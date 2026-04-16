@@ -177,19 +177,48 @@ class TestFileGuard:
 
     def test_write_inside_work_dir_allowed(self) -> None:
         path = Path(self.tmp) / "test.py"
-        allowed, _ = self.fg.check_write(path)
-        assert allowed
+        verdict, _ = self.fg.check_write(path)
+        assert verdict == "allowed"
 
     def test_write_outside_work_dir_blocked(self) -> None:
-        allowed, reason = self.fg.check_write("/tmp/outside.py")
-        assert not allowed
+        verdict, reason = self.fg.check_write("/tmp/outside.py")
+        assert verdict == "blocked"
         assert "工作目录" in reason
 
     def test_write_sensitive_file_blocked(self) -> None:
         path = Path(self.tmp) / ".env"
-        allowed, reason = self.fg.check_write(path)
-        assert not allowed
+        verdict, reason = self.fg.check_write(path)
+        assert verdict == "blocked"
         assert "敏感文件" in reason
+
+    # ----- 根目录保护文件 -----
+
+    def test_root_readme_needs_confirm(self) -> None:
+        path = Path(self.tmp) / "README.md"
+        verdict, reason = self.fg.check_write(path)
+        assert verdict == "needs_confirm"
+        assert "README.md" in reason
+
+    def test_root_pyproject_needs_confirm(self) -> None:
+        path = Path(self.tmp) / "pyproject.toml"
+        verdict, reason = self.fg.check_write(path)
+        assert verdict == "needs_confirm"
+
+    def test_subdir_readme_allowed(self) -> None:
+        """子目录下的 README.md 不受保护，正常放行."""
+        path = Path(self.tmp) / "examples" / "README.md"
+        verdict, _ = self.fg.check_write(path)
+        assert verdict == "allowed"
+
+    def test_protected_root_file_detected(self) -> None:
+        assert self.fg.is_protected_root_file(Path(self.tmp) / "README.md")
+        assert self.fg.is_protected_root_file(Path(self.tmp) / "pyproject.toml")
+        assert self.fg.is_protected_root_file(Path(self.tmp) / "Dockerfile")
+
+    def test_non_protected_root_file(self) -> None:
+        assert not self.fg.is_protected_root_file(Path(self.tmp) / "main.py")
+        # 子目录下的同名文件不算根目录保护文件
+        assert not self.fg.is_protected_root_file(Path(self.tmp) / "docs" / "README.md")
 
     # ----- 备份与回滚 -----
 

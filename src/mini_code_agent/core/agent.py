@@ -349,9 +349,11 @@ class Agent:
         if self.file_guard and tool_name in ("WriteFile", "EditFile"):
             path = args.get("path", "")
             if path:
-                allowed, reason = self.file_guard.check_write(path)
-                if not allowed:
+                verdict, reason = self.file_guard.check_write(path)
+                if verdict == "blocked":
                     return SafetyLevel.BLOCKED, reason
+                if verdict == "needs_confirm":
+                    return SafetyLevel.NEEDS_CONFIRM, None
 
         if self.file_guard and tool_name == "ReadFile":
             path = args.get("path", "")
