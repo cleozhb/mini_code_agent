@@ -40,6 +40,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="显示详细信息（上下文统计等）",
     )
+    parser.add_argument(
+        "--plan",
+        action="store_true",
+        help="启动时默认开启 Plan 模式（先规划再执行）",
+    )
     return parser.parse_args()
 
 
@@ -141,7 +146,31 @@ async def async_main() -> None:
             tool_name, tool_call, console, prompt_session, safety_level,
         )
 
-    # 6. 创建 Agent
+    # 6. 创建 Planner + Plan mode 回调
+    from mini_code_agent.core import Planner
+    from mini_code_agent.cli.plan_display import (
+        ask_replan,
+        confirm_plan,
+        render_step_done,
+        render_step_start,
+    )
+
+    planner = Planner(llm_client=llm_client)
+
+    async def _plan_confirm_cb(plan):
+        result = await confirm_plan(plan, console, prompt_session)
+        return (result.decision == "confirm", result.plan)
+
+    async def _plan_progress_cb(idx, total, step, phase, success):
+        if phase == "start":
+            render_step_start(idx, total, step, console)
+        else:
+            render_step_done(idx, total, step, success, console)
+
+    async def _plan_replan_cb(plan, failed_step, last_content):
+        return await ask_replan(console, prompt_session)
+
+    # 7. 创建 Agent
     from mini_code_agent.core import Agent
 
     agent = Agent(
@@ -153,9 +182,14 @@ async def async_main() -> None:
         file_guard=file_guard,
         loop_guard=loop_guard,
         project_memory=project_memory,
+        plan_mode=args.plan,
+        planner=planner,
+        plan_confirm_callback=_plan_confirm_cb,
+        plan_progress_callback=_plan_progress_cb,
+        plan_replan_callback=_plan_replan_cb,
     )
 
-    # 7. 启动 REPL
+    # 8. 启动 REPL
     from mini_code_agent.cli import REPL
 
     repl = REPL(agent=agent, console=console)
