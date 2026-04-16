@@ -9,6 +9,7 @@ from functools import partial
 from typing import Any
 
 from prompt_toolkit import PromptSession
+from prompt_toolkit.completion import WordCompleter
 from prompt_toolkit.formatted_text import HTML
 from prompt_toolkit.history import FileHistory
 from prompt_toolkit.key_binding import KeyBindings
@@ -70,9 +71,16 @@ class REPL:
         self.agent = agent
         self.console = console or Console()
 
-        # prompt_toolkit session，带文件历史
+        # 斜杠命令补全
+        self._completer = WordCompleter(
+            ["/quit", "/exit", "/q", "/clear", "/cost", "/model"],
+            sentence=True,  # 整条匹配，不拆词
+        )
+
+        # prompt_toolkit session，带文件历史和命令补全
         self._prompt_session = PromptSession[str](
             history=FileHistory(".agent_history"),
+            completer=self._completer,
         )
 
     async def run(self) -> None:

@@ -8,12 +8,31 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
-# 默认敏感文件模式（只读保护）
+# 默认敏感文件模式（禁止写入）
 SENSITIVE_FILE_PATTERNS: list[str] = [
     ".env",
     "secrets.*",
     "*.pem",
     "*.key",
+]
+
+# 项目根目录保护文件（写入需确认，不禁止）
+PROTECTED_ROOT_PATTERNS: list[str] = [
+    "README.md",
+    "README.rst",
+    "README",
+    "CHANGELOG.md",
+    "LICENSE",
+    "pyproject.toml",
+    "setup.py",
+    "setup.cfg",
+    "package.json",
+    "Cargo.toml",
+    "go.mod",
+    "Makefile",
+    "Dockerfile",
+    ".gitignore",
+    "CLAUDE.md",
 ]
 
 
@@ -41,10 +60,12 @@ class FileGuard:
         work_dir: str | Path,
         backup_dir_name: str = ".agent-backups",
         sensitive_patterns: list[str] | None = None,
+        protected_root_patterns: list[str] | None = None,
     ) -> None:
         self.work_dir = Path(work_dir).resolve()
         self.backup_dir = self.work_dir / backup_dir_name
         self.sensitive_patterns = sensitive_patterns or SENSITIVE_FILE_PATTERNS
+        self.protected_root_patterns = protected_root_patterns or PROTECTED_ROOT_PATTERNS
         self._modifications: list[FileModification] = []
 
     def is_path_allowed(self, path: str | Path) -> bool:
@@ -76,17 +97,31 @@ class FileGuard:
                     return True
         return False
 
-    def check_write(self, path: str | Path) -> tuple[bool, str]:
+    def is_protected_root_file(self, path: str | Path) -> bool:
+        """检查是否为项目根目录下的保护文件（README.md 等）."""
+        p = Path(path).resolve()
+        # 必须直接在工作目录下（不是子目录中的同名文件）
+        if p.parent != self.work_dir:
+            return False
+        name = p.name
+        return name in self.protected_root_patterns
+
+    def check_write(self, path: str | Path) -> tuple[str, str]:
         """检查是否允许写入.
 
         Returns:
-            (allowed, reason) — allowed=False 时 reason 说明原因
+            (verdict, reason)
+            - ("allowed", "") — 正常放行
+            - ("needs_confirm", reason) — 需要用户确认
+            - ("blocked", reason) — 禁止写入
         """
         if not self.is_path_allowed(path):
-            return False, f"路径不在工作目录内: {path}（工作目录: {self.work_dir}）"
+            return "blocked", f"路径不在工作目录内: {path}（工作目录: {self.work_dir}）"
         if self.is_sensitive_file(path):
-            return False, f"敏感文件禁止写入: {Path(path).name}"
-        return True, ""
+            return "blocked", f"敏感文件禁止写入: {Path(path).name}"
+        if self.is_protected_root_file(path):
+            return "needs_confirm", f"项目根目录文件: {Path(path).name}"
+        return "allowed", ""
 
     def check_read(self, path: str | Path) -> tuple[bool, str]:
         """检查是否允许读取.
@@ -135,13 +170,15 @@ class FileGuard:
     def pre_write(self, path: str | Path) -> tuple[bool, str]:
         """写入前的完整流程：检查权限 + 备份.
 
+        注意：此方法只处理 blocked 情况。needs_confirm 应由调用方在确认后再调用此方法。
+
         Returns:
             (allowed, reason_or_backup_path)
         """
-        allowed, reason = self.check_write(path)
-        if not allowed:
+        verdict, reason = self.check_write(path)
+        if verdict == "blocked":
             return False, reason
-
+        # allowed 或 needs_confirm（已确认后）都执行备份
         backup_path = self.backup_file(path)
         self.record_modification(path, backup_path)
         return True, backup_path or ""
