@@ -70,6 +70,7 @@ async def async_main() -> None:
     # 2. 注册工具
     from mini_code_agent.tools import (
         BashTool,
+        EditFileTool,
         GrepTool,
         ListDirTool,
         ReadFileTool,
@@ -80,6 +81,7 @@ async def async_main() -> None:
     registry = ToolRegistry()
     registry.register(ReadFileTool())
     registry.register(WriteFileTool())
+    registry.register(EditFileTool())
     registry.register(BashTool())
     registry.register(GrepTool())
     registry.register(ListDirTool())
