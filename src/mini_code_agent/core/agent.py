@@ -17,6 +17,9 @@ from ..llm.base import (
     ToolCall,
 )
 from ..llm.base import ToolResult as LLMToolResult
+from ..safety.command_filter import CommandFilter, SafetyLevel
+from ..safety.file_guard import FileGuard
+from ..safety.loop_guard import LoopGuard
 from ..tools.base import PermissionLevel, ToolRegistry
 from ..tools.base import ToolResult as ExecToolResult
 
@@ -65,8 +68,11 @@ class AgentEvent:
     usage: TokenUsage | None = None
 
 
-# 确认回调类型：传入 ToolCall，返回 (approved, edited_args_or_none)
-ConfirmCallback = Callable[[str, ToolCall], Awaitable[tuple[bool, dict[str, Any] | None]]]
+# 确认回调类型：传入 (tool_name, ToolCall, SafetyLevel)，返回 (approved, edited_args_or_none)
+ConfirmCallback = Callable[
+    [str, ToolCall, SafetyLevel],
+    Awaitable[tuple[bool, dict[str, Any] | None]],
+]
 
 
 class Agent:
@@ -78,6 +84,9 @@ class Agent:
         tool_registry: ToolRegistry,
         system_prompt: str,
         confirm_callback: ConfirmCallback | None = None,
+        command_filter: CommandFilter | None = None,
+        file_guard: FileGuard | None = None,
+        loop_guard: LoopGuard | None = None,
     ) -> None:
         self.llm_client = llm_client
         self.tool_registry = tool_registry
@@ -85,6 +94,9 @@ class Agent:
         self.messages: list[Message] = [Message.system(system_prompt)]
         self.total_usage = TokenUsage()
         self.confirm_callback = confirm_callback
+        self.command_filter = command_filter
+        self.file_guard = file_guard
+        self.loop_guard = loop_guard
 
     async def run(self, user_message: str) -> AgentResult:
         """核心循环：发送消息 → 处理工具调用 → 返回最终文本.
@@ -102,7 +114,16 @@ class Agent:
         round_usage = TokenUsage()
         total_tool_calls = 0
 
-        for _round in range(MAX_TOOL_ROUNDS):
+        max_rounds = self.loop_guard.max_rounds if self.loop_guard else MAX_TOOL_ROUNDS
+
+        for _round in range(max_rounds):
+            # LoopGuard 轮数检查
+            if self.loop_guard:
+                limit_msg = self.loop_guard.next_round()
+                if limit_msg:
+                    self.messages.append(Message.user(limit_msg))
+                    break
+
             response: LLMResponse = await self.llm_client.chat(
                 messages=self.messages,
                 tools=tool_params if tool_params else None,
@@ -111,6 +132,14 @@ class Agent:
             # 累计 token 用量
             round_usage.input_tokens += response.usage.input_tokens
             round_usage.output_tokens += response.usage.output_tokens
+
+            # LoopGuard token 预算检查
+            if self.loop_guard:
+                token_msg = self.loop_guard.add_tokens(
+                    response.usage.input_tokens + response.usage.output_tokens
+                )
+                if token_msg:
+                    logger.warning(token_msg)
 
             # 没有 tool_calls → 纯文本回复，结束循环
             if not response.tool_calls:
@@ -135,7 +164,7 @@ class Agent:
 
         # 超过最大轮数，做一次不带 tools 的收尾调用
         self._accumulate_usage(round_usage)
-        logger.warning("达到最大工具调用轮数 (%d)，强制收尾", MAX_TOOL_ROUNDS)
+        logger.warning("达到最大工具调用轮数，强制收尾")
         return await self._force_final_response(round_usage, total_tool_calls)
 
     async def run_stream(self, user_message: str) -> AsyncIterator[AgentEvent]:
@@ -150,7 +179,16 @@ class Agent:
         round_usage = TokenUsage()
         total_tool_calls = 0
 
-        for _round in range(MAX_TOOL_ROUNDS):
+        max_rounds = self.loop_guard.max_rounds if self.loop_guard else MAX_TOOL_ROUNDS
+
+        for _round in range(max_rounds):
+            # LoopGuard 轮数检查
+            if self.loop_guard:
+                limit_msg = self.loop_guard.next_round()
+                if limit_msg:
+                    self.messages.append(Message.user(limit_msg))
+                    break
+
             # 通过流式 API 获取响应
             full_content = ""
             tool_calls: list[ToolCall] = []
@@ -223,6 +261,13 @@ class Agent:
                     if delta.usage:
                         round_usage.input_tokens += delta.usage.input_tokens
                         round_usage.output_tokens += delta.usage.output_tokens
+                        # LoopGuard token 预算检查
+                        if self.loop_guard:
+                            token_msg = self.loop_guard.add_tokens(
+                                delta.usage.input_tokens + delta.usage.output_tokens
+                            )
+                            if token_msg:
+                                logger.warning(token_msg)
 
             # 没有工具调用 → 纯文本回复，结束
             if not tool_calls:
@@ -252,7 +297,7 @@ class Agent:
 
         # 超出最大轮数 → 收尾
         self._accumulate_usage(round_usage)
-        logger.warning("达到最大工具调用轮数 (%d)，强制收尾", MAX_TOOL_ROUNDS)
+        logger.warning("达到最大工具调用轮数，强制收尾")
 
         # 强制收尾也用流式
         self.messages.append(
@@ -278,6 +323,53 @@ class Agent:
         self._accumulate_usage(round_usage)
         yield AgentEvent(type=AgentEventType.FINISH, usage=round_usage)
 
+    def _check_safety(
+        self, tool_name: str, tool_call: ToolCall
+    ) -> tuple[SafetyLevel, str | None]:
+        """对工具调用进行安全检查.
+
+        Returns:
+            (safety_level, block_reason) — SAFE/NEEDS_CONFIRM 时 reason 为 None
+        """
+        args = tool_call.arguments
+
+        # 1) Bash 命令过滤
+        if tool_name == "Bash" and self.command_filter:
+            command = args.get("command", "")
+            level = self.command_filter.is_safe(command)
+            if level == SafetyLevel.BLOCKED:
+                reason = self.command_filter.get_block_reason(command)
+                return SafetyLevel.BLOCKED, reason or "危险命令被拦截"
+            if level == SafetyLevel.NEEDS_CONFIRM:
+                return SafetyLevel.NEEDS_CONFIRM, None
+            # SAFE → 降低权限需求（跳过确认）
+            return SafetyLevel.SAFE, None
+
+        # 2) 文件操作保护
+        if self.file_guard and tool_name in ("WriteFile", "EditFile"):
+            path = args.get("path", "")
+            if path:
+                allowed, reason = self.file_guard.check_write(path)
+                if not allowed:
+                    return SafetyLevel.BLOCKED, reason
+
+        if self.file_guard and tool_name == "ReadFile":
+            path = args.get("path", "")
+            if path:
+                allowed, reason = self.file_guard.check_read(path)
+                if not allowed:
+                    return SafetyLevel.BLOCKED, reason
+
+        # 3) 重复调用检测
+        if self.loop_guard:
+            warning = self.loop_guard.record_tool_call(tool_name, args)
+            if warning:
+                logger.warning(warning)
+                # 重复检测只警告，不拦截
+
+        # 默认保持工具原有权限级别
+        return SafetyLevel.NEEDS_CONFIRM, None
+
     async def _execute_tool_call(self, tool_call: ToolCall) -> Message:
         """执行单个工具调用，返回 tool result 消息."""
         tool = self.tool_registry.get(tool_call.name)
@@ -287,6 +379,17 @@ class Agent:
                 LLMToolResult(
                     tool_call_id=tool_call.id,
                     content=f"错误：未找到工具 '{tool_call.name}'",
+                    is_error=True,
+                )
+            )
+
+        # 安全检查
+        safety_level, block_reason = self._check_safety(tool.name, tool_call)
+        if safety_level == SafetyLevel.BLOCKED:
+            return Message.tool(
+                LLMToolResult(
+                    tool_call_id=tool_call.id,
+                    content=f"[安全拦截] {block_reason}",
                     is_error=True,
                 )
             )
@@ -302,12 +405,18 @@ class Agent:
             )
 
         # CONFIRM 级别的工具暂时先自动执行，后续加确认逻辑
-        if tool.permission_level == PermissionLevel.CONFIRM:
+        if tool.permission_level == PermissionLevel.CONFIRM and safety_level != SafetyLevel.SAFE:
             logger.info(
                 "工具 '%s' 需要确认（当前自动放行）: %s",
                 tool_call.name,
                 tool_call.arguments,
             )
+
+        # 写操作前备份
+        if self.file_guard and tool.name in ("WriteFile", "EditFile"):
+            path = tool_call.arguments.get("path", "")
+            if path:
+                self.file_guard.pre_write(path)
 
         # 执行工具
         try:
@@ -355,6 +464,19 @@ class Agent:
             )
             return msg, dummy
 
+        # 安全检查
+        safety_level, block_reason = self._check_safety(tool.name, tool_call)
+        if safety_level == SafetyLevel.BLOCKED:
+            dummy = ExecToolResult(output="", error=block_reason or "危险操作被拦截")
+            msg = Message.tool(
+                LLMToolResult(
+                    tool_call_id=tool_call.id,
+                    content=f"[安全拦截] {block_reason}",
+                    is_error=True,
+                )
+            )
+            return msg, dummy
+
         # 权限检查
         if tool.permission_level == PermissionLevel.DENY:
             dummy = ExecToolResult(output="", error=f"工具 '{tool_call.name}' 被禁止执行")
@@ -367,9 +489,15 @@ class Agent:
             )
             return msg, dummy
 
-        # CONFIRM 级别 — 通过回调让 CLI 确认
-        if tool.permission_level == PermissionLevel.CONFIRM and self.confirm_callback:
-            approved, edited_args = await self.confirm_callback(tool.name, tool_call)
+        # CONFIRM 级别 — 白名单命令跳过确认，其他通过回调让 CLI 确认
+        needs_confirm = (
+            tool.permission_level == PermissionLevel.CONFIRM
+            and safety_level != SafetyLevel.SAFE
+        )
+        if needs_confirm and self.confirm_callback:
+            approved, edited_args = await self.confirm_callback(
+                tool.name, tool_call, safety_level,
+            )
             if not approved:
                 dummy = ExecToolResult(output="", error="用户拒绝了此操作")
                 msg = Message.tool(
@@ -382,6 +510,12 @@ class Agent:
                 return msg, dummy
             if edited_args is not None:
                 tool_call.arguments = edited_args
+
+        # 写操作前备份
+        if self.file_guard and tool.name in ("WriteFile", "EditFile"):
+            path = tool_call.arguments.get("path", "")
+            if path:
+                self.file_guard.pre_write(path)
 
         # 执行工具
         try:
@@ -448,3 +582,5 @@ class Agent:
     def reset(self) -> None:
         """重置对话历史（保留 system prompt）."""
         self.messages = [Message.system(self.system_prompt)]
+        if self.loop_guard:
+            self.loop_guard.reset()
