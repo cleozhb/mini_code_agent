@@ -24,10 +24,15 @@ from ..safety.file_guard import FileGuard
 from ..safety.loop_guard import LoopGuard
 from ..tools.base import PermissionLevel, ToolRegistry
 from ..tools.base import ToolResult as ExecToolResult
+from .retry import RetryController
+from .verifier import VerificationResult, Verifier
 
 logger = logging.getLogger(__name__)
 
 MAX_TOOL_ROUNDS = 25
+
+# 会改动文件的工具名；用于追踪本轮任务修改过哪些文件
+WRITE_TOOL_NAMES = {"WriteFile", "EditFile", "write_file", "edit_file"}
 
 
 class AgentError(Exception):
@@ -90,6 +95,9 @@ class Agent:
         file_guard: FileGuard | None = None,
         loop_guard: LoopGuard | None = None,
         project_memory: ProjectMemory | None = None,
+        verifier: Verifier | None = None,
+        retry_controller: RetryController | None = None,
+        project_path: str | None = None,
     ) -> None:
         self.llm_client = llm_client
         self.tool_registry = tool_registry
@@ -100,6 +108,15 @@ class Agent:
         self.file_guard = file_guard
         self.loop_guard = loop_guard
         self.project_memory = project_memory
+        self.verifier = verifier
+        # 如果外部提供了 verifier 但没给 retry_controller，默认创建一个
+        self.retry_controller = retry_controller or (
+            RetryController() if verifier is not None else None
+        )
+        self.project_path = project_path
+
+        # 当前任务期间追踪改动过哪些文件（供 Verifier 使用）
+        self._files_changed: list[str] = []
 
         # 使用 ConversationManager 管理消息
         self.conversation = ConversationManager(llm_client=llm_client)
@@ -121,6 +138,74 @@ class Agent:
 
     async def run(self, user_message: str) -> AgentResult:
         """核心循环：发送消息 → 处理工具调用 → 返回最终文本.
+
+        如果配置了 Verifier，纯文本回复之后会自动对改动的文件跑一次验证，
+        失败时在 RetryController 允许的范围内自动把错误回传给 LLM 继续修复。
+        """
+        # 每次顶层 run() 开始时重置文件追踪与重试计数
+        self._files_changed = []
+        if self.retry_controller is not None:
+            self.retry_controller.reset()
+
+        total_usage = TokenUsage()
+        total_tool_calls = 0
+        last_content = ""
+        current_user_msg = user_message
+
+        while True:
+            single = await self._run_once(current_user_msg)
+            total_usage.input_tokens += single.usage.input_tokens
+            total_usage.output_tokens += single.usage.output_tokens
+            total_tool_calls += single.tool_calls_count
+            last_content = single.content
+
+            # 没有 verifier，或者本轮没改过文件 → 不触发验证
+            if (
+                self.verifier is None
+                or self.project_path is None
+                or not self._files_changed
+            ):
+                break
+
+            vr: VerificationResult = await self.verifier.verify_code_change(
+                self._files_changed, self.project_path
+            )
+            if vr.passed:
+                logger.info("验证通过（%d 个文件）", len(self._files_changed))
+                break
+
+            logger.info(
+                "验证失败: %d 个错误；尝试次数: %d/%d",
+                len(vr.errors),
+                self.retry_controller.attempts_count + 1 if self.retry_controller else 0,
+                self.retry_controller.max_retries if self.retry_controller else 0,
+            )
+
+            # 没有重试控制器或已达上限 → 交给用户
+            if self.retry_controller is None:
+                break
+
+            self.retry_controller.record_attempt(vr.errors, last_content)
+            if not self.retry_controller.can_retry():
+                giveup = self.retry_controller.build_giveup_summary()
+                # 把最终说明作为 assistant 消息写进对话历史
+                self.conversation.append(Message.assistant(giveup))
+                last_content = giveup
+                break
+
+            # 还能重试 — 构造回传提示并清空文件追踪
+            retry_prompt = self.retry_controller.build_retry_prompt(vr.errors)
+            self._files_changed = []
+            current_user_msg = retry_prompt
+
+        return AgentResult(
+            content=last_content,
+            usage=total_usage,
+            tool_calls_count=total_tool_calls,
+        )
+
+    async def _run_once(self, user_message: str) -> AgentResult:
+        """单轮对话：发送消息 → 处理工具调用 → 返回最终文本.
 
         流程：
         1. 把 user_message 加入 messages
@@ -468,6 +553,9 @@ class Agent:
                 )
             )
 
+        # 追踪文件改动
+        self._track_file_change(tool.name, tool_call.arguments, result)
+
         # 将 tools.base.ToolResult 转为 llm.base.ToolResult
         if result.is_error:
             content = result.error or "未知错误"
@@ -571,6 +659,9 @@ class Agent:
             )
             return msg, err_result
 
+        # 追踪文件改动
+        self._track_file_change(tool.name, tool_call.arguments, result)
+
         # 转换
         if result.is_error:
             content = result.error or "未知错误"
@@ -587,6 +678,23 @@ class Agent:
             )
         )
         return msg, result
+
+    def _track_file_change(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        result: ExecToolResult,
+    ) -> None:
+        """如果是写/编辑类工具且执行成功，记录改动的文件路径."""
+        if tool_name not in WRITE_TOOL_NAMES:
+            return
+        if result.is_error:
+            return
+        path = arguments.get("path") or arguments.get("file_path")
+        if not path or not isinstance(path, str):
+            return
+        if path not in self._files_changed:
+            self._files_changed.append(path)
 
     async def _force_final_response(
         self,
