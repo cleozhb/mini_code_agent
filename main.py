@@ -108,16 +108,26 @@ async def async_main() -> None:
             f"[/dim]"
         )
 
-    # 4. 创建确认回调
+    # 4. 创建安全控制层
+    from mini_code_agent.safety import CommandFilter, FileGuard, LoopGuard
+
+    command_filter = CommandFilter()
+    file_guard = FileGuard(work_dir=project_dir)
+    loop_guard = LoopGuard()
+
+    # 5. 创建确认回调
     from prompt_toolkit import PromptSession
     from mini_code_agent.cli.confirm import confirm_tool_call
+    from mini_code_agent.safety import SafetyLevel
 
     prompt_session = PromptSession()
 
-    async def _confirm_cb(tool_name, tool_call):
-        return await confirm_tool_call(tool_name, tool_call, console, prompt_session)
+    async def _confirm_cb(tool_name, tool_call, safety_level=SafetyLevel.NEEDS_CONFIRM):
+        return await confirm_tool_call(
+            tool_name, tool_call, console, prompt_session, safety_level,
+        )
 
-    # 5. 创建 Agent
+    # 6. 创建 Agent
     from mini_code_agent.core import Agent
 
     agent = Agent(
@@ -125,9 +135,12 @@ async def async_main() -> None:
         tool_registry=registry,
         system_prompt=system_prompt,
         confirm_callback=_confirm_cb,
+        command_filter=command_filter,
+        file_guard=file_guard,
+        loop_guard=loop_guard,
     )
 
-    # 6. 启动 REPL
+    # 7. 启动 REPL
     from mini_code_agent.cli import REPL
 
     repl = REPL(agent=agent, console=console)

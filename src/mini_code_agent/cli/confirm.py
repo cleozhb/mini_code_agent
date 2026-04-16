@@ -15,6 +15,14 @@ from rich.syntax import Syntax
 from rich.text import Text
 
 from ..llm.base import ToolCall
+from ..safety.command_filter import SafetyLevel
+
+# 安全等级显示标识
+_SAFETY_BADGES: dict[SafetyLevel, str] = {
+    SafetyLevel.SAFE: "🟢 安全",
+    SafetyLevel.NEEDS_CONFIRM: "🟡 需确认",
+    SafetyLevel.BLOCKED: "🔴 已拦截",
+}
 
 
 async def confirm_tool_call(
@@ -22,6 +30,7 @@ async def confirm_tool_call(
     tool_call: ToolCall,
     console: Console,
     prompt_session: PromptSession,
+    safety_level: SafetyLevel = SafetyLevel.NEEDS_CONFIRM,
 ) -> tuple[bool, dict[str, Any] | None]:
     """展示待执行的操作并请求用户确认.
 
@@ -30,6 +39,7 @@ async def confirm_tool_call(
         tool_call: 工具调用对象
         console: Rich console 用于渲染
         prompt_session: prompt_toolkit session 用于输入
+        safety_level: 安全等级（由 CommandFilter 判定）
 
     Returns:
         (approved, edited_args_or_none)
@@ -38,6 +48,10 @@ async def confirm_tool_call(
         - approved=False, None: 用户拒绝
     """
     args = tool_call.arguments
+
+    # 显示安全等级标识
+    badge = _SAFETY_BADGES.get(safety_level, "🟡 需确认")
+    console.print(f"\n  {badge}", style="bold")
 
     if tool_name == "WriteFile":
         _render_write_file(args, console)
