@@ -73,7 +73,7 @@ class REPL:
 
         # 斜杠命令补全
         self._completer = WordCompleter(
-            ["/quit", "/exit", "/q", "/clear", "/cost", "/model"],
+            ["/quit", "/exit", "/q", "/clear", "/cost", "/model", "/memory", "/save"],
             sentence=True,  # 整条匹配，不拆词
         )
 
@@ -147,8 +147,19 @@ class REPL:
             self._switch_model(model_arg)
             return True
 
+        if command == "/memory":
+            self._show_memory()
+            return True
+
+        if command == "/save":
+            save_arg = parts[1].strip() if len(parts) > 1 else ""
+            self._save_memory(save_arg)
+            return True
+
         self.console.print(f"[red]未知命令: {command}[/red]")
-        self.console.print("[dim]可用命令: /quit  /clear  /cost  /model[/dim]")
+        self.console.print(
+            "[dim]可用命令: /quit  /clear  /cost  /model  /memory  /save[/dim]"
+        )
         return True
 
     def _show_cost(self) -> None:
@@ -173,6 +184,52 @@ class REPL:
             title="[bold]会话消耗[/bold]",
             border_style="cyan",
         ))
+
+    def _show_memory(self) -> None:
+        """显示项目长期记忆和对话 token 统计."""
+        lines: list[str] = []
+
+        # 对话 token 统计
+        conv = self.agent.conversation
+        lines.append(f"对话 token 数: {conv.token_count:,}")
+        lines.append(f"对话消息数: {len(conv.messages)}")
+        threshold = int(conv.max_tokens * conv.compress_ratio)
+        lines.append(f"压缩阈值: {threshold:,} tokens")
+
+        # 项目记忆
+        pm = self.agent.project_memory
+        if pm:
+            data = pm.data
+            lines.append("")
+            lines.append(f"项目约定: {len(data.conventions)} 条")
+            for c in data.conventions:
+                lines.append(f"  - {c}")
+            lines.append(f"技术决策: {len(data.decisions)} 条")
+            for d in data.decisions:
+                lines.append(f"  - [{d.date}] {d.decision}")
+            lines.append(f"已知问题: {len(data.known_issues)} 条")
+            for ki in data.known_issues:
+                lines.append(f"  - {ki.issue}")
+        else:
+            lines.append("\n(项目记忆未启用)")
+
+        self.console.print(Panel(
+            "\n".join(lines),
+            title="[bold]记忆状态[/bold]",
+            border_style="magenta",
+        ))
+
+    def _save_memory(self, text: str) -> None:
+        """手动保存一条信息到项目记忆（约定类型）."""
+        pm = self.agent.project_memory
+        if not pm:
+            self.console.print("[red]项目记忆未启用[/red]")
+            return
+        if not text:
+            self.console.print("[dim]用法: /save <要记住的信息>[/dim]")
+            return
+        pm.add_convention(text)
+        self.console.print(f"[green]已保存到项目记忆: {text}[/green]")
 
     def _switch_model(self, model_name: str) -> None:
         """切换模型."""
@@ -317,6 +374,8 @@ class REPL:
             f"  /clear  — 清空对话\n"
             f"  /cost   — 查看 token 消耗\n"
             f"  /model  — 切换模型\n"
+            f"  /memory — 查看记忆状态\n"
+            f"  /save   — 保存信息到项目记忆\n"
             f"  Ctrl+C  — 中断当前操作\n"
             f"  多行输入：Alt+Enter 换行，Enter 提交",
             border_style="blue",
