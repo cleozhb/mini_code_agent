@@ -69,14 +69,26 @@ async def async_main() -> None:
 
     # 2. 注册工具
     from mini_code_agent.tools import (
+        AddMemoryTool,
         BashTool,
         EditFileTool,
         GrepTool,
         ListDirTool,
         ReadFileTool,
+        RecallMemoryTool,
         ToolRegistry,
         WriteFileTool,
     )
+    from mini_code_agent.memory import ProjectMemory
+
+    # 初始化项目记忆
+    project_memory = ProjectMemory(project_dir)
+
+    # 创建记忆工具并注入 ProjectMemory
+    add_memory_tool = AddMemoryTool()
+    add_memory_tool._project_memory = project_memory
+    recall_memory_tool = RecallMemoryTool()
+    recall_memory_tool._project_memory = project_memory
 
     registry = ToolRegistry()
     registry.register(ReadFileTool())
@@ -85,6 +97,8 @@ async def async_main() -> None:
     registry.register(BashTool())
     registry.register(GrepTool())
     registry.register(ListDirTool())
+    registry.register(add_memory_tool)
+    registry.register(recall_memory_tool)
 
     # 3. 构建 system prompt（使用项目上下文感知）
     from mini_code_agent.core import build_system_prompt_with_context
@@ -138,6 +152,7 @@ async def async_main() -> None:
         command_filter=command_filter,
         file_guard=file_guard,
         loop_guard=loop_guard,
+        project_memory=project_memory,
     )
 
     # 7. 启动 REPL

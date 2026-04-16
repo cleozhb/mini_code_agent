@@ -17,6 +17,8 @@ from ..llm.base import (
     ToolCall,
 )
 from ..llm.base import ToolResult as LLMToolResult
+from ..memory.conversation import ConversationManager
+from ..memory.project_memory import ProjectMemory
 from ..safety.command_filter import CommandFilter, SafetyLevel
 from ..safety.file_guard import FileGuard
 from ..safety.loop_guard import LoopGuard
@@ -87,16 +89,35 @@ class Agent:
         command_filter: CommandFilter | None = None,
         file_guard: FileGuard | None = None,
         loop_guard: LoopGuard | None = None,
+        project_memory: ProjectMemory | None = None,
     ) -> None:
         self.llm_client = llm_client
         self.tool_registry = tool_registry
         self.system_prompt = system_prompt
-        self.messages: list[Message] = [Message.system(system_prompt)]
         self.total_usage = TokenUsage()
         self.confirm_callback = confirm_callback
         self.command_filter = command_filter
         self.file_guard = file_guard
         self.loop_guard = loop_guard
+        self.project_memory = project_memory
+
+        # 使用 ConversationManager 管理消息
+        self.conversation = ConversationManager(llm_client=llm_client)
+        self.conversation.init_system(self._build_full_system_prompt())
+
+    def _build_full_system_prompt(self) -> str:
+        """拼接 system prompt + 项目记忆."""
+        prompt = self.system_prompt
+        if self.project_memory:
+            memory_text = self.project_memory.format_for_prompt()
+            if memory_text:
+                prompt += f"\n\n<project-memory>\n{memory_text}\n</project-memory>"
+        return prompt
+
+    @property
+    def messages(self) -> list[Message]:
+        """消息列表（委托给 ConversationManager）."""
+        return self.conversation.messages
 
     async def run(self, user_message: str) -> AgentResult:
         """核心循环：发送消息 → 处理工具调用 → 返回最终文本.
@@ -108,7 +129,7 @@ class Agent:
         4. 如果 LLM 返回纯文本：返回给用户
         5. 最多 MAX_TOOL_ROUNDS 轮 tool calling
         """
-        self.messages.append(Message.user(user_message))
+        self.conversation.append(Message.user(user_message))
 
         tool_params = self.tool_registry.to_tool_params()
         round_usage = TokenUsage()
@@ -121,7 +142,7 @@ class Agent:
             if self.loop_guard:
                 limit_msg = self.loop_guard.next_round()
                 if limit_msg:
-                    self.messages.append(Message.user(limit_msg))
+                    self.conversation.append(Message.user(limit_msg))
                     break
 
             response: LLMResponse = await self.llm_client.chat(
@@ -143,8 +164,9 @@ class Agent:
 
             # 没有 tool_calls → 纯文本回复，结束循环
             if not response.tool_calls:
-                self.messages.append(Message.assistant(response.content))
+                self.conversation.append(Message.assistant(response.content))
                 self._accumulate_usage(round_usage)
+                await self._maybe_compress()
                 return AgentResult(
                     content=response.content,
                     usage=round_usage,
@@ -152,20 +174,22 @@ class Agent:
                 )
 
             # 有 tool_calls → 先把 assistant 消息（含 tool_calls）加入历史
-            self.messages.append(
+            self.conversation.append(
                 Message.assistant(response.content, tool_calls=response.tool_calls)
             )
 
             # 逐个执行工具
             for tool_call in response.tool_calls:
                 tool_result_msg = await self._execute_tool_call(tool_call)
-                self.messages.append(tool_result_msg)
+                self.conversation.append(tool_result_msg)
                 total_tool_calls += 1
 
         # 超过最大轮数，做一次不带 tools 的收尾调用
         self._accumulate_usage(round_usage)
         logger.warning("达到最大工具调用轮数，强制收尾")
-        return await self._force_final_response(round_usage, total_tool_calls)
+        result = await self._force_final_response(round_usage, total_tool_calls)
+        await self._maybe_compress()
+        return result
 
     async def run_stream(self, user_message: str) -> AsyncIterator[AgentEvent]:
         """流式核心循环：与 run() 逻辑一致，但以事件流形式产出中间过程.
@@ -173,7 +197,7 @@ class Agent:
         yields:
             AgentEvent 事件流：TEXT_DELTA / TOOL_CALL_* / TOOL_RESULT / FINISH
         """
-        self.messages.append(Message.user(user_message))
+        self.conversation.append(Message.user(user_message))
 
         tool_params = self.tool_registry.to_tool_params()
         round_usage = TokenUsage()
@@ -186,7 +210,7 @@ class Agent:
             if self.loop_guard:
                 limit_msg = self.loop_guard.next_round()
                 if limit_msg:
-                    self.messages.append(Message.user(limit_msg))
+                    self.conversation.append(Message.user(limit_msg))
                     break
 
             # 通过流式 API 获取响应
@@ -271,8 +295,9 @@ class Agent:
 
             # 没有工具调用 → 纯文本回复，结束
             if not tool_calls:
-                self.messages.append(Message.assistant(full_content))
+                self.conversation.append(Message.assistant(full_content))
                 self._accumulate_usage(round_usage)
+                await self._maybe_compress()
                 yield AgentEvent(
                     type=AgentEventType.FINISH,
                     usage=round_usage,
@@ -280,14 +305,14 @@ class Agent:
                 return
 
             # 有工具调用 → 先记录 assistant 消息
-            self.messages.append(
+            self.conversation.append(
                 Message.assistant(full_content, tool_calls=tool_calls)
             )
 
             # 逐个执行工具
             for tool_call in tool_calls:
                 tool_result_msg, exec_result = await self._execute_tool_call_with_result(tool_call)
-                self.messages.append(tool_result_msg)
+                self.conversation.append(tool_result_msg)
                 total_tool_calls += 1
                 yield AgentEvent(
                     type=AgentEventType.TOOL_RESULT,
@@ -300,7 +325,7 @@ class Agent:
         logger.warning("达到最大工具调用轮数，强制收尾")
 
         # 强制收尾也用流式
-        self.messages.append(
+        self.conversation.append(
             Message.user(
                 "你已经进行了很多轮工具调用。请根据目前获得的信息，"
                 "直接给出最终回答，不要再调用工具。"
@@ -319,9 +344,19 @@ class Agent:
                 round_usage.input_tokens += delta.usage.input_tokens
                 round_usage.output_tokens += delta.usage.output_tokens
 
-        self.messages.append(Message.assistant(full_content))
+        self.conversation.append(Message.assistant(full_content))
         self._accumulate_usage(round_usage)
+        await self._maybe_compress()
         yield AgentEvent(type=AgentEventType.FINISH, usage=round_usage)
+
+    async def _maybe_compress(self) -> None:
+        """检查是否需要压缩对话历史，需要则执行."""
+        if self.conversation.needs_compression():
+            compressed = await self.conversation.compress()
+            if compressed:
+                logger.info(
+                    "对话已压缩，当前 token 数: %d", self.conversation.token_count
+                )
 
     def _check_safety(
         self, tool_name: str, tool_call: ToolCall
@@ -559,7 +594,7 @@ class Agent:
         total_tool_calls: int,
     ) -> AgentResult:
         """超出轮数限制时，不带 tools 做一次收尾调用."""
-        self.messages.append(
+        self.conversation.append(
             Message.user(
                 "你已经进行了很多轮工具调用。请根据目前获得的信息，"
                 "直接给出最终回答，不要再调用工具。"
@@ -568,7 +603,7 @@ class Agent:
         response = await self.llm_client.chat(messages=self.messages, tools=None)
         accumulated_usage.input_tokens += response.usage.input_tokens
         accumulated_usage.output_tokens += response.usage.output_tokens
-        self.messages.append(Message.assistant(response.content))
+        self.conversation.append(Message.assistant(response.content))
         self._accumulate_usage(accumulated_usage)
         return AgentResult(
             content=response.content,
@@ -583,6 +618,6 @@ class Agent:
 
     def reset(self) -> None:
         """重置对话历史（保留 system prompt）."""
-        self.messages = [Message.system(self.system_prompt)]
+        self.conversation.reset(self._build_full_system_prompt())
         if self.loop_guard:
             self.loop_guard.reset()
