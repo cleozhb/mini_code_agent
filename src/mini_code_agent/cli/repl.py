@@ -73,7 +73,10 @@ class REPL:
 
         # 斜杠命令补全
         self._completer = WordCompleter(
-            ["/quit", "/exit", "/q", "/clear", "/cost", "/model", "/memory", "/save"],
+            [
+                "/quit", "/exit", "/q", "/clear", "/cost", "/model",
+                "/memory", "/save", "/plan",
+            ],
             sentence=True,  # 整条匹配，不拆词
         )
 
@@ -104,8 +107,11 @@ class REPL:
                     break
                 continue
 
-            # 正常对话 → 流式执行
-            await self._run_agent_stream(user_input)
+            # Plan mode 用非流式（在步骤间渲染进度）；否则走流式
+            if self.agent.plan_mode and self.agent.planner is not None:
+                await self._run_agent_plan(user_input)
+            else:
+                await self._run_agent_stream(user_input)
 
     async def _get_input(self) -> str:
         """获取用户输入，支持多行（Alt+Enter 提交，Enter 换行默认单行）."""
@@ -156,11 +162,37 @@ class REPL:
             self._save_memory(save_arg)
             return True
 
+        if command == "/plan":
+            plan_arg = parts[1].strip().lower() if len(parts) > 1 else ""
+            self._toggle_plan_mode(plan_arg)
+            return True
+
         self.console.print(f"[red]未知命令: {command}[/red]")
         self.console.print(
-            "[dim]可用命令: /quit  /clear  /cost  /model  /memory  /save[/dim]"
+            "[dim]可用命令: /quit  /clear  /cost  /model  /memory  /save  /plan[/dim]"
         )
         return True
+
+    def _toggle_plan_mode(self, arg: str) -> None:
+        """开关 plan mode."""
+        if self.agent.planner is None:
+            self.console.print("[red]Plan mode 未初始化（缺少 Planner）[/red]")
+            return
+
+        if arg in ("on", "enable", "true", "1"):
+            self.agent.plan_mode = True
+        elif arg in ("off", "disable", "false", "0"):
+            self.agent.plan_mode = False
+        elif arg == "":
+            self.agent.plan_mode = not self.agent.plan_mode
+        else:
+            self.console.print(f"[red]无法识别的参数: {arg}[/red]")
+            self.console.print("[dim]用法: /plan [on|off][/dim]")
+            return
+
+        status = "开启" if self.agent.plan_mode else "关闭"
+        color = "green" if self.agent.plan_mode else "yellow"
+        self.console.print(f"[{color}]Plan mode 已{status}[/{color}]")
 
     def _show_cost(self) -> None:
         """显示 token 消耗和费用估算."""
@@ -240,6 +272,28 @@ class REPL:
         old = self.agent.llm_client.model
         self.agent.llm_client.model = model_name
         self.console.print(f"[green]模型已切换: {old} → {model_name}[/green]")
+
+    async def _run_agent_plan(self, user_input: str) -> None:
+        """Plan mode：调用非流式 Agent.run()，中间通过回调渲染进度."""
+        self.console.print()
+        self.console.print(
+            "[dim]进入 Plan mode，正在生成执行计划...[/dim]"
+        )
+        try:
+            result = await self.agent.run(user_input)
+        except KeyboardInterrupt:
+            self.console.print("\n[yellow]已中断[/yellow]")
+            return
+        except Exception as e:
+            self.console.print(f"\n[red]错误: {type(e).__name__}: {e}[/red]")
+            return
+
+        # 展示最终回复
+        if result.content:
+            self.console.print()
+            self.console.print(result.content)
+        if result.usage:
+            self._render_usage_brief(result.usage)
 
     async def _run_agent_stream(self, user_input: str) -> None:
         """流式执行 Agent 并实时渲染输出."""
@@ -376,6 +430,7 @@ class REPL:
             f"  /model  — 切换模型\n"
             f"  /memory — 查看记忆状态\n"
             f"  /save   — 保存信息到项目记忆\n"
+            f"  /plan   — 切换 Plan 模式（先规划后执行）\n"
             f"  Ctrl+C  — 中断当前操作\n"
             f"  多行输入：Alt+Enter 换行，Enter 提交",
             border_style="blue",

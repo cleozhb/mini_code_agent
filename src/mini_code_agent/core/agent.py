@@ -24,6 +24,7 @@ from ..safety.file_guard import FileGuard
 from ..safety.loop_guard import LoopGuard
 from ..tools.base import PermissionLevel, ToolRegistry
 from ..tools.base import ToolResult as ExecToolResult
+from .planner import Plan, Planner, PlannerError
 from .retry import RetryController
 from .verifier import VerificationResult, Verifier
 
@@ -82,6 +83,24 @@ ConfirmCallback = Callable[
 ]
 
 
+# Plan mode 回调类型
+# - plan_confirm_callback: 传入生成好的 Plan，返回 (approved, final_plan_or_none)
+# - plan_progress_callback: 在每一步开始/结束时回调 (index_1based, total, step, phase, success)
+# - plan_replan_callback: 某步失败时调用，返回 "replan" | "continue" | "abort"
+PlanConfirmCallback = Callable[
+    [Plan],
+    Awaitable[tuple[bool, Plan | None]],
+]
+PlanProgressCallback = Callable[
+    [int, int, Any, str, bool],  # (idx, total, step, phase: "start"|"end", success)
+    Awaitable[None],
+]
+PlanReplanCallback = Callable[
+    [Plan, int, str],  # (plan, failed_step_1based, last_content)
+    Awaitable[str],  # "replan" | "continue" | "abort"
+]
+
+
 class Agent:
     """编程 Agent，通过 ReAct 循环协调 LLM 与工具调用."""
 
@@ -98,6 +117,11 @@ class Agent:
         verifier: Verifier | None = None,
         retry_controller: RetryController | None = None,
         project_path: str | None = None,
+        plan_mode: bool = False,
+        planner: Planner | None = None,
+        plan_confirm_callback: PlanConfirmCallback | None = None,
+        plan_progress_callback: PlanProgressCallback | None = None,
+        plan_replan_callback: PlanReplanCallback | None = None,
     ) -> None:
         self.llm_client = llm_client
         self.tool_registry = tool_registry
@@ -114,6 +138,13 @@ class Agent:
             RetryController() if verifier is not None else None
         )
         self.project_path = project_path
+
+        # Plan mode 相关
+        self.plan_mode = plan_mode
+        self.planner = planner
+        self.plan_confirm_callback = plan_confirm_callback
+        self.plan_progress_callback = plan_progress_callback
+        self.plan_replan_callback = plan_replan_callback
 
         # 当前任务期间追踪改动过哪些文件（供 Verifier 使用）
         self._files_changed: list[str] = []
@@ -142,6 +173,10 @@ class Agent:
         如果配置了 Verifier，纯文本回复之后会自动对改动的文件跑一次验证，
         失败时在 RetryController 允许的范围内自动把错误回传给 LLM 继续修复。
         """
+        # Plan mode 分支：先生成计划，让用户确认，再按步骤执行
+        if self.plan_mode and self.planner is not None:
+            return await self._run_with_plan(user_message)
+
         # 每次顶层 run() 开始时重置文件追踪与重试计数
         self._files_changed = []
         if self.retry_controller is not None:
@@ -203,6 +238,157 @@ class Agent:
             usage=total_usage,
             tool_calls_count=total_tool_calls,
         )
+
+    async def _run_with_plan(self, user_message: str) -> AgentResult:
+        """Plan mode：先生成计划 → 用户确认 → 按步骤执行.
+
+        流程：
+        1. 调用 Planner 生成 Plan
+        2. 通过 plan_confirm_callback 让用户确认 / 编辑 / 放弃
+        3. 逐步执行每一步（每步一次 _run_once）
+        4. 每一步用 plan_progress_callback 通知进度
+        5. 如果某步失败（tool 报错），通过 plan_replan_callback 询问是否重规划
+        """
+        assert self.planner is not None
+
+        # 生成计划
+        try:
+            plan = await self.planner.plan(user_message)
+        except PlannerError as e:
+            logger.warning("计划生成失败，回退到普通模式: %s", e)
+            self.plan_mode = False
+            try:
+                return await self.run(user_message)
+            finally:
+                self.plan_mode = True
+
+        # 请用户确认
+        if self.plan_confirm_callback:
+            approved, edited = await self.plan_confirm_callback(plan)
+            if not approved:
+                return AgentResult(
+                    content="[已放弃] 用户取消了计划。",
+                    usage=TokenUsage(),
+                    tool_calls_count=0,
+                )
+            if edited is not None:
+                plan = edited
+
+        # 把计划整体推给对话：后续每一步都基于这个上下文
+        plan_intro = (
+            "现在进入分步执行模式。以下是已确认的执行计划：\n\n"
+            f"{plan.format_for_prompt()}\n\n"
+            "接下来我会按顺序告诉你每一步要做什么，"
+            "你只需针对当前步骤行动，必要时调用工具，完成后简要说明即可。"
+        )
+        self.conversation.append(Message.user(plan_intro))
+        self.conversation.append(Message.assistant("收到计划，我会按步骤执行。"))
+
+        total_usage = TokenUsage()
+        total_tool_calls = 0
+        last_content = ""
+
+        # 重置重试控制器（整次 plan run 共用一个，顶层）
+        if self.retry_controller is not None:
+            self.retry_controller.reset()
+        self._files_changed = []
+
+        i = 0
+        while i < len(plan.steps):
+            step = plan.steps[i]
+            step_num = i + 1
+            total = len(plan.steps)
+
+            if self.plan_progress_callback:
+                await self.plan_progress_callback(step_num, total, step, "start", True)
+
+            step_prompt_lines = [
+                f"【第 {step_num}/{total} 步】{step.description}",
+            ]
+            if step.files_involved:
+                step_prompt_lines.append(
+                    f"涉及文件：{', '.join(step.files_involved)}"
+                )
+            if step.tools_needed:
+                step_prompt_lines.append(
+                    f"可能用到的工具：{', '.join(step.tools_needed)}"
+                )
+            if step.verification:
+                step_prompt_lines.append(f"完成后请验证：{step.verification}")
+            step_prompt_lines.append("请只完成这一步，不要跨步执行。")
+            step_prompt = "\n".join(step_prompt_lines)
+
+            single = await self._run_once(step_prompt)
+            total_usage.input_tokens += single.usage.input_tokens
+            total_usage.output_tokens += single.usage.output_tokens
+            total_tool_calls += single.tool_calls_count
+            last_content = single.content
+
+            success = not self._last_step_had_tool_error()
+            if self.plan_progress_callback:
+                await self.plan_progress_callback(
+                    step_num, total, step, "end", success
+                )
+
+            if not success and self.plan_replan_callback is not None:
+                choice = await self.plan_replan_callback(plan, step_num, last_content)
+                if choice == "replan":
+                    # 基于剩余目标和上一步的错误重新规划
+                    remaining_goal = (
+                        f"原始目标：{plan.goal}\n"
+                        f"已完成步骤：{step_num - 1}/{total}\n"
+                        f"当前失败步骤：{step.description}\n"
+                        f"请对剩余工作重新规划。"
+                    )
+                    try:
+                        new_plan = await self.planner.plan(remaining_goal)
+                    except PlannerError as e:
+                        logger.warning("重规划失败: %s", e)
+                        break
+
+                    if self.plan_confirm_callback:
+                        approved, edited = await self.plan_confirm_callback(new_plan)
+                        if not approved:
+                            last_content = "[已放弃] 用户在重规划环节取消。"
+                            break
+                        if edited is not None:
+                            new_plan = edited
+
+                    # 把新计划接到当前对话
+                    self.conversation.append(
+                        Message.user(
+                            "基于当前进展，重新规划后的剩余步骤：\n\n"
+                            f"{new_plan.format_for_prompt()}"
+                        )
+                    )
+                    self.conversation.append(
+                        Message.assistant("收到新计划，继续按步骤执行。")
+                    )
+                    plan = new_plan
+                    i = 0
+                    continue
+                if choice == "abort":
+                    last_content = last_content or "[已放弃] 用户在某步失败后放弃。"
+                    break
+                # "continue" → 跳过失败步骤，继续下一步
+
+            i += 1
+
+        return AgentResult(
+            content=last_content or "计划执行完毕。",
+            usage=total_usage,
+            tool_calls_count=total_tool_calls,
+        )
+
+    def _last_step_had_tool_error(self) -> bool:
+        """粗略判断最近一步是否遇到 tool 错误：扫最近几条 tool 消息."""
+        for msg in reversed(self.conversation.messages):
+            if msg.role.value == "tool" and msg.tool_result is not None:
+                return bool(msg.tool_result.is_error)
+            if msg.role.value == "user":
+                # 已经回到步骤边界
+                break
+        return False
 
     async def _run_once(self, user_message: str) -> AgentResult:
         """单轮对话：发送消息 → 处理工具调用 → 返回最终文本.
