@@ -1,0 +1,14 @@
+id: L1-add-function
+level: 1
+description: |
+  在 utils.py 中添加一个函数，把 Unix 时间戳转换成 YYYY-MM-DD 字符串，
+  并补上测试。
+expected_files:
+  - src/utils.py
+  - tests/test_utils.py
+max_steps: 20
+max_tokens: 50000
+max_wall_time_seconds: 300
+tags:
+  - single-file
+  - python
