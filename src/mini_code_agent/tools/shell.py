@@ -34,6 +34,8 @@ class BashTool(Tool):
     max_output_lines: int = 200
     head_lines: int = 20
     tail_lines: int = 50
+    # 限制子进程的工作目录；None 表示继承当前进程 cwd（保持原行为）
+    cwd: str | None = None
 
     async def execute(self, **kwargs: Any) -> ToolResult:
         command: str = kwargs["command"]
@@ -43,6 +45,7 @@ class BashTool(Tool):
                 command,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.STDOUT,
+                cwd=self.cwd,
             )
             stdout, _ = await asyncio.wait_for(
                 proc.communicate(), timeout=self.timeout

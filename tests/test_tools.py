@@ -349,6 +349,24 @@ class TestBashTool:
     async def test_permission_level(self, tool: BashTool) -> None:
         assert tool.permission_level == PermissionLevel.CONFIRM
 
+    async def test_cwd_scopes_subprocess(self, tmp_path) -> None:
+        """设置 cwd 后，子进程的工作目录应被限制到 cwd."""
+        tool = BashTool(cwd=str(tmp_path))
+        result = await tool.execute(command="pwd")
+        assert not result.is_error
+        # macOS 上 /tmp 和 /private/tmp 等价，比较 realpath
+        import os
+        expected = os.path.realpath(str(tmp_path))
+        actual = os.path.realpath(result.output.strip())
+        assert actual == expected
+
+    async def test_cwd_isolates_relative_paths(self, tmp_path) -> None:
+        """相对路径操作应发生在 cwd 内部，而不是当前进程目录."""
+        tool = BashTool(cwd=str(tmp_path))
+        result = await tool.execute(command="touch marker.txt && ls marker.txt")
+        assert not result.is_error
+        assert (tmp_path / "marker.txt").exists()
+
 
 # ===========================================================================
 # GrepTool 测试

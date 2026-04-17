@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, AsyncIterator, Callable, Awaitable
+from typing import Any, AsyncIterator, Callable, Awaitable, Literal
 
 from ..llm.base import (
     LLMClient,
@@ -40,6 +41,9 @@ class AgentError(Exception):
     """Agent 运行时错误."""
 
 
+StopReason = Literal["ok", "max_rounds", "max_tokens", "timeout", "error"]
+
+
 @dataclass
 class AgentResult:
     """单次 run() 的返回结果."""
@@ -47,6 +51,22 @@ class AgentResult:
     content: str
     usage: TokenUsage = field(default_factory=TokenUsage)
     tool_calls_count: int = 0
+    # 结束原因：
+    # - "ok"          正常结束（LLM 给出纯文本回复）
+    # - "max_rounds"  达到最大工具调用轮数，被强制收尾
+    # - "max_tokens"  达到 token 预算硬上限
+    # - "timeout"     超过 max_wall_time_seconds 墙钟上限
+    # - "error"       发生异常
+    stop_reason: StopReason = "ok"
+    # 工具调用里 is_error=True 的次数（含安全拦截、权限拒绝、工具异常、Bash exit≠0 等）
+    tool_calls_errors: int = 0
+    # Verifier 触发的统计；从未触发时为 None / 0
+    #   verifier_attempts      = 跑过几次 verifier（>=1 即触发过）
+    #   verifier_first_passed  = 首次 verifier 是否 pass
+    #   verifier_final_passed  = 最后一次 verifier 是否 pass
+    verifier_attempts: int = 0
+    verifier_first_passed: bool | None = None
+    verifier_final_passed: bool | None = None
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +142,7 @@ class Agent:
         plan_confirm_callback: PlanConfirmCallback | None = None,
         plan_progress_callback: PlanProgressCallback | None = None,
         plan_replan_callback: PlanReplanCallback | None = None,
+        max_wall_time_seconds: float | None = None,
     ) -> None:
         self.llm_client = llm_client
         self.tool_registry = tool_registry
@@ -138,6 +159,7 @@ class Agent:
             RetryController() if verifier is not None else None
         )
         self.project_path = project_path
+        self.max_wall_time_seconds = max_wall_time_seconds
 
         # Plan mode 相关
         self.plan_mode = plan_mode
@@ -168,6 +190,35 @@ class Agent:
         return self.conversation.messages
 
     async def run(self, user_message: str) -> AgentResult:
+        """核心循环入口：如果设置了 max_wall_time_seconds，用 wait_for 包裹整个执行.
+
+        超时后返回 stop_reason="timeout" 的 AgentResult，
+        注意：正在运行的 Bash 子进程可能残留（尽力而为）。
+        """
+        if self.max_wall_time_seconds is None:
+            return await self._run_impl(user_message)
+
+        try:
+            return await asyncio.wait_for(
+                self._run_impl(user_message),
+                timeout=self.max_wall_time_seconds,
+            )
+        except asyncio.TimeoutError:
+            logger.warning(
+                "Agent 运行超时（%.1fs），返回部分结果",
+                self.max_wall_time_seconds,
+            )
+            return AgentResult(
+                content=(
+                    f"[超时] Agent 超过 {self.max_wall_time_seconds:.0f}s "
+                    f"墙钟上限，已中止。"
+                ),
+                usage=TokenUsage(),
+                tool_calls_count=0,
+                stop_reason="timeout",
+            )
+
+    async def _run_impl(self, user_message: str) -> AgentResult:
         """核心循环：发送消息 → 处理工具调用 → 返回最终文本.
 
         如果配置了 Verifier，纯文本回复之后会自动对改动的文件跑一次验证，
@@ -184,15 +235,28 @@ class Agent:
 
         total_usage = TokenUsage()
         total_tool_calls = 0
+        total_tool_errors = 0
         last_content = ""
+        last_stop_reason: StopReason = "ok"
         current_user_msg = user_message
+
+        # verifier 统计
+        verifier_attempts = 0
+        verifier_first_passed: bool | None = None
+        verifier_final_passed: bool | None = None
 
         while True:
             single = await self._run_once(current_user_msg)
             total_usage.input_tokens += single.usage.input_tokens
             total_usage.output_tokens += single.usage.output_tokens
             total_tool_calls += single.tool_calls_count
+            total_tool_errors += single.tool_calls_errors
             last_content = single.content
+            last_stop_reason = single.stop_reason
+
+            # 异常终止（max_tokens / max_rounds）— 不再走 verifier 重试
+            if single.stop_reason != "ok":
+                break
 
             # 没有 verifier，或者本轮没改过文件 → 不触发验证
             if (
@@ -205,6 +269,11 @@ class Agent:
             vr: VerificationResult = await self.verifier.verify_code_change(
                 self._files_changed, self.project_path
             )
+            verifier_attempts += 1
+            if verifier_first_passed is None:
+                verifier_first_passed = vr.passed
+            verifier_final_passed = vr.passed
+
             if vr.passed:
                 logger.info("验证通过（%d 个文件）", len(self._files_changed))
                 break
@@ -237,6 +306,11 @@ class Agent:
             content=last_content,
             usage=total_usage,
             tool_calls_count=total_tool_calls,
+            stop_reason=last_stop_reason,
+            tool_calls_errors=total_tool_errors,
+            verifier_attempts=verifier_attempts,
+            verifier_first_passed=verifier_first_passed,
+            verifier_final_passed=verifier_final_passed,
         )
 
     async def _run_with_plan(self, user_message: str) -> AgentResult:
@@ -405,6 +479,7 @@ class Agent:
         tool_params = self.tool_registry.to_tool_params()
         round_usage = TokenUsage()
         total_tool_calls = 0
+        total_tool_errors = 0
 
         max_rounds = self.loop_guard.max_rounds if self.loop_guard else MAX_TOOL_ROUNDS
 
@@ -432,6 +507,21 @@ class Agent:
                 )
                 if token_msg:
                     logger.warning(token_msg)
+                # 硬超限：push 提示后直接停掉本轮，且标记 stop_reason
+                if self.loop_guard.total_tokens >= self.loop_guard.max_tokens:
+                    if response.content:
+                        self.conversation.append(
+                            Message.assistant(response.content)
+                        )
+                    self._accumulate_usage(round_usage)
+                    await self._maybe_compress()
+                    return AgentResult(
+                        content=response.content or (token_msg or "[预算耗尽]"),
+                        usage=round_usage,
+                        tool_calls_count=total_tool_calls,
+                        stop_reason="max_tokens",
+                        tool_calls_errors=total_tool_errors,
+                    )
 
             # 没有 tool_calls → 纯文本回复，结束循环
             if not response.tool_calls:
@@ -442,6 +532,8 @@ class Agent:
                     content=response.content,
                     usage=round_usage,
                     tool_calls_count=total_tool_calls,
+                    stop_reason="ok",
+                    tool_calls_errors=total_tool_errors,
                 )
 
             # 有 tool_calls → 先把 assistant 消息（含 tool_calls）加入历史
@@ -454,11 +546,18 @@ class Agent:
                 tool_result_msg = await self._execute_tool_call(tool_call)
                 self.conversation.append(tool_result_msg)
                 total_tool_calls += 1
+                if (
+                    tool_result_msg.tool_result is not None
+                    and tool_result_msg.tool_result.is_error
+                ):
+                    total_tool_errors += 1
 
         # 超过最大轮数，做一次不带 tools 的收尾调用
         self._accumulate_usage(round_usage)
         logger.warning("达到最大工具调用轮数，强制收尾")
-        result = await self._force_final_response(round_usage, total_tool_calls)
+        result = await self._force_final_response(
+            round_usage, total_tool_calls, total_tool_errors
+        )
         await self._maybe_compress()
         return result
 
@@ -886,6 +985,7 @@ class Agent:
         self,
         accumulated_usage: TokenUsage,
         total_tool_calls: int,
+        total_tool_errors: int = 0,
     ) -> AgentResult:
         """超出轮数限制时，不带 tools 做一次收尾调用."""
         self.conversation.append(
@@ -903,6 +1003,8 @@ class Agent:
             content=response.content,
             usage=accumulated_usage,
             tool_calls_count=total_tool_calls,
+            stop_reason="max_rounds",
+            tool_calls_errors=total_tool_errors,
         )
 
     def _accumulate_usage(self, usage: TokenUsage) -> None:

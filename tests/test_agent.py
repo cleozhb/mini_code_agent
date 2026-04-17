@@ -274,6 +274,218 @@ async def test_agent_max_rounds_protection():
     # 最多执行 25 轮
     assert result.tool_calls_count == 25
     assert result.content == "好的，以上是结果。"
+    assert result.stop_reason == "max_rounds"
+
+
+# ==================================================================
+# 单元测试：stop_reason — token 硬超限 / 墙钟超时
+# ==================================================================
+
+
+@pytest.mark.asyncio
+async def test_agent_stop_reason_ok_on_normal_finish():
+    """正常结束应返回 stop_reason='ok'."""
+    mock_client = MockLLMClient([
+        LLMResponse(content="搞定。", usage=TokenUsage(10, 5)),
+    ])
+    agent = Agent(mock_client, ToolRegistry(), "你是助手")
+    result = await agent.run("来一个")
+    assert result.stop_reason == "ok"
+
+
+@pytest.mark.asyncio
+async def test_agent_stop_reason_max_tokens():
+    """LoopGuard 的 max_tokens 硬超限时应中断并标记 stop_reason='max_tokens'."""
+    from mini_code_agent.safety import LoopGuard
+
+    # 第一轮就超 1000 预算
+    mock_client = MockLLMClient([
+        LLMResponse(
+            content="",
+            tool_calls=[ToolCall(id="c1", name="list_dir", arguments={})],
+            usage=TokenUsage(800, 300),
+        ),
+        # 不应被调用到；若调用会 RuntimeError Mock 用尽
+    ])
+    registry = ToolRegistry()
+    registry.register(ListDirTool())
+    lg = LoopGuard(max_tokens=1000, max_rounds=50)
+    agent = Agent(mock_client, registry, "你是助手", loop_guard=lg)
+
+    result = await agent.run("test")
+    assert result.stop_reason == "max_tokens"
+
+
+@pytest.mark.asyncio
+async def test_agent_tool_calls_errors_counted(tmp_path: Path):
+    """tool_result.is_error=True 的次数应被汇总到 tool_calls_errors."""
+    # 让 ReadFile 读不存在的文件 → is_error=True
+    missing = tmp_path / "nope.txt"
+    assert not missing.exists()
+
+    mock_client = MockLLMClient([
+        # 1: 连读两个，第一个存在、第二个不存在
+        LLMResponse(
+            content="",
+            tool_calls=[
+                ToolCall(id="c1", name="ReadFile", arguments={"path": str(missing)}),
+                ToolCall(id="c2", name="ReadFile", arguments={"path": str(missing)}),
+            ],
+            usage=TokenUsage(50, 10),
+        ),
+        # 2: 收尾
+        LLMResponse(content="读不到", usage=TokenUsage(20, 5)),
+    ])
+    registry = ToolRegistry()
+    registry.register(ReadFileTool())
+    agent = Agent(mock_client, registry, "你是助手")
+
+    result = await agent.run("读一下")
+    assert result.tool_calls_count == 2
+    assert result.tool_calls_errors == 2  # 两次都是 is_error
+
+
+@pytest.mark.asyncio
+async def test_agent_verifier_first_pass_no_retry(tmp_path: Path):
+    """改了文件后 verifier 一把过 — first_passed / final_passed 都 True，attempts=1."""
+    from mini_code_agent.core import Verifier
+
+    class AlwaysPassVerifier(Verifier):
+        async def verify_code_change(self, files_changed, project_path):
+            from mini_code_agent.core.verifier import VerificationResult
+            return VerificationResult(passed=True)
+
+    target = tmp_path / "x.py"
+
+    mock_client = MockLLMClient([
+        # 1: 写文件
+        LLMResponse(
+            content="",
+            tool_calls=[
+                ToolCall(
+                    id="c1",
+                    name="WriteFile",
+                    arguments={"path": str(target), "content": "x = 1\n"},
+                ),
+            ],
+            usage=TokenUsage(10, 5),
+        ),
+        # 2: 收尾
+        LLMResponse(content="已写", usage=TokenUsage(10, 5)),
+    ])
+    registry = ToolRegistry()
+    registry.register(WriteFileTool())
+    agent = Agent(
+        mock_client, registry, "你是助手",
+        verifier=AlwaysPassVerifier(),
+        project_path=str(tmp_path),
+    )
+    result = await agent.run("写个文件")
+    assert result.verifier_attempts == 1
+    assert result.verifier_first_passed is True
+    assert result.verifier_final_passed is True
+
+
+@pytest.mark.asyncio
+async def test_agent_verifier_recovery_tracked(tmp_path: Path):
+    """首次 verifier 失败、重试后 pass — first=False, final=True, attempts=2."""
+    from mini_code_agent.core import Verifier
+    from mini_code_agent.core.verifier import VerificationResult
+
+    class FailThenPassVerifier(Verifier):
+        def __init__(self):
+            super().__init__()
+            self._calls = 0
+
+        async def verify_code_change(self, files_changed, project_path):
+            self._calls += 1
+            if self._calls == 1:
+                return VerificationResult(passed=False, errors=["first fail"])
+            return VerificationResult(passed=True)
+
+    target = tmp_path / "y.py"
+
+    mock_client = MockLLMClient([
+        # 1: 写文件
+        LLMResponse(
+            content="",
+            tool_calls=[
+                ToolCall(
+                    id="c1",
+                    name="WriteFile",
+                    arguments={"path": str(target), "content": "y = 1\n"},
+                ),
+            ],
+            usage=TokenUsage(10, 5),
+        ),
+        # 2: 收尾（第一次）
+        LLMResponse(content="已写", usage=TokenUsage(10, 5)),
+        # 3: verifier 失败后，retry prompt 触发再一次修复
+        LLMResponse(
+            content="",
+            tool_calls=[
+                ToolCall(
+                    id="c2",
+                    name="WriteFile",
+                    arguments={"path": str(target), "content": "y = 2\n"},
+                ),
+            ],
+            usage=TokenUsage(10, 5),
+        ),
+        # 4: 收尾（修好）
+        LLMResponse(content="已修", usage=TokenUsage(10, 5)),
+    ])
+    registry = ToolRegistry()
+    registry.register(WriteFileTool())
+    agent = Agent(
+        mock_client, registry, "你是助手",
+        verifier=FailThenPassVerifier(),
+        project_path=str(tmp_path),
+    )
+    result = await agent.run("写个文件")
+    assert result.verifier_attempts == 2
+    assert result.verifier_first_passed is False
+    assert result.verifier_final_passed is True
+
+
+@pytest.mark.asyncio
+async def test_agent_verifier_not_triggered(tmp_path: Path):
+    """没改文件时 verifier 不触发，字段保持默认 None/0."""
+    mock_client = MockLLMClient([
+        LLMResponse(content="不需要改", usage=TokenUsage(10, 5)),
+    ])
+    agent = Agent(mock_client, ToolRegistry(), "你是助手")
+    result = await agent.run("只是问个问题")
+    assert result.verifier_attempts == 0
+    assert result.verifier_first_passed is None
+    assert result.verifier_final_passed is None
+
+
+@pytest.mark.asyncio
+async def test_agent_stop_reason_timeout():
+    """设置了 max_wall_time_seconds 且真的超时后，应返回 stop_reason='timeout'."""
+    import asyncio
+
+    class SlowMockClient(LLMClient):
+        def __init__(self) -> None:
+            super().__init__(model="slow-mock")
+
+        async def chat(self, messages, tools=None):
+            await asyncio.sleep(5)  # 远超 timeout
+            return LLMResponse(content="太慢了", usage=TokenUsage(10, 5))
+
+        def chat_stream(self, messages, tools=None):
+            raise NotImplementedError
+
+    agent = Agent(
+        SlowMockClient(),
+        ToolRegistry(),
+        "你是助手",
+        max_wall_time_seconds=0.2,
+    )
+    result = await agent.run("test")
+    assert result.stop_reason == "timeout"
+    assert "超时" in result.content
 
 
 # ==================================================================
