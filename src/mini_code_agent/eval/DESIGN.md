@@ -15,8 +15,9 @@
 | Agent 侧前置改动（BashTool cwd、stop_reason、max_wall_time、tool/verifier 统计） | ✅ 已完成并通过所有测试 |
 | PR1: `benchmark.py` + 1 个最小任务 + `snapshot.py` | ✅ 已 merge (PR #8) |
 | PR2: `runner.py` + `ModelPricing` + 端到端跑通 | ✅ 已 merge (PR #9) |
-| PR3: `tracker.py` + compare + trend | ✅ 本 PR |
-| PR4: CLI 子命令 + 剩余 11 个任务 | ⬜ 未开始 |
+| PR3: `tracker.py` + compare + trend | ✅ 已 merge |
+| PR4a: CLI 子命令 + 第 2 个任务（L1-add-classmethod） | ✅ 本 PR |
+| PR4b+: 剩余 10 个 benchmark 任务（分批） | ⬜ 未开始 |
 
 ---
 
@@ -254,6 +255,8 @@ class EvalSummary:
 - `L3-api-integration`：基于现有 HTTP client 给未实现的 endpoint 补完（含错误处理 + 重试 + 测试）
 
 **强制开发顺序**：先只写 `L1-add-function` 一个任务，把 runner / validate / snapshot / tracker 全流程打通再扩量。fixture 和 validate 的坑一次性暴露比较好。
+
+> 已验证的 validate.py 工程经验（PR4a 踩过）：如果 workspace 里的模块用了 `@dataclass`，validate.py 通过 `importlib.util` 加载它之前必须把模块写进 `sys.modules`，否则 dataclass 内部查 `sys.modules[cls.__module__]` 会拿到 None，抛 "NoneType has no attribute __dict__"。后续任务写 validate 时先抄 `L1-add-classmethod/validate.py` 的 `_load_*` 函数。
 
 ### validate.py 协议
 
