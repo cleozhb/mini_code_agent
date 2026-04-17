@@ -1,0 +1,16 @@
+id: L1-rename-var
+level: 1
+description: |
+  把 user.py 中所有 `user_id` 重命名为 `uid`（包括类属性、函数参数、局部变量、类型注解）。
+  同步更新 tests/test_user.py 中的引用，确保测试通过。
+  重命名完成后代码里不应再出现任何 `user_id` 标识符。
+expected_files:
+  - user.py
+  - tests/test_user.py
+max_steps: 20
+max_tokens: 50000
+max_wall_time_seconds: 300
+tags:
+  - single-file
+  - python
+  - refactor

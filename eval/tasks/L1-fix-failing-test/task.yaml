@@ -1,0 +1,14 @@
+id: L1-fix-failing-test
+level: 1
+description: |
+  跑 `pytest tests/test_parser.py` 有测试失败，定位并修复。
+  约束：只改产品代码 parser.py，不允许删除或修改测试用例。
+expected_files:
+  - parser.py
+max_steps: 20
+max_tokens: 50000
+max_wall_time_seconds: 300
+tags:
+  - single-file
+  - python
+  - bug-fix
