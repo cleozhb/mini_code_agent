@@ -1,0 +1,466 @@
+# Evaluation 系统设计文档
+
+本文档是 mini_code_agent Evaluation 系统的完整设计说明与施工蓝图。每次新会话接手这个工作时，先读本文档 + 根目录 `CLAUDE.md` 即可接着干。
+
+## 目的
+
+在后续优化 Agent 时，能**量化**每次改动的影响。改完跑 eval 要能看到每个指标的具体变化，而不是凭感觉判断。
+
+---
+
+## 状态
+
+| 模块 | 状态 |
+|---|---|
+| Agent 侧前置改动（BashTool cwd、stop_reason、max_wall_time、tool/verifier 统计） | ✅ 已完成并通过所有测试 |
+| PR1: `benchmark.py` + 1 个最小任务 + `snapshot.py` | ⬜ 未开始 |
+| PR2: `runner.py` + `ModelPricing` + 端到端跑通 | ⬜ 未开始 |
+| PR3: `tracker.py` + compare + trend | ⬜ 未开始 |
+| PR4: CLI 子命令 + 剩余 11 个任务 | ⬜ 未开始 |
+
+---
+
+## 0. 已完成：Agent 侧前置改动
+
+这三件事不属于 eval 模块，但 eval 强依赖它们，已经实现并测过：
+
+### 0.1 BashTool 加 cwd 字段
+`src/mini_code_agent/tools/shell.py` — `BashTool` 多一个 `cwd: str | None = None`，透传给 `create_subprocess_shell`。默认 `None` 保持原行为；eval runner 构造时设为任务 workspace 目录，把 Agent 的 Bash 操作锁在隔离区内。
+
+### 0.2 Agent 墙钟超时与硬中断
+`src/mini_code_agent/core/agent.py`：
+
+- `Agent.__init__` 加 `max_wall_time_seconds: float | None = None`
+- `run()` 拆成外层 `asyncio.wait_for` + 内部 `_run_impl()`
+- `LoopGuard.max_tokens` 超限时 `_run_once` 真的中断（之前只 log 不 break — 修复了）
+- `AgentResult` 新增字段 `stop_reason: Literal["ok","max_rounds","max_tokens","timeout","error"]`
+- `_force_final_response` 返回 `stop_reason="max_rounds"`
+- 超时返 `stop_reason="timeout"`
+
+### 0.3 AgentResult 暴露 eval 所需的统计量
+`AgentResult` 同时新增这 4 个字段（默认值不破坏现有调用点）：
+
+```python
+tool_calls_errors: int = 0                    # is_error=True 的 tool_call 数
+verifier_attempts: int = 0                    # 跑了几次 verifier
+verifier_first_passed: bool | None = None     # 首次 verifier 是否 pass（None=没触发）
+verifier_final_passed: bool | None = None     # 末次 verifier 是否 pass
+```
+
+`_run_once` 累计 `tool_calls_errors`；`_run_impl` 在 verifier 重试循环里记录 first/final。
+
+### 0.4 测试
+`tests/test_agent.py` 新增覆盖：
+- `test_agent_max_rounds_protection` 断言 `stop_reason == "max_rounds"`
+- `test_agent_stop_reason_ok_on_normal_finish`
+- `test_agent_stop_reason_max_tokens`
+- `test_agent_stop_reason_timeout`
+- `test_agent_tool_calls_errors_counted`
+- `test_agent_verifier_first_pass_no_retry`
+- `test_agent_verifier_recovery_tracked`
+- `test_agent_verifier_not_triggered`
+
+`tests/test_tools.py` 新增：
+- `test_cwd_scopes_subprocess`
+- `test_cwd_isolates_relative_paths`
+
+---
+
+## 1. 目录结构
+
+```
+src/mini_code_agent/eval/
+  __init__.py
+  DESIGN.md             ← 本文档
+  benchmark.py          # BenchmarkTask / BenchmarkSuite / hash 计算
+  runner.py             # EvalRunner / TaskResult / SuiteResult / EvalSummary
+  tracker.py            # EvalTracker / ComparisonReport / TrendReport
+  snapshot.py           # workspace 文件快照 diff（edit_accuracy 用）
+  METRICS.md            # 指标定义文档（判定规则写死，避免漂移）
+
+eval/                   # 仓库根下，不在 src 下
+  tasks/                # benchmark 任务定义
+    L1-add-function/
+      task.yaml
+      workspace/        # Agent 的初始工作区
+      validate.py       # 验证脚本，最后一行输出 JSON
+    ...（共 12 个任务，见第 3 节）
+  results/              # 每次 eval 结果，{timestamp}_{commit}_{seq}.json
+    .gitignore          # 忽略本地结果
+
+tests/
+  test_eval_benchmark.py
+  test_eval_runner.py
+  test_eval_tracker.py
+```
+
+---
+
+## 2. 核心数据结构
+
+### BenchmarkTask
+
+```python
+@dataclass(frozen=True)
+class BenchmarkTask:
+    id: str                      # "L1-add-function"
+    level: int                   # 1 / 2 / 3
+    description: str             # 给 Agent 的任务描述（脱敏，像真实用户输入）
+    workspace_dir: Path          # task 目录下的 workspace/
+    validate_script: Path        # task 目录下的 validate.py
+    expected_files: list[str]    # 预期改动的相对路径
+    max_steps: int               # 该任务的 LoopGuard.max_rounds
+    max_tokens: int              # 该任务的 LoopGuard.max_tokens
+    max_wall_time_seconds: int   # 该任务的 Agent.max_wall_time_seconds
+    tags: list[str]              # ["single-file", "python", "bug-fix"]
+    task_hash: str               # 对 task 目录内容算 sha256（不含 __pycache__/.pyc/.DS_Store）
+```
+
+YAML 示例（`eval/tasks/L1-add-function/task.yaml`）：
+
+```yaml
+id: L1-add-function
+level: 1
+description: |
+  在 utils.py 中添加一个函数，把 Unix 时间戳转换成 YYYY-MM-DD 字符串，
+  并补上测试。
+expected_files:
+  - src/utils.py
+  - tests/test_utils.py
+max_steps: 20
+max_tokens: 50000
+max_wall_time_seconds: 300
+tags: [single-file, python]
+```
+
+### BenchmarkSuite
+
+```python
+class BenchmarkSuite:
+    tasks: list[BenchmarkTask]
+    suite_hash: str  # sha256 of sorted([task.id + ":" + task.task_hash for task in tasks])
+
+    @classmethod
+    def load_from_dir(cls, tasks_dir: Path) -> BenchmarkSuite: ...
+    def filter_by_level(self, level: int) -> BenchmarkSuite: ...
+    def filter_by_tag(self, tag: str) -> BenchmarkSuite: ...
+    def get(self, task_id: str) -> BenchmarkTask | None: ...
+```
+
+**Hash 计算规则**：
+- `task_hash`：遍历 task 目录下所有文件（按相对路径排序），逐个文件 `sha256(relpath || b"\0" || content)`，串起来再 sha256。忽略 `__pycache__/`、`*.pyc`、`.DS_Store`。
+- `suite_hash`：`sha256(sorted([f"{t.id}:{t.task_hash}" for t in tasks]).join("\n"))`
+
+### TaskResult / SuiteResult / EvalSummary
+
+```python
+@dataclass
+class TaskResult:
+    task_id: str
+    task_hash: str
+    run_index: int                     # 第几次运行（n>=3 时区分）
+    passed: bool                       # validate.py 最终判定
+    stop_reason: str                   # 来自 AgentResult.stop_reason
+    step_count: int                    # tool_calls_count
+    tool_error_count: int              # tool_calls_errors
+    prompt_tokens: int
+    completion_tokens: int
+    cost_usd: float                    # tokens × 模型单价
+    wall_time_seconds: float
+    verifier_first_passed: bool | None
+    verifier_final_passed: bool | None
+    files_changed_actual: list[str]    # 由 workspace snapshot diff 得出
+    edit_precision: float              # |actual ∩ expected| / |actual|
+    edit_recall: float                 # |actual ∩ expected| / |expected|
+    failure_category: str | None       # 见下
+    validation_details: str            # validate.py 的完整输出
+
+
+@dataclass
+class SuiteResult:
+    timestamp: str                     # ISO8601
+    git_commit: str | None
+    suite_hash: str
+    model_name: str
+    results: list[TaskResult]          # 每个 (task_id, run_index) 一条
+    summary: EvalSummary
+
+
+@dataclass
+class EvalSummary:
+    # 任务先在 n 次 run 里聚合成"任务通过率"，再对所有任务平均
+    task_success_rate: float
+    by_level: dict[int, float]         # {1: 0.8, 2: 0.5, 3: 0.3}
+    by_failure_category: dict[str, int]
+
+    avg_step_count: float
+    tool_error_rate: float             # sum(tool_errors) / sum(tool_calls)
+    verifier_first_pass_rate: float
+    verifier_recovery_rate: float      # 从失败中挽回的比例（见下）
+
+    avg_prompt_tokens: float
+    avg_completion_tokens: float
+    total_cost_usd: float
+    avg_wall_time_seconds: float
+    avg_edit_precision: float
+    avg_edit_recall: float
+```
+
+### failure_category（固定枚举）
+
+| 值 | 判定 |
+|---|---|
+| `"timeout"` | `stop_reason == "timeout"` |
+| `"max_tokens"` | `stop_reason == "max_tokens"` |
+| `"max_rounds"` | `stop_reason == "max_rounds"` |
+| `"validation_fail"` | Agent 正常结束但 validate.py 挂了 |
+| `"agent_error"` | run() 抛异常 |
+| `None` | 通过 |
+
+### recovery_rate 定义
+
+- `verifier_first_pass_rate` = 一把过的任务比例（`verifier_first_passed == True`）
+- `verifier_recovery_rate` = 本来首次失败但最终救回来的比例
+  - 分子：`verifier_first_passed == False && verifier_final_passed == True` 的任务数
+  - 分母：`verifier_first_passed == False` 的任务数（即首次失败过的任务总数）
+
+这是第三轮讨论时敲定的，替换了原计划模糊的 `error_recovery_count`。
+
+---
+
+## 3. Benchmark 任务清单（12 个）
+
+任务描述必须**脱敏**（像真实用户输入，不泄漏修复思路或答案），否则测不出真实能力。
+
+### Level 1（5 个，单文件修改）
+
+- `L1-add-function`：加一个时间戳格式化函数 + 测试
+- `L1-fix-failing-test`：跑 `pytest tests/test_parser.py` 有测试失败，修好（**不**说是 off-by-one）
+- `L1-add-classmethod`：给 Config 类加 `from_env()` 类方法
+- `L1-rename-var`：把某模块的 `user_id` 统一重命名为 `uid`，保持测试通过
+- `L1-add-docstring`：给某个无文档的模块批量加 docstring（验证：ast 解析出所有函数都有 docstring）
+
+### Level 2（4 个，多文件协作）
+
+- `L2-add-model-field`：给 User model 加 email 字段（model + schema + endpoint + test）
+- `L2-print-to-logger`：把 `print()` 替换成 logger 调用，涉及创建 logger 模块
+- `L2-cache-decorator`：给 3 个请求方法加缓存装饰器 + 失效测试
+- `L2-split-large-function`：把 100+ 行的函数拆成小函数（验证：单函数行数上限 + 测试通过）
+
+### Level 3（3 个，探索 + 修改）
+
+- `L3-find-and-fix-bugs`：测试 suite 里有 2 个 failing test，找出根因并修
+- `L3-refactor-module`：把 `auth.py` 里的 session 逻辑抽出到 `session.py`
+- `L3-api-integration`：基于现有 HTTP client 给未实现的 endpoint 补完（含错误处理 + 重试 + 测试）
+
+**强制开发顺序**：先只写 `L1-add-function` 一个任务，把 runner / validate / snapshot / tracker 全流程打通再扩量。fixture 和 validate 的坑一次性暴露比较好。
+
+### validate.py 协议
+
+每个任务的 `validate.py` 以子进程方式运行，cwd 是该 run 的临时 workspace。
+
+**约定**：脚本的**最后一行 stdout** 必须是一行合法 JSON：
+
+```json
+{"passed": true, "details": "all 3 tests passed", "tests_run": 3, "tests_passed": 3}
+```
+
+runner 只解析最后一行，前面的输出全部进 `TaskResult.validation_details`。JSON 解析失败或 `passed` 缺失 → `failure_category="validation_fail"`。
+
+---
+
+## 4. EvalRunner
+
+```python
+class EvalRunner:
+    def __init__(
+        self,
+        *,
+        agent_factory: Callable[[Path], Agent],  # 传 workspace，返回配好的 Agent
+        runs_per_task: int = 3,                  # 默认 n=3（信噪比）
+        parallel_tasks: int = 1,                 # 任务间并行度（默认串行）
+        model_name: str,
+        pricing: ModelPricing,                   # {input_per_1k, output_per_1k}
+    ): ...
+
+    async def run_task(self, task: BenchmarkTask) -> list[TaskResult]: ...
+    async def run_suite(self, suite: BenchmarkSuite) -> SuiteResult: ...
+```
+
+### 单次 run_task 流程
+
+1. 创建临时工作区：`shutil.copytree(task.workspace_dir, f"/tmp/eval-{uuid}/")`
+2. `snapshot.capture(workspace)` — 记录初始文件 `{relpath: (size, mtime, sha256)}`
+3. `agent = agent_factory(workspace_path)`：
+   - `BashTool(cwd=workspace_path)`
+   - `FileGuard(work_dir=workspace_path)`
+   - `LoopGuard(max_rounds=task.max_steps, max_tokens=task.max_tokens)`
+   - `Agent(..., max_wall_time_seconds=task.max_wall_time_seconds)`
+4. `result: AgentResult = await agent.run(task.description)`
+5. `files_changed_actual = snapshot.diff(workspace, initial_snapshot)` — 包括 Bash 间接改的
+6. 跑 `validate.py`：`python {validate_script}`，cwd=workspace，超时 60s，解析最后一行 JSON
+7. 计算 edit_precision/recall、failure_category、cost_usd → 组装 `TaskResult`
+
+### 关键细节
+
+- 工作区默认**不删除**（失败后能进去调试）。超过 7 天或超过 100 个由 tracker 在 trend/list 时清理老的。
+- `cost_usd = (prompt * input_per_1k + completion * output_per_1k) / 1000`
+- Agent 异常（不是 Agent 自己处理的那种）：`TaskResult.passed=False, failure_category="agent_error"`，不中断整个 suite
+- `parallel_tasks > 1` 时用 `asyncio.Semaphore` 控制并发；任务间互不依赖（临时目录隔离）
+
+### ModelPricing 内置表
+
+```python
+KNOWN_MODELS = {
+    "deepseek-chat":        ModelPricing(0.00014, 0.00028),
+    "gpt-4o":               ModelPricing(0.0025, 0.010),
+    "gpt-4o-mini":          ModelPricing(0.00015, 0.00060),
+    "claude-sonnet-4-5":    ModelPricing(0.003, 0.015),
+    # 必要时扩充
+}
+```
+
+用户可传 `pricing=ModelPricing(...)` 覆盖。
+
+---
+
+## 5. EvalTracker
+
+```python
+class EvalTracker:
+    def __init__(self, results_dir: Path): ...
+
+    def save(self, result: SuiteResult) -> Path:
+        # 文件名 {timestamp}_{commit}_{seq}.json
+        # 同 commit 多次跑，seq 递增，不覆盖
+
+    def list_runs(self, last_n: int | None = None) -> list[SuiteResult]: ...
+
+    def compare(self, run_a: SuiteResult, run_b: SuiteResult) -> ComparisonReport:
+        # suite_hash 不同 → 只对 task_hash 相同的任务做 diff（交集对比）
+        # 三部分：
+        #   - 共有任务的指标 diff（含箭头 + 颜色）
+        #   - 仅 A 有的任务（被删 / 定义变了）
+        #   - 仅 B 有的任务（新增 / 定义变了）
+
+    def trend(self, last_n: int = 10) -> TrendReport:
+        # 用 rich 画 5 个核心指标 sparkline：
+        #   task_success_rate / tool_error_rate / avg_cost / avg_wall_time / verifier_recovery_rate
+```
+
+---
+
+## 6. CLI（扩 main.py）
+
+```
+main.py eval                              # 跑全部任务，n=3 次/任务
+main.py eval --level 1                    # 只跑 L1
+main.py eval --task L1-add-function       # 跑单任务
+main.py eval --runs 1                     # 覆盖默认 n
+main.py eval --parallel 4                 # 任务间并行度
+main.py eval --no-save                    # 不落盘
+main.py eval --compare                    # 对比最近两次
+main.py eval --compare RUN_A RUN_B        # 对比指定两次
+main.py eval --trend                      # 最近 10 次趋势
+main.py eval --trend 20                   # 最近 N 次
+```
+
+---
+
+## 7. 测试
+
+### `test_eval_benchmark.py`
+- YAML 加载、`filter_by_level` / `filter_by_tag`
+- `task_hash` 稳定性：同内容同 hash，改一字节变 hash
+- `suite_hash` 一致性
+
+### `test_eval_runner.py`
+- MockLLMClient + 临时最小任务，端到端跑通 `run_task`
+- 超时任务被正确标 `failure_category="timeout"`
+- `edit_precision/recall` 对照预期
+- `validate.py` JSON 解析失败 → `failure_category="validation_fail"`
+
+### `test_eval_tracker.py`
+- 存读往返
+- `compare` 在 `suite_hash` 不同时只对比交集
+- 同 commit 多次保存，文件名 `seq` 递增不覆盖
+
+---
+
+## 8. 明确排除（避免 scope creep）
+
+- ❌ **Plan mode 相关指标**（`plan_steps_failed` 等）— 等真跑 L3 有数据再说
+- ❌ **tool_error 良性失败过滤**（`test -f` 这种）— 接受噪音，相对变化仍可比
+- ❌ **JS/TS 任务** — 全 Python fixture，避免 node 依赖
+- ❌ **多模型对比自动化** — 一次一个模型，跨 run 比靠 tracker
+- ❌ **Web UI / notebook 分析工具** — JSON 落盘后用户自己分析
+
+---
+
+## 9. 关键决策备忘（为什么这么设计）
+
+### 9.1 Benchmark 版本化（每任务 hash + 交集对比）
+
+Benchmark 本身会演进（改描述、改 workspace、改 validate），跨时间对比会"苹果 vs 橘子"。
+
+- 每任务单独算 `task_hash`，而不只是整体 `suite_hash` — 这样"你改了 1 个任务"不会让另外 11 个任务的对比作废
+- `tracker.compare` 在 suite_hash 不同时只对比 task_hash 相同的任务子集，新增/删除/变更的任务单独列出
+- 结果 JSON 同时记录 `suite_hash` 和每个 result 的 `task_hash`，这样事后分析也能判断可比性
+
+### 9.2 错误恢复指标（三指标替代 error_recovery_count）
+
+原计划 `error_recovery_count: int` 模糊、无法自动判定、一个数丢信息。换成：
+
+- `tool_error_rate` — 犯错频率（客观）
+- `verifier_first_pass_rate` — 一把过率
+- `verifier_recovery_rate` — 挽回率（从失败中救回来的比例）
+
+三个分开看：优化方向不同（prompt 改进 vs 自我修复能力），需要分别观察。
+
+### 9.3 n=3 默认运行次数
+
+8 个任务 pass/fail 最小变化粒度 = 12.5%，LLM 本身的随机性就能造成那么大的波动。n=3 牺牲成本换信噪比。
+
+### 9.4 edit_accuracy 用 workspace snapshot diff 而不是 Agent 自报
+
+Agent 的 `_files_changed` 只追踪 WriteFile/EditFile，Bash 用 `sed -i` / `echo >` 改的文件追不到。eval runner 自己做前后快照 diff 是可靠信号。
+
+### 9.5 validate.py 用子进程 + stdout 末行 JSON
+
+- 不 import 到 runner 进程里：隔离副作用
+- JSON 格式规整、易解析；允许脚本前面打印任意调试信息都不影响解析
+
+---
+
+## 10. 实施顺序
+
+| PR | 内容 | 验收 |
+|---|---|---|
+| 1 | `benchmark.py` + `snapshot.py` + 1 个最小任务（`L1-add-function`） | YAML 能 load、task_hash 稳定、snapshot diff 准确 |
+| 2 | `runner.py` + `ModelPricing` + 端到端跑通最小任务 | MockLLM 跑 `L1-add-function` 产出完整 TaskResult |
+| 3 | `tracker.py` + compare + trend | 存读往返、交集对比、sparkline 渲染 |
+| 4 | CLI 子命令 + 剩余 11 个任务 | `main.py eval` 产出完整 summary |
+
+**每个 PR 都是独立可 merge 的**，不要攒大包。
+
+---
+
+## 11. 还可能被调整的非关键默认值
+
+这些之前列为"可以改"，默认是这样，执行时如果用户想调再说：
+
+1. `runs_per_task=3`（成本敏感时可降到 1）
+2. `parallel_tasks=1`（日志清晰，L1 理论上可并行）
+3. `ModelPricing` 内置表 — 用户可传自定义
+4. 工作区保留 7 天 / 100 个自动清理
+
+---
+
+## 参考：相关代码位置
+
+- Agent 核心：`src/mini_code_agent/core/agent.py`
+- LoopGuard：`src/mini_code_agent/safety/loop_guard.py`
+- FileGuard：`src/mini_code_agent/safety/file_guard.py`
+- BashTool：`src/mini_code_agent/tools/shell.py`
+- Verifier：`src/mini_code_agent/core/verifier.py`
+- RetryController：`src/mini_code_agent/core/retry.py`
