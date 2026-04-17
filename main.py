@@ -45,6 +45,12 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="启动时默认开启 Plan 模式（先规划再执行）",
     )
+
+    # 子命令：不带 → REPL（保持原行为）；带 → 分派
+    subparsers = parser.add_subparsers(dest="command", metavar="COMMAND")
+    from mini_code_agent.cli import add_eval_subparser
+    add_eval_subparser(subparsers)
+
     return parser.parse_args()
 
 
@@ -58,6 +64,11 @@ async def async_main() -> None:
         console.print(f"[red]项目目录不存在: {project_dir}[/red]")
         sys.exit(1)
     os.chdir(project_dir)
+
+    # 子命令分派：eval 走 eval_cmd；其他（None）走 REPL
+    if args.command == "eval":
+        from mini_code_agent.cli import run_eval_command
+        sys.exit(await run_eval_command(args))
 
     # 1. 创建 LLM 客户端
     from mini_code_agent.llm import create_client

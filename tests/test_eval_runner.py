@@ -128,7 +128,8 @@ def test_later():
 """
 
 
-def _success_factory(workspace: Path) -> Agent:
+def _success_factory(workspace: Path, task: BenchmarkTask) -> Agent:  # noqa: ARG001
+    _ = task  # factory 按签名接收 task，但本 mock 路径不需要用
     utils_path = str(workspace / "src" / "utils.py")
     tests_path = str(workspace / "tests" / "test_utils.py")
     responses = [
@@ -161,8 +162,9 @@ def _success_factory(workspace: Path) -> Agent:
     return Agent(_ScriptedLLM(responses), registry, "you are a test agent")
 
 
-def _noop_factory(workspace: Path) -> Agent:
+def _noop_factory(workspace: Path, task: BenchmarkTask) -> Agent:  # noqa: ARG001
     """Agent 直接给一句纯文本，什么都不改 → 应该走 validation_fail."""
+    _ = task
     responses = [
         LLMResponse(content="我不打算改任何文件。", usage=TokenUsage(80, 20)),
     ]
@@ -170,7 +172,8 @@ def _noop_factory(workspace: Path) -> Agent:
     return Agent(_ScriptedLLM(responses), registry, "noop")
 
 
-def _timeout_factory(workspace: Path) -> Agent:
+def _timeout_factory(workspace: Path, task: BenchmarkTask) -> Agent:  # noqa: ARG001
+    _ = task
     registry = ToolRegistry()
     return Agent(
         _SlowLLM(delay=2.0),
@@ -180,7 +183,8 @@ def _timeout_factory(workspace: Path) -> Agent:
     )
 
 
-def _raising_factory(workspace: Path) -> Agent:
+def _raising_factory(workspace: Path, task: BenchmarkTask) -> Agent:  # noqa: ARG001
+    _ = task
     registry = ToolRegistry()
     return Agent(_RaisingLLM(), registry, "raise")
 
@@ -661,6 +665,37 @@ class TestEvalRunnerE2E:
         # 三个 workspace 各自独立
         paths = {r.workspace_path for r in results}
         assert len(paths) == 3
+
+    async def test_factory_receives_task(
+        self, tmp_path: Path, l1_task: BenchmarkTask,
+    ) -> None:
+        """factory 必须拿到 (workspace, task)，不然没法按 task 限制 LoopGuard/wall_time."""
+        seen: list[tuple[Path, BenchmarkTask]] = []
+
+        def factory(workspace: Path, task: BenchmarkTask) -> Agent:
+            seen.append((workspace, task))
+            registry = ToolRegistry()
+            return Agent(
+                _ScriptedLLM([LLMResponse(content="hi", usage=TokenUsage(10, 5))]),
+                registry,
+                "spy",
+            )
+
+        runner = EvalRunner(
+            agent_factory=factory,
+            model_name="mock",
+            pricing=ModelPricing(0.0, 0.0),
+            runs_per_task=1,
+            workspace_root=tmp_path,
+        )
+        await runner.run_task(l1_task)
+
+        assert len(seen) == 1
+        ws, t = seen[0]
+        assert ws.is_dir()
+        assert t.id == "L1-add-function"
+        assert t.task_hash == l1_task.task_hash
+        assert t.max_steps == l1_task.max_steps
 
     async def test_run_suite_aggregates(
         self, tmp_path: Path, l1_task: BenchmarkTask

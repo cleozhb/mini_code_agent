@@ -1,0 +1,16 @@
+id: L1-add-classmethod
+level: 1
+description: |
+  给 Config 类加一个 `from_env()` 类方法：从环境变量读 APP_HOST（默认 "localhost"）、
+  APP_PORT（默认 8080，注意从字符串转成 int）、APP_DEBUG（"1"/"true"/"yes" 视为 True，
+  其余视为 False）构造一个 Config 实例；补上相应测试。
+expected_files:
+  - config.py
+  - test_config.py
+max_steps: 20
+max_tokens: 50000
+max_wall_time_seconds: 300
+tags:
+  - single-file
+  - python
+  - classmethod

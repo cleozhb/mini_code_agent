@@ -376,17 +376,18 @@ def compute_summary(
 # ---------------------------------------------------------------------------
 
 
-AgentFactory = Callable[[Path], Agent]
+AgentFactory = Callable[[Path, BenchmarkTask], Agent]
 
 
 class EvalRunner:
     """把 BenchmarkTask / BenchmarkSuite 跑起来，吐出 TaskResult / SuiteResult.
 
-    由外部传入 agent_factory(workspace) → Agent：factory 负责每次 run 构造一个
+    由外部传入 agent_factory(workspace, task) → Agent：factory 负责每次 run 构造一个
     干净的 Agent（BashTool(cwd=workspace)、FileGuard(work_dir=workspace)、
     LoopGuard(max_rounds=task.max_steps, max_tokens=task.max_tokens)、
     Agent(max_wall_time_seconds=task.max_wall_time_seconds)）。
-    Runner 不替用户做这件事，因为每个项目的安全控制策略不一样。
+    Runner 不替用户做这件事，因为每个项目的安全控制策略不一样；把 task 一起传给
+    factory 是为了拿到 per-task 的 max_steps / max_tokens / max_wall_time 等上限。
     """
 
     def __init__(
@@ -455,7 +456,7 @@ class EvalRunner:
         before_snap = snapshot.capture(workspace)
 
         # 3. 构造 Agent 并跑
-        agent = self.agent_factory(workspace)
+        agent = self.agent_factory(workspace, task)
 
         t0 = time.monotonic()
         agent_result: AgentResult | None = None
