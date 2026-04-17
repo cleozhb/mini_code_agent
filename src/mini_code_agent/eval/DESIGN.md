@@ -16,8 +16,9 @@
 | PR1: `benchmark.py` + 1 个最小任务 + `snapshot.py` | ✅ 已 merge (PR #8) |
 | PR2: `runner.py` + `ModelPricing` + 端到端跑通 | ✅ 已 merge (PR #9) |
 | PR3: `tracker.py` + compare + trend | ✅ 已 merge |
-| PR4a: CLI 子命令 + 第 2 个任务（L1-add-classmethod） | ✅ 本 PR |
-| PR4b+: 剩余 10 个 benchmark 任务（分批） | ⬜ 未开始 |
+| PR4a: CLI 子命令 + 第 2 个任务（L1-add-classmethod） | ✅ 已 merge (PR #11) |
+| PR4b: 补齐剩余 3 个 L1 任务（fix-failing-test / rename-var / add-docstring） | ✅ 本 PR |
+| PR4c+: 剩余 7 个 benchmark 任务（L2×4 + L3×3，分批） | ⬜ 未开始 |
 
 ---
 

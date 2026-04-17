@@ -1,0 +1,15 @@
+id: L1-add-docstring
+level: 1
+description: |
+  给 math_helpers.py 里的每个公共函数补一段 docstring（三引号字符串）。
+  docstring 要能说清楚函数做什么、参数含义、返回值。
+  不要改函数签名或原有行为。
+expected_files:
+  - math_helpers.py
+max_steps: 20
+max_tokens: 50000
+max_wall_time_seconds: 300
+tags:
+  - single-file
+  - python
+  - docs
