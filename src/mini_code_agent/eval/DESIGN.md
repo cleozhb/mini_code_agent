@@ -13,9 +13,9 @@
 | 模块 | 状态 |
 |---|---|
 | Agent 侧前置改动（BashTool cwd、stop_reason、max_wall_time、tool/verifier 统计） | ✅ 已完成并通过所有测试 |
-| PR1: `benchmark.py` + 1 个最小任务 + `snapshot.py` | ⬜ 未开始 |
-| PR2: `runner.py` + `ModelPricing` + 端到端跑通 | ⬜ 未开始 |
-| PR3: `tracker.py` + compare + trend | ⬜ 未开始 |
+| PR1: `benchmark.py` + 1 个最小任务 + `snapshot.py` | ✅ 已 merge (PR #8) |
+| PR2: `runner.py` + `ModelPricing` + 端到端跑通 | ✅ 已 merge (PR #9) |
+| PR3: `tracker.py` + compare + trend | ✅ 本 PR |
 | PR4: CLI 子命令 + 剩余 11 个任务 | ⬜ 未开始 |
 
 ---

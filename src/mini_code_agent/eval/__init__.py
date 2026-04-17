@@ -24,19 +24,35 @@ from .runner import (
     run_validate_script,
 )
 from .snapshot import FileFingerprint, SnapshotDiff, capture, diff
+from .tracker import (
+    ComparisonReport,
+    EvalTracker,
+    SummaryDiff,
+    TaskMetricDiff,
+    TrendPoint,
+    TrendReport,
+    suite_result_from_dict,
+    suite_result_to_dict,
+)
 
 __all__ = [
     "BenchmarkSuite",
     "BenchmarkTask",
+    "ComparisonReport",
     "EvalRunner",
     "EvalSummary",
+    "EvalTracker",
     "FailureCategory",
     "FileFingerprint",
     "KNOWN_MODELS",
     "ModelPricing",
     "SnapshotDiff",
     "SuiteResult",
+    "SummaryDiff",
+    "TaskMetricDiff",
     "TaskResult",
+    "TrendPoint",
+    "TrendReport",
     "capture",
     "classify_failure",
     "compute_edit_metrics",
@@ -46,5 +62,7 @@ __all__ = [
     "diff",
     "pricing_for",
     "run_validate_script",
+    "suite_result_from_dict",
+    "suite_result_to_dict",
 ]
 
