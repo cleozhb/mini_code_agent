@@ -17,8 +17,9 @@
 | PR2: `runner.py` + `ModelPricing` + 端到端跑通 | ✅ 已 merge (PR #9) |
 | PR3: `tracker.py` + compare + trend | ✅ 已 merge |
 | PR4a: CLI 子命令 + 第 2 个任务（L1-add-classmethod） | ✅ 已 merge (PR #11) |
-| PR4b: 补齐剩余 3 个 L1 任务（fix-failing-test / rename-var / add-docstring） | ✅ 本 PR |
-| PR4c+: 剩余 7 个 benchmark 任务（L2×4 + L3×3，分批） | ⬜ 未开始 |
+| PR4b: 补齐剩余 3 个 L1 任务（fix-failing-test / rename-var / add-docstring） | ✅ 已 merge (PR #12) |
+| PR4c-fix: 给 eval 模式注入 workspace 上下文到 system prompt | ✅ 本 PR |
+| PR4d+: 剩余 7 个 benchmark 任务（L2×4 + L3×3，分批） | ⬜ 未开始 |
 
 ---
 
@@ -433,6 +434,18 @@ Agent 的 `_files_changed` 只追踪 WriteFile/EditFile，Bash 用 `sed -i` / `e
 
 - 不 import 到 runner 进程里：隔离副作用
 - JSON 格式规整、易解析；允许脚本前面打印任意调试信息都不影响解析
+
+### 9.6 eval 模式的 system prompt 必须注入 workspace 上下文
+
+**根因**：PR4a 刚落地的时候，eval 用的是一句话的常量 system prompt（"你是一个编程 Agent，使用工具完成任务"）。在 DeepSeek 上跑 L1-add-classmethod 观察到 Agent 连续 11 轮没调用过一次 WriteFile、prompt token 滚到 50k 被 LoopGuard 砍掉、`files_changed_actual=[]`、`tool_error_rate=0.273`。Claude 这样的强模型有先验能猜对 cwd，但弱模型不行。
+
+**修法**：`src/mini_code_agent/cli/eval_cmd.py:_build_eval_system_prompt(workspace)` 按每个 workspace 动态生成 prompt，里面塞进：
+- 当前 cwd 绝对路径
+- 工作区初始文件相对路径列表（过滤 `__pycache__` / `.pytest_cache`，超过 30 个截断）
+- WriteFile/EditFile path 用相对路径的明确约束
+- Bash cwd 已锁住、不要 cd 出去的提示
+
+REPL 模式下这层由 `core.build_system_prompt_with_context` 提供，eval 之前绕过了 —— 是设计漏洞，不是模型能力问题。后续开新任务（尤其 L2/L3 多文件）前必须先确认这层稳定，否则测的不是 Agent 能力而是"能不能摸到目录"。
 
 ---
 

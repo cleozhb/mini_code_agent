@@ -13,6 +13,7 @@ import pytest
 from rich.console import Console
 
 from mini_code_agent.cli.eval_cmd import (
+    _build_eval_system_prompt,
     _find_run,
     add_eval_subparser,
     build_agent_factory,
@@ -341,6 +342,84 @@ class TestBuildAgentFactory:
         bash = agent.tool_registry.get("Bash")
         assert bash is not None
         assert bash.cwd == str(workspace)
+
+    def test_factory_injects_dynamic_system_prompt(self, tmp_path: Path) -> None:
+        """factory 默认应按 workspace 动态生成 system prompt，注入 cwd + 文件列表."""
+        task = BenchmarkTask.load(_L1_TASK_DIR)
+
+        workspace = tmp_path / "ws"
+        (workspace / "subdir").mkdir(parents=True)
+        (workspace / "config.py").write_text("x = 1\n")
+        (workspace / "subdir" / "helper.py").write_text("y = 2\n")
+
+        llm = _ScriptedLLM([LLMResponse(content="done", usage=TokenUsage(1, 1))])
+        factory = build_agent_factory(llm)
+        agent = factory(workspace, task)
+
+        prompt = agent.system_prompt
+        assert str(workspace) in prompt, "system prompt 应包含 workspace 路径"
+        assert "config.py" in prompt
+        assert "subdir/helper.py" in prompt
+        # 工具使用要点里应明确提到相对路径约束
+        assert "相对路径" in prompt
+
+    def test_factory_override_system_prompt(self, tmp_path: Path) -> None:
+        """显式传 system_prompt_override 时应跳过动态生成."""
+        task = BenchmarkTask.load(_L1_TASK_DIR)
+        workspace = tmp_path / "ws"
+        workspace.mkdir()
+
+        llm = _ScriptedLLM([LLMResponse(content="done", usage=TokenUsage(1, 1))])
+        factory = build_agent_factory(llm, system_prompt_override="FIXED")
+        agent = factory(workspace, task)
+
+        assert agent.system_prompt == "FIXED"
+
+
+class TestEvalSystemPromptBuilder:
+    def test_empty_workspace(self, tmp_path: Path) -> None:
+        ws = tmp_path / "empty"
+        ws.mkdir()
+        prompt = _build_eval_system_prompt(ws)
+        assert str(ws) in prompt
+        assert "工作区为空" in prompt
+
+    def test_lists_files_sorted_relative(self, tmp_path: Path) -> None:
+        ws = tmp_path / "w"
+        (ws / "tests").mkdir(parents=True)
+        (ws / "b.py").write_text("")
+        (ws / "a.py").write_text("")
+        (ws / "tests" / "test_b.py").write_text("")
+        prompt = _build_eval_system_prompt(ws)
+        # 排序后 a < b < tests/
+        idx_a = prompt.index("a.py")
+        idx_b = prompt.index("b.py")
+        idx_t = prompt.index("tests/test_b.py")
+        assert idx_a < idx_b < idx_t
+
+    def test_filters_pycache_and_pytest_cache(self, tmp_path: Path) -> None:
+        ws = tmp_path / "w"
+        (ws / "__pycache__").mkdir(parents=True)
+        (ws / ".pytest_cache" / "v").mkdir(parents=True)
+        (ws / "__pycache__" / "x.cpython.pyc").write_text("")
+        (ws / ".pytest_cache" / "v" / "cache.db").write_text("")
+        (ws / "main.py").write_text("")
+        prompt = _build_eval_system_prompt(ws)
+        assert "main.py" in prompt
+        assert "__pycache__" not in prompt
+        assert ".pytest_cache" not in prompt
+
+    def test_truncates_large_workspace(self, tmp_path: Path) -> None:
+        ws = tmp_path / "big"
+        ws.mkdir()
+        for i in range(50):
+            (ws / f"f{i:03d}.txt").write_text("")
+        prompt = _build_eval_system_prompt(ws)
+        assert "未列出" in prompt  # 截断提示
+        # 前 30 个应该在，30+ 的不列
+        assert "f000.txt" in prompt
+        assert "f029.txt" in prompt
+        assert "f030.txt" not in prompt
 
 
 class TestRunEvalEndToEnd:
