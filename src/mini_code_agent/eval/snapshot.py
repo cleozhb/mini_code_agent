@@ -14,7 +14,12 @@ from pathlib import Path
 
 
 # 快照遍历要忽略的路径片段（与 task_hash 共享语义，但多忽略 .git 这种只在运行期出现的目录）
-_IGNORE_NAMES: frozenset[str] = frozenset({"__pycache__", ".DS_Store", ".git"})
+# - `.agent-backups`：WriteFileTool 写文件前会自动备份，不是 Agent 的"产出"
+# - `.pytest_cache`：Agent 在 workspace 里跑 pytest 时副产物，不是修改意图
+# 这两个不过滤会把 edit_precision 拉低，污染 files_changed_actual（DESIGN §9.8）。
+_IGNORE_NAMES: frozenset[str] = frozenset(
+    {"__pycache__", ".DS_Store", ".git", ".agent-backups", ".pytest_cache"}
+)
 _IGNORE_SUFFIXES: frozenset[str] = frozenset({".pyc"})
 
 

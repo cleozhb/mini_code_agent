@@ -8,7 +8,10 @@
    - 无环境变量 → host='localhost', port=8080, debug=False
    - APP_HOST='h', APP_PORT='9001', APP_DEBUG='true' → 正确转型
    - APP_DEBUG='0' → debug=False（不是所有非空字符串都 True）
-4. workspace/test_config.py 存在并 pytest 跑通
+4. 测试文件存在并 pytest 跑通，位置允许：
+   - workspace/test_config.py（根目录，简单任务惯例）
+   - workspace/tests/test_config.py（大一点的项目惯例）
+   两种都接受；如果两个位置都有，优先根目录。
 """
 
 from __future__ import annotations
@@ -115,14 +118,28 @@ def main() -> int:
         _emit({"passed": False, "details": detail})
         return 1
 
-    test_file = _WORKSPACE / "test_config.py"
-    if not test_file.is_file():
+    # 测试文件位置：根目录优先，tests/ 次选；两个都接受（见本文件 docstring）
+    candidates = [
+        _WORKSPACE / "test_config.py",
+        _WORKSPACE / "tests" / "test_config.py",
+    ]
+    test_file = next((p for p in candidates if p.is_file()), None)
+    if test_file is None:
         _emit({
             "passed": False,
-            "details": f"from_env 行为对，但缺测试文件：{test_file}",
+            "details": (
+                "from_env 行为对，但缺测试文件；期望："
+                f"{candidates[0]} 或 {candidates[1]}"
+            ),
         })
         return 1
 
+    # 测试可能放在 tests/ 子目录，里面 `from config import Config` 需要 workspace
+    # 在 sys.path 上；通过 PYTHONPATH 显式注入，不依赖 Agent 自己加 conftest.py
+    env = os.environ.copy()
+    env["PYTHONPATH"] = (
+        str(_WORKSPACE) + os.pathsep + env.get("PYTHONPATH", "")
+    ).rstrip(os.pathsep)
     proc = subprocess.run(
         [
             sys.executable,
@@ -134,6 +151,7 @@ def main() -> int:
             "--no-header",
         ],
         cwd=str(_WORKSPACE),
+        env=env,
         capture_output=True,
         text=True,
         timeout=30,
