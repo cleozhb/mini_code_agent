@@ -48,6 +48,21 @@ class TestCapture:
         snap = capture(tmp_path)
         assert set(snap.keys()) == {"keep.py"}
 
+    def test_ignores_agent_backups_and_pytest_cache(self, tmp_path: Path) -> None:
+        """WriteFileTool 自动备份目录和 Agent 跑 pytest 的副产物都不算"真改动".
+
+        出发点见 DESIGN §9.8：这些文件会把 edit_precision 拉低到离谱的数（0.14 实测），
+        让 Agent 看起来写了一堆没用的文件，掩盖它真正的产出对不对。
+        """
+        _write(tmp_path / "keep.py", "x")
+        _write(tmp_path / ".agent-backups" / "keep.py.1700000.bak", "old content")
+        _write(tmp_path / ".agent-backups" / "nested" / "deep.bak", "x")
+        _write(tmp_path / "tests" / ".pytest_cache" / "v" / "cache" / "nodeids", "{}")
+        _write(tmp_path / "tests" / ".pytest_cache" / "CACHEDIR.TAG", "Signature")
+        _write(tmp_path / ".pytest_cache" / "README.md", "# pytest cache")
+        snap = capture(tmp_path)
+        assert set(snap.keys()) == {"keep.py"}
+
     def test_missing_workspace_raises(self, tmp_path: Path) -> None:
         with pytest.raises(FileNotFoundError):
             capture(tmp_path / "does-not-exist")
