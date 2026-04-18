@@ -288,6 +288,51 @@ class TestEditMetrics:
         p, r = compute_edit_metrics(["a", "a", "b"], ["a", "b"])
         assert p == 1.0 and r == 1.0
 
+    def test_alternative_group_hit_on_first(self) -> None:
+        # OR 组："test_config.py" 或 "tests/test_config.py" 任一算命中
+        p, r = compute_edit_metrics(
+            ["config.py", "test_config.py"],
+            ["config.py", ("test_config.py", "tests/test_config.py")],
+        )
+        assert p == 1.0
+        assert r == 1.0
+
+    def test_alternative_group_hit_on_second(self) -> None:
+        # Agent 把测试写在 tests/ 下 —— 也算命中
+        p, r = compute_edit_metrics(
+            ["config.py", "tests/test_config.py"],
+            ["config.py", ("test_config.py", "tests/test_config.py")],
+        )
+        assert p == 1.0
+        assert r == 1.0
+
+    def test_alternative_group_miss(self) -> None:
+        # 两个 alternative 都没写 —— 该组整组未命中
+        p, r = compute_edit_metrics(
+            ["config.py"],
+            ["config.py", ("test_config.py", "tests/test_config.py")],
+        )
+        assert p == 1.0
+        assert r == 0.5
+
+    def test_alternative_group_double_write_not_penalized(self) -> None:
+        # Agent 同时写了根和 tests/ 下两份测试，都算 expected 命中，precision 不被拉低
+        p, r = compute_edit_metrics(
+            ["config.py", "test_config.py", "tests/test_config.py"],
+            ["config.py", ("test_config.py", "tests/test_config.py")],
+        )
+        assert p == 1.0
+        assert r == 1.0
+
+    def test_alternative_group_mixed_with_extra(self) -> None:
+        # OR 组命中 + Agent 多写了个无关文件 → precision 下降但 recall 仍满
+        p, r = compute_edit_metrics(
+            ["config.py", "tests/test_config.py", "notes.md"],
+            ["config.py", ("test_config.py", "tests/test_config.py")],
+        )
+        assert p == pytest.approx(2 / 3)
+        assert r == 1.0
+
 
 # ---------------------------------------------------------------------------
 # classify_failure
@@ -465,6 +510,7 @@ def _fake_suite(tasks: list[tuple[str, int]]) -> BenchmarkSuite:
             workspace_dir=Path("/tmp"),
             validate_script=Path("/tmp/v"),
             expected_files=(),
+            expected_file_groups=(),
             max_steps=1,
             max_tokens=1,
             max_wall_time_seconds=1,

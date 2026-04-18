@@ -24,7 +24,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Iterator, Literal
+from typing import Callable, Iterator, Literal, Sequence
 
 from ..core.agent import Agent, AgentResult
 from . import snapshot
@@ -53,8 +53,14 @@ class ModelPricing:
 
 
 # 预置定价（DESIGN.md §4.3）。实际跑 eval 时用户可传自定义覆盖。
+# 数值是 USD / 1K tokens。价格会变，以模型厂商官网/控制台为准；这里只为了让
+# `cost_usd` 从 0 变成一个"量级对"的估计。不在表里的模型走 pricing_for(...)
+# 会抛 KeyError，调用方可以外部传入 ModelPricing 覆盖。
 KNOWN_MODELS: dict[str, ModelPricing] = {
     "deepseek-chat":     ModelPricing(0.00014, 0.00028),
+    # deepseek-v3.2 是 DeepSeek 2025 Q4 上线的 V3.2-Exp 线；公开定价约
+    # 输入 $0.28/M（cache miss）、输出 $0.42/M —— 比 deepseek-chat 略贵。
+    "deepseek-v3.2":     ModelPricing(0.00028, 0.00042),
     "gpt-4o":            ModelPricing(0.0025, 0.010),
     "gpt-4o-mini":       ModelPricing(0.00015, 0.00060),
     "claude-sonnet-4-5": ModelPricing(0.003, 0.015),
@@ -108,22 +114,43 @@ def classify_failure(
 
 
 def compute_edit_metrics(
-    actual: list[str],
-    expected: list[str],
+    actual: Sequence[str],
+    expected: Sequence[str | Sequence[str]],
 ) -> tuple[float, float]:
     """返回 (precision, recall).
 
-    约定：
-    - precision = |actual ∩ expected| / |actual|，actual 为空时记为 0
-    - recall    = |actual ∩ expected| / |expected|，expected 为空时记为 1
-      （"任务没指定预期改动"天然算召回满分，避免除 0）
+    约定（DESIGN §9.8 末段）：
+    - `expected` 每项可以是字符串（单文件）或字符串序列（**alternative 组**，
+      任一命中即整组算命中）。后者用来表达 "测试放 a/ 或 b/ 都算对" 这种合理
+      位置选择自由，避免指标把 Agent 的好的惯例选择判成非预期改动。
+    - recall = 命中的 expected 项数 / |expected|；expected 空时 recall=1
+      （"任务没指定预期改动"→召回满分，避免除 0）
+    - precision = |actual 中被任意 expected 项命中过的文件| / |actual|；
+      actual 空时 precision=0。
+    - 一组 alternative 里如果 Agent 同时写了多个（罕见），都计入 precision 分子，
+      不惩罚兜底式的双写。
+
+    老 `list[str]` 调用天然兼容：每个 str 被视作单元素组。
     """
     actual_set = set(actual)
-    expected_set = set(expected)
-    inter = actual_set & expected_set
 
-    precision = len(inter) / len(actual_set) if actual_set else 0.0
-    recall = len(inter) / len(expected_set) if expected_set else 1.0
+    groups: list[tuple[str, ...]] = []
+    for item in expected:
+        if isinstance(item, str):
+            groups.append((item,))
+        else:
+            groups.append(tuple(item))
+
+    matched_group_count = 0
+    matched_actual: set[str] = set()
+    for group in groups:
+        hits = [f for f in group if f in actual_set]
+        if hits:
+            matched_group_count += 1
+            matched_actual.update(hits)
+
+    precision = len(matched_actual) / len(actual_set) if actual_set else 0.0
+    recall = matched_group_count / len(groups) if groups else 1.0
     return precision, recall
 
 
@@ -508,8 +535,9 @@ class EvalRunner:
         # 4. 跑后 diff（即便 agent 挂了，也要看看文件有没有动）
         diff = snapshot.diff(workspace, before_snap)
         files_changed = diff.changed
+        # 用 groups 而不是 raw expected_files：带上 "|" 分隔的 alternative 语义
         precision, recall = compute_edit_metrics(
-            files_changed, list(task.expected_files)
+            files_changed, task.expected_file_groups
         )
 
         # 5. 跑 validate.py（agent 异常时跳过，直接失败）
