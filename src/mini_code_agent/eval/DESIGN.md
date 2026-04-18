@@ -18,7 +18,8 @@
 | PR3: `tracker.py` + compare + trend | ✅ 已 merge |
 | PR4a: CLI 子命令 + 第 2 个任务（L1-add-classmethod） | ✅ 已 merge (PR #11) |
 | PR4b: 补齐剩余 3 个 L1 任务（fix-failing-test / rename-var / add-docstring） | ✅ 已 merge (PR #12) |
-| PR4c-fix: 给 eval 模式注入 workspace 上下文到 system prompt | ✅ 本 PR |
+| PR4c-fix: 给 eval 模式注入 workspace 上下文到 system prompt | ✅ 已 merge (PR #13) |
+| PR4c-fix2: runner 在 agent.run() 外 chdir 到 workspace（修 FileGuard 相对路径误拦） | ✅ 本 PR |
 | PR4d+: 剩余 7 个 benchmark 任务（L2×4 + L3×3，分批） | ⬜ 未开始 |
 
 ---
@@ -445,7 +446,30 @@ Agent 的 `_files_changed` 只追踪 WriteFile/EditFile，Bash 用 `sed -i` / `e
 - WriteFile/EditFile path 用相对路径的明确约束
 - Bash cwd 已锁住、不要 cd 出去的提示
 
-REPL 模式下这层由 `core.build_system_prompt_with_context` 提供，eval 之前绕过了 —— 是设计漏洞，不是模型能力问题。后续开新任务（尤其 L2/L3 多文件）前必须先确认这层稳定，否则测的不是 Agent 能力而是"能不能摸到目录"。
+REPL 模式下这层由 `core.build_system_prompt_with_context` 提供，eval 之前绕过了。
+
+**但这只是故事的一半** —— 见 §9.7 的路径解析 bug，两个 bug 叠在一起才完整解释当时的 `tool_error_rate=0.27`。
+
+### 9.7 eval 模式的 workspace 相对路径解析（chdir 临时修复 + 真正 fix 的 follow-up）
+
+**追加观察**：PR4c-fix 上完后在 DeepSeek 重跑 L1-add-classmethod，`tool_error_rate` 从 0.273 **升到了 0.538**，`files_changed_actual` 仍然空。看起来 prompt 修好了反而更糟 —— 实际是 prompt 让模型严格按相对路径调 WriteFile，而**基础设施本身处理不了相对路径**：
+
+- `FileGuard.is_path_allowed(path)` 里 `Path(path).resolve()` 用**进程 cwd**，不是 `self.work_dir`
+- `WriteFileTool.execute` 同样 `Path(path_str).expanduser()`，直接依赖进程 cwd
+
+跑 eval 时进程 cwd = 你启动 `main.py` 的目录（通常是仓库根），而 `FileGuard.work_dir = /var/folders/.../eval-xxx`。于是 Agent 发 `WriteFile(path="config.py")` 时：
+1. FileGuard 把它 resolve 成 `<仓库根>/config.py`
+2. 判定"路径不在工作目录内"
+3. 返回 `blocked`，Agent 收到 `[安全拦截]` 当成 tool_error
+4. Agent 试别的路径再被拦，死循环直到 token 爆
+
+**PR4c-fix2 的临时修法**：`EvalRunner._run_task_once` 在 `await agent.run(...)` 外面用 `_chdir(workspace)` 包一层，离开时恢复。这样 `Path.resolve()` 的相对路径基准对齐到 workspace，FileGuard + WriteFileTool + EditFileTool + ReadFileTool + Grep + ListDir 都自动正确。
+
+**代价 / 已知局限**：`os.chdir` 是进程全局状态 —— 当前实现因此不支持 `parallel_tasks > 1`（多个任务会抢 cwd）。`EvalRunner.__init__` 里在 `parallel_tasks > 1` 时 log 警告。真要跑并发必须走方案 B。
+
+**方案 B（根治，未来做）**：把所有文件工具族（`WriteFileTool` / `EditFileTool` / `ReadFileTool` / `GrepTool` / `ListDirTool`）加 `work_dir: Path | None = None` 参数，效仿 `BashTool.cwd` 的做法。相对路径在工具内部解析到 `work_dir / path`；`FileGuard.is_path_allowed` 同步按 `self.work_dir` 解析而不是进程 cwd。改完之后 eval 不再需要 chdir，天然支持并行。改动面：6 个工具 + guard + 所有现有调用点 + 一批测试 —— 显然不能塞在这个 PR 里。
+
+**教训**：PR4c-fix 以为根因是 prompt，实际是两层（prompt + 路径解析）叠加，误诊的代价是多跑一次真 API、多发一个 PR。诊断"为什么 Agent 没落地文件"时应同时查 prompt 层（告诉没告诉）和基础设施层（就算告诉了能不能执行），而不是看到 prompt 明显缺信息就下结论。这条记到 memory 里。
 
 ---
 

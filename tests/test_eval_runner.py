@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 from dataclasses import replace
 from pathlib import Path
 from typing import AsyncIterator
@@ -24,6 +25,7 @@ from mini_code_agent.eval import (
     pricing_for,
     run_validate_script,
 )
+from mini_code_agent.eval.runner import _chdir
 from mini_code_agent.llm import (
     LLMClient,
     LLMResponse,
@@ -33,6 +35,7 @@ from mini_code_agent.llm import (
     ToolCall,
     ToolParam,
 )
+from mini_code_agent.safety import FileGuard
 from mini_code_agent.tools import ToolRegistry, WriteFileTool
 
 
@@ -187,6 +190,39 @@ def _raising_factory(workspace: Path, task: BenchmarkTask) -> Agent:  # noqa: AR
     _ = task
     registry = ToolRegistry()
     return Agent(_RaisingLLM(), registry, "raise")
+
+
+def _relative_path_factory(workspace: Path, task: BenchmarkTask) -> Agent:  # noqa: ARG001
+    """模拟真实 LLM：用**相对路径**调 WriteFile，配真实 FileGuard.
+
+    这是 PR4c-fix2 引入的回归场景：
+    没有 runner 的 _chdir 包裹时，FileGuard.is_path_allowed 会把 "hello.txt"
+    resolve 成 <进程cwd>/hello.txt，判定不在 workspace 内、直接拦截。
+    现在 runner 在 agent.run() 外面 chdir 到 workspace，这种相对路径应能正常落地。
+    """
+    _ = task
+    responses = [
+        LLMResponse(
+            content="",
+            tool_calls=[
+                ToolCall(
+                    id="c1",
+                    name="WriteFile",
+                    arguments={"path": "hello.txt", "content": "hi"},
+                ),
+            ],
+            usage=TokenUsage(10, 5),
+        ),
+        LLMResponse(content="完成", usage=TokenUsage(5, 2)),
+    ]
+    registry = ToolRegistry()
+    registry.register(WriteFileTool())
+    return Agent(
+        _ScriptedLLM(responses),
+        registry,
+        "you are a test agent; use relative paths.",
+        file_guard=FileGuard(work_dir=workspace),
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -561,6 +597,26 @@ def l1_task() -> BenchmarkTask:
     return BenchmarkTask.load(_L1_TASK_DIR)
 
 
+class TestChdirContext:
+    def test_chdir_restores_on_success(self, tmp_path: Path) -> None:
+        prev = os.getcwd()
+        target = tmp_path / "target"
+        target.mkdir()
+        with _chdir(target):
+            assert Path(os.getcwd()).resolve() == target.resolve()
+        assert os.getcwd() == prev
+
+    def test_chdir_restores_on_exception(self, tmp_path: Path) -> None:
+        prev = os.getcwd()
+        target = tmp_path / "target"
+        target.mkdir()
+        with pytest.raises(RuntimeError, match="boom"):
+            with _chdir(target):
+                assert Path(os.getcwd()).resolve() == target.resolve()
+                raise RuntimeError("boom")
+        assert os.getcwd() == prev
+
+
 class TestEvalRunnerE2E:
     async def test_success_run(self, tmp_path: Path, l1_task: BenchmarkTask) -> None:
         runner = EvalRunner(
@@ -601,6 +657,41 @@ class TestEvalRunnerE2E:
         assert r.workspace_path is not None
         assert Path(r.workspace_path).is_dir()
         assert str(tmp_path) in r.workspace_path
+
+    async def test_relative_paths_resolved_against_workspace(
+        self, tmp_path: Path, l1_task: BenchmarkTask, monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        """回归：Agent 用相对路径 WriteFile("hello.txt") 时，文件必须落在 workspace.
+
+        修复前：FileGuard 用进程 cwd 解析相对路径，判定路径"不在 workspace"、
+        直接拦截所有写入。我们在 runner._run_task_once 里 chdir 到 workspace
+        绕开这个问题。
+        """
+        # 模拟用户在仓库根目录启动 main.py 的场景：进程 cwd = 别处
+        outside = tmp_path / "outside"
+        outside.mkdir()
+        monkeypatch.chdir(outside)
+
+        runner = EvalRunner(
+            agent_factory=_relative_path_factory,
+            model_name="mock",
+            pricing=ModelPricing(0.0, 0.0),
+            runs_per_task=1,
+            workspace_root=tmp_path / "workspaces",
+        )
+        [r] = await runner.run_task(l1_task)
+
+        # 不应被 FileGuard 拦截
+        assert r.tool_error_count == 0, (
+            f"WriteFile 相对路径被 FileGuard 误拦：{r.validation_details}"
+        )
+        # 文件落在 workspace，不在进程 cwd
+        ws = Path(r.workspace_path)
+        assert (ws / "hello.txt").is_file(), "相对路径写的文件应在 workspace 里"
+        assert not (outside / "hello.txt").exists(), "文件不应跑到进程 cwd 去"
+
+        # chdir 离开后应被复原
+        assert Path.cwd() == outside
 
     async def test_validation_fail(self, tmp_path: Path, l1_task: BenchmarkTask) -> None:
         runner = EvalRunner(
