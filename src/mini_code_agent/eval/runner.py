@@ -11,8 +11,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
+import os
 import shutil
 import subprocess
 import sys
@@ -22,7 +24,7 @@ import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable, Literal
+from typing import Callable, Iterator, Literal
 
 from ..core.agent import Agent, AgentResult
 from . import snapshot
@@ -131,6 +133,29 @@ def compute_edit_metrics(
 
 
 VALIDATE_TIMEOUT_S = 60
+
+
+@contextlib.contextmanager
+def _chdir(path: Path) -> Iterator[None]:
+    """临时把进程 cwd 切到 path，离开时恢复.
+
+    为什么这里要这么做：FileGuard.is_path_allowed 和 WriteFileTool/EditFileTool
+    都是通过 `Path(x).resolve()` 处理相对路径的 —— 这会用**进程 cwd**而不是
+    FileGuard 的 work_dir 来解析。如果我们不先 chdir 到 workspace，Agent 按
+    system prompt 要求用相对路径（如 "config.py"）写文件时，FileGuard 会把
+    它解析成 `<项目根>/config.py`，判定"不在 work_dir 里"并直接拦截 —— 观察到
+    的症状就是 tool_error_rate 飙到 50%+、files_changed_actual 永远为空。
+
+    注意：os.chdir 是进程全局状态，这意味着当前 runner 实际上不支持
+    `parallel_tasks > 1`（会互相踩 cwd）。DESIGN §11 默认串行；真要并行得先把
+    文件工具族改成接 work_dir 参数（见 DESIGN §9.7 的 follow-up 方案 B）。
+    """
+    prev = os.getcwd()
+    os.chdir(path)
+    try:
+        yield
+    finally:
+        os.chdir(prev)
 
 
 def run_validate_script(
@@ -405,6 +430,14 @@ class EvalRunner:
         self.pricing = pricing
         self.runs_per_task = max(1, runs_per_task)
         self.parallel_tasks = max(1, parallel_tasks)
+        if self.parallel_tasks > 1:
+            logger.warning(
+                "parallel_tasks=%d：当前实现在 _run_task_once 里会 os.chdir 到 workspace "
+                "（为了让 FileGuard/WriteFile 的相对路径解析到工作区），"
+                "这是进程全局状态，并发跑会互相踩。DESIGN §9.7 里的方案 B "
+                "落地之前请保持串行。",
+                self.parallel_tasks,
+            )
         self.workspace_root = (
             Path(workspace_root) if workspace_root is not None
             else Path(tempfile.gettempdir())
@@ -462,7 +495,11 @@ class EvalRunner:
         agent_result: AgentResult | None = None
         agent_error: BaseException | None = None
         try:
-            agent_result = await agent.run(task.description)
+            # 把进程 cwd 临时切到 workspace：让 FileGuard/WriteFileTool 用 Path.resolve()
+            # 时解析的相对路径基准对齐到工作区，而不是 `main.py` 启动时的目录。
+            # 详见 _chdir 的 docstring 与 DESIGN §9.7。
+            with _chdir(workspace):
+                agent_result = await agent.run(task.description)
         except Exception as e:  # noqa: BLE001
             logger.exception("agent.run() 抛异常")
             agent_error = e
