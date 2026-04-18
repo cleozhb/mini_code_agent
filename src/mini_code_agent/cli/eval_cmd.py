@@ -47,11 +47,53 @@ from ..tools import (
 
 
 # 评估时给 Agent 用的 system prompt —— 不泄漏任务思路，只强调"用工具改文件，简短总结"
-_EVAL_SYSTEM_PROMPT = (
-    "你是一个编程 Agent，正在运行自动化评估任务。"
-    "仔细阅读用户给的任务描述，使用工具（读/写/编辑文件、跑 shell、检索代码等）"
-    "直接在当前工作区完成任务。完成后用一两句话简短说明你做了什么即可。"
-)
+_EVAL_PROMPT_FILE_LIST_LIMIT = 30  # 超过就截断，避免 prompt 过大
+_EVAL_PROMPT_IGNORED_DIRS = {"__pycache__", ".pytest_cache", ".git"}
+
+
+def _list_workspace_files(workspace: Path) -> list[str]:
+    """列出 workspace 里的相对路径，过滤掉 pycache 等噪音目录."""
+    out: list[str] = []
+    for p in sorted(workspace.rglob("*")):
+        if not p.is_file():
+            continue
+        if any(part in _EVAL_PROMPT_IGNORED_DIRS for part in p.relative_to(workspace).parts):
+            continue
+        out.append(str(p.relative_to(workspace)))
+    return out
+
+
+def _build_eval_system_prompt(workspace: Path) -> str:
+    """动态生成 eval 用 system prompt：告诉模型 cwd 在哪、初始文件有哪些.
+
+    之前用常量 system prompt 的版本在弱模型（如 DeepSeek）上迷路率很高：
+    L1 任务 11 轮一个 WriteFile 都没调用成功、prompt token 爆掉。
+    根因是模型不知道 cwd、不知道工作区文件结构，只能靠瞎摸。
+    REPL 模式靠 `build_system_prompt_with_context` 补上这层，eval 之前绕过了。
+    """
+    files = _list_workspace_files(workspace)
+    if not files:
+        file_list = "  （工作区为空，可自由创建文件）"
+    else:
+        shown = files[: _EVAL_PROMPT_FILE_LIST_LIMIT]
+        lines = [f"  - {f}" for f in shown]
+        if len(files) > _EVAL_PROMPT_FILE_LIST_LIMIT:
+            lines.append(f"  - ...（另有 {len(files) - _EVAL_PROMPT_FILE_LIST_LIMIT} 个文件未列出，可用 ListDir/Grep 自行查看）")
+        file_list = "\n".join(lines)
+
+    return (
+        "你是编程 Agent，正在执行一项自动化评估任务。\n"
+        "\n"
+        f"当前工作目录（cwd）: {workspace}\n"
+        "工作区初始文件：\n"
+        f"{file_list}\n"
+        "\n"
+        "工具使用要点：\n"
+        "- WriteFile / EditFile 的 path 参数用**相对路径**（如 'config.py'、'tests/test_config.py'）\n"
+        "- Bash 执行时 cwd 已经锁在工作区里，不要 cd 出去\n"
+        "- workspace 是隔离的临时副本，放开手改文件即可\n"
+        "- 完成任务后用一两句话简短汇报做了什么，不要冗长解释\n"
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -283,11 +325,12 @@ def _resolve_pricing(model_name: str, console: Console) -> ModelPricing:
 def build_agent_factory(
     llm_client: LLMClient,
     *,
-    system_prompt: str = _EVAL_SYSTEM_PROMPT,
+    system_prompt_override: str | None = None,
 ) -> Callable[[Path, BenchmarkTask], Agent]:
     """按 DESIGN §4 的要求组装 factory：把 task 的三项上限绑到 Agent 的安全层.
 
-    单独开成模块级函数便于测试（不必起真 CLI）。
+    `system_prompt_override` 不传时，会按每个 workspace 动态生成 system prompt
+    （见 `_build_eval_system_prompt`）。传字符串则固定用它（主要给测试用）。
     """
 
     def factory(workspace: Path, task: BenchmarkTask) -> Agent:
@@ -304,10 +347,15 @@ def build_agent_factory(
             max_rounds=task.max_steps,
             max_tokens=task.max_tokens,
         )
+        prompt = (
+            system_prompt_override
+            if system_prompt_override is not None
+            else _build_eval_system_prompt(workspace)
+        )
         return Agent(
             llm_client=llm_client,
             tool_registry=registry,
-            system_prompt=system_prompt,
+            system_prompt=prompt,
             file_guard=file_guard,
             loop_guard=loop_guard,
             max_wall_time_seconds=task.max_wall_time_seconds,
