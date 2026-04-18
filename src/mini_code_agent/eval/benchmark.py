@@ -86,7 +86,13 @@ _REQUIRED_FIELDS = (
 
 @dataclass(frozen=True)
 class BenchmarkTask:
-    """单个 benchmark 任务的不可变描述."""
+    """单个 benchmark 任务的不可变描述.
+
+    `expected_files` 保留 YAML 里的**原始字符串序列**（"a.py", "b.py|tests/b.py"），
+    主要给 human-readable 展示和哈希稳定性用。评分时用派生的 `expected_file_groups`：
+    每项拆成 `|` 分隔的 alternative 组，只要 actual 里出现组里任一项就算命中。
+    这样可以表达"测试文件放根目录或 tests/ 下都算对"这种合理的位置选择自由度。
+    """
 
     id: str
     level: int
@@ -94,6 +100,9 @@ class BenchmarkTask:
     workspace_dir: Path
     validate_script: Path
     expected_files: tuple[str, ...]
+    # 派生自 expected_files：每项按 "|" 拆成 alternative 组。扁平条目（无 "|"）
+    # 自动变成单元素组。给 compute_edit_metrics 用。
+    expected_file_groups: tuple[tuple[str, ...], ...]
     max_steps: int
     max_tokens: int
     max_wall_time_seconds: int
@@ -136,13 +145,25 @@ class BenchmarkTask:
         if not validate_script.is_file():
             raise FileNotFoundError(f"缺少 validate.py: {validate_script}")
 
+        raw_expected = tuple(str(x) for x in data.get("expected_files", []))
+        # 每项按 "|" 切成 alternative 组；空白被 strip。"a|b" → ("a", "b")；"a" → ("a",)
+        expected_groups = tuple(
+            tuple(p.strip() for p in r.split("|") if p.strip())
+            for r in raw_expected
+        )
+        if any(len(g) == 0 for g in expected_groups):
+            raise ValueError(
+                f"task.yaml expected_files 有空条目或全空 alternative 组: {yaml_path}"
+            )
+
         return cls(
             id=str(data["id"]),
             level=int(data["level"]),
             description=str(data["description"]).strip(),
             workspace_dir=workspace_dir,
             validate_script=validate_script,
-            expected_files=tuple(str(x) for x in data.get("expected_files", [])),
+            expected_files=raw_expected,
+            expected_file_groups=expected_groups,
             max_steps=int(data["max_steps"]),
             max_tokens=int(data["max_tokens"]),
             max_wall_time_seconds=int(data["max_wall_time_seconds"]),

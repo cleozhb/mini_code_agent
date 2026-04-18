@@ -65,6 +65,11 @@ class TestBenchmarkTaskLoad:
         assert task.level == 1
         assert "时间戳" in task.description or "Unix" in task.description
         assert task.expected_files == ("src/utils.py", "tests/test_utils.py")
+        # 无 "|" 时 expected_file_groups 每项都是单元素组
+        assert task.expected_file_groups == (
+            ("src/utils.py",),
+            ("tests/test_utils.py",),
+        )
         assert task.max_steps == 20
         assert task.max_tokens == 50_000
         assert task.max_wall_time_seconds == 300
@@ -72,6 +77,80 @@ class TestBenchmarkTaskLoad:
         assert task.workspace_dir.is_dir()
         assert task.validate_script.is_file()
         assert len(task.task_hash) == 64  # sha256 hex
+
+    def test_load_expected_files_with_alternative_groups(self, tmp_path: Path) -> None:
+        """expected_files 里的 "a|b" 该被拆成 alternative 组 ("a", "b")."""
+        task_dir = tmp_path / "T-alt"
+        task_dir.mkdir()
+        (task_dir / "workspace").mkdir()
+        (task_dir / "workspace" / "main.py").write_text("x")
+        (task_dir / "validate.py").write_text("print('{}')")
+        (task_dir / "task.yaml").write_text(
+            "id: T-alt\n"
+            "level: 1\n"
+            "description: d\n"
+            "expected_files:\n"
+            "  - config.py\n"
+            "  - test_config.py|tests/test_config.py\n"
+            "max_steps: 5\n"
+            "max_tokens: 1000\n"
+            "max_wall_time_seconds: 60\n"
+        )
+        task = BenchmarkTask.load(task_dir)
+        # expected_files 保留原始字符串（便于 human read + hash 稳定）
+        assert task.expected_files == (
+            "config.py",
+            "test_config.py|tests/test_config.py",
+        )
+        # 派生的 groups 才是评分用的
+        assert task.expected_file_groups == (
+            ("config.py",),
+            ("test_config.py", "tests/test_config.py"),
+        )
+
+    def test_load_expected_files_trims_whitespace_in_alternatives(
+        self, tmp_path: Path
+    ) -> None:
+        """'a | b' 的空白应被 strip 掉；不是扩充新路径语义，纯容错."""
+        task_dir = tmp_path / "T-alt-ws"
+        task_dir.mkdir()
+        (task_dir / "workspace").mkdir()
+        (task_dir / "workspace" / "main.py").write_text("x")
+        (task_dir / "validate.py").write_text("print('{}')")
+        (task_dir / "task.yaml").write_text(
+            "id: T-alt-ws\n"
+            "level: 1\n"
+            "description: d\n"
+            "expected_files:\n"
+            "  - '  a.py  |  b.py  '\n"
+            "max_steps: 5\n"
+            "max_tokens: 1000\n"
+            "max_wall_time_seconds: 60\n"
+        )
+        task = BenchmarkTask.load(task_dir)
+        assert task.expected_file_groups == (("a.py", "b.py"),)
+
+    def test_load_expected_files_rejects_empty_alternative(
+        self, tmp_path: Path
+    ) -> None:
+        """纯空串的 expected_files 条目应报错，不让它静默变成空组."""
+        task_dir = tmp_path / "T-empty"
+        task_dir.mkdir()
+        (task_dir / "workspace").mkdir()
+        (task_dir / "workspace" / "main.py").write_text("x")
+        (task_dir / "validate.py").write_text("print('{}')")
+        (task_dir / "task.yaml").write_text(
+            "id: T-empty\n"
+            "level: 1\n"
+            "description: d\n"
+            "expected_files:\n"
+            "  - ''\n"
+            "max_steps: 5\n"
+            "max_tokens: 1000\n"
+            "max_wall_time_seconds: 60\n"
+        )
+        with pytest.raises(ValueError, match="expected_files"):
+            BenchmarkTask.load(task_dir)
 
     def test_load_missing_yaml(self, tmp_path: Path) -> None:
         (tmp_path / "workspace").mkdir()
