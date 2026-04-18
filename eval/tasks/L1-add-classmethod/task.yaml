@@ -10,9 +10,10 @@ description: |
   - 新增测试文件命名为 `test_config.py`，放在**工作区根目录**（与 config.py 并列），
     或 `tests/test_config.py`（两种都接受）
 expected_files:
-  # 只列核心产出；测试文件位置允许 test_config.py / tests/test_config.py 二选一，
-  # 不列进 expected_files 避免 edit_precision/recall 因为合理的目录选择被误判。
   - config.py
+  # "|" 表示 alternative 组：根目录 test_config.py 或 tests/ 下的，二选一算命中
+  # （语义见 benchmark.py 的 expected_file_groups）
+  - test_config.py|tests/test_config.py
 max_steps: 20
 max_tokens: 50000
 max_wall_time_seconds: 300
