@@ -1,0 +1,32 @@
+id: L2-add-model-field
+level: 2
+description: |
+  现在 `app/models.py` 里的 `User` 只有 `id` 和 `name`；业务要为用户加邮箱通知，
+  需要把 `email` 字段贯通到 model / schema / api 三层。
+
+  具体要求：
+
+  1. **`app/models.py`**：给 `User` dataclass 加 `email: str` 字段，**必填**
+     （不要给默认值）。
+  2. **`app/schemas.py`**：`UserCreateIn` 和 `UserOut` 都加 `email: str` 字段，
+     **必填**。顺序放在 `name` 之后。
+  3. **`app/api.py`**：`create_user` 把入参的 `email` 存到 `User` 上；
+     `get_user` 把存的 `email` 放回 `UserOut`。`create_user` / `get_user` 的
+     签名（参数名、返回类型）保持不变；`UserAlreadyExists` / `UserNotFound`
+     两种错误路径的行为也不要动。
+  4. 不要删 / 改 `reset_store` 或 `_USERS` 这些现有符号。
+  5. **不要改 `tests/` 下的任何文件**，也不要改函数签名 —— tests 是行为契约，
+     原先已有的用例 + 新加的 email 用例必须全部通过。
+
+  修改范围：`app/models.py`、`app/schemas.py`、`app/api.py`。不要新建文件。
+expected_files:
+  - app/models.py
+  - app/schemas.py
+  - app/api.py
+max_steps: 30
+max_tokens: 150000
+max_wall_time_seconds: 400
+tags:
+  - multi-file
+  - python
+  - feature
