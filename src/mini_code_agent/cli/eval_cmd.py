@@ -92,7 +92,13 @@ def _build_eval_system_prompt(workspace: Path) -> str:
         "- WriteFile / EditFile 的 path 参数用**相对路径**（如 'config.py'、'tests/test_config.py'）\n"
         "- Bash 执行时 cwd 已经锁在工作区里，不要 cd 出去\n"
         "- workspace 是隔离的临时副本，放开手改文件即可\n"
-        "- 完成任务后用一两句话简短汇报做了什么，不要冗长解释\n"
+        "\n"
+        "提交前自测（重要）：\n"
+        "- 改完代码后，**必须**用 Bash 跑一次测试确认没回归，再给最终回复：\n"
+        "  - 如果工作区有 `tests/` 目录：`python -m pytest tests/ -q`\n"
+        "  - 如果是单文件任务（根目录下有 `test_*.py`）：`python -m pytest -q`\n"
+        "- 测试挂了就继续修，通过后再收尾。不要跳过这一步直接汇报。\n"
+        "- 汇报时一句话说明做了什么 + 测试结果（如 `改了 X，pytest 全绿`），不要冗长解释。\n"
     )
 
 
@@ -122,6 +128,8 @@ def add_eval_subparser(subparsers: argparse._SubParsersAction) -> argparse.Argum
                    help="任务间并发度（默认 1，串行）")
     p.add_argument("--no-save", action="store_true",
                    help="不把结果落盘")
+    p.add_argument("--no-trace", action="store_true",
+                   help="不落 Agent 对话 trace（默认落到 results_dir/traces/）")
     # 目录
     p.add_argument("--tasks-dir", type=str, default="eval/tasks",
                    help="benchmark 任务目录（相对 cwd，默认 eval/tasks）")
@@ -277,12 +285,18 @@ async def _run_eval(
 
     # 3. factory + runner
     factory = build_agent_factory(llm_client)
+    # --no-save 隐含 --no-trace：既然连 summary 都不落盘，就别留调试副产物
+    trace_dir = (
+        None if (args.no_trace or args.no_save)
+        else (results_dir / "traces")
+    )
     runner = EvalRunner(
         agent_factory=factory,
         model_name=model_name,
         pricing=pricing,
         runs_per_task=args.runs,
         parallel_tasks=args.parallel,
+        trace_dir=trace_dir,
     )
     total_runs = len(suite.tasks) * max(1, args.runs)
     console.print(
@@ -298,6 +312,8 @@ async def _run_eval(
         tracker = EvalTracker(results_dir)
         path = tracker.save(result)
         console.print(f"[dim]已保存: {path}[/dim]")
+        if trace_dir is not None:
+            console.print(f"[dim]trace 目录: {trace_dir}[/dim]")
     else:
         console.print("[dim]--no-save：结果未落盘[/dim]")
 
