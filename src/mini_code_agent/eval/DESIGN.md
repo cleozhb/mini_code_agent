@@ -22,9 +22,10 @@
 | PR4c-fix2: runner 在 agent.run() 外 chdir 到 workspace（修 FileGuard 相对路径误拦） | ✅ 已 merge (PR #14) |
 | PR4d-fix: L1-add-classmethod 规约精确化 + snapshot 过滤 `.agent-backups`/`.pytest_cache` | ✅ 已 merge (PR #15) |
 | PR4d-polish: `expected_files` 支持 `a|b` OR 组 + `KNOWN_MODELS` 加 deepseek-v3.2 定价 | ✅ 已 merge (PR #17) |
-| PR4e: L2-split-large-function + L2-print-to-logger（2 个 L2 任务） | ✅ 本 PR |
-| PR4e-fix: L2 任务 max_tokens 80k→150k、system prompt 加自测引导、Runner 加 trace 落盘 | ✅ 本 PR |
-| PR4f+: 剩余 5 个 benchmark 任务（L2×2 + L3×3，分批） | ⬜ 未开始 |
+| PR4e: L2-split-large-function + L2-print-to-logger（2 个 L2 任务） | ✅ 已 merge (PR #18) |
+| PR4e-fix: L2 任务 max_tokens 80k→150k、system prompt 加自测引导、Runner 加 trace 落盘 | ✅ 已 merge (PR #19) |
+| PR4f: L2-add-model-field + L2-cache-decorator（补齐 L2×4） | ✅ 已 merge (PR #20) |
+| PR4g+: 剩余 3 个 L3 任务（find-and-fix-bugs / refactor-module / api-integration，可分批） | ⬜ 未开始 |
 
 ---
 
@@ -240,26 +241,28 @@ class EvalSummary:
 
 任务描述必须**脱敏**（像真实用户输入，不泄漏修复思路或答案），否则测不出真实能力。
 
+> **当前进度（2026-04-20）**：L1×5 + L2×4 全部落地，剩 L3×3 未开工。每项后面的 ✅/⬜ 代表 `eval/tasks/<id>/` 是否已存在。
+
 ### Level 1（5 个，单文件修改）
 
-- `L1-add-function`：加一个时间戳格式化函数 + 测试
-- `L1-fix-failing-test`：跑 `pytest tests/test_parser.py` 有测试失败，修好（**不**说是 off-by-one）
-- `L1-add-classmethod`：给 Config 类加 `from_env()` 类方法
-- `L1-rename-var`：把某模块的 `user_id` 统一重命名为 `uid`，保持测试通过
-- `L1-add-docstring`：给某个无文档的模块批量加 docstring（验证：ast 解析出所有函数都有 docstring）
+- ✅ `L1-add-function`：加一个时间戳格式化函数 + 测试
+- ✅ `L1-fix-failing-test`：跑 `pytest tests/test_parser.py` 有测试失败，修好（**不**说是 off-by-one）
+- ✅ `L1-add-classmethod`：给 Config 类加 `from_env()` 类方法
+- ✅ `L1-rename-var`：把某模块的 `user_id` 统一重命名为 `uid`，保持测试通过
+- ✅ `L1-add-docstring`：给某个无文档的模块批量加 docstring（验证：ast 解析出所有函数都有 docstring）
 
 ### Level 2（4 个，多文件协作）
 
-- `L2-add-model-field`：给 User model 加 email 字段（model + schema + endpoint + test）
-- `L2-print-to-logger`：把 `print()` 替换成 logger 调用，涉及创建 logger 模块
-- `L2-cache-decorator`：给 3 个请求方法加缓存装饰器 + 失效测试
-- `L2-split-large-function`：把 100+ 行的函数拆成小函数（验证：单函数行数上限 + 测试通过）
+- ✅ `L2-add-model-field`：给 User model 加 email 字段（model + schema + endpoint + test）
+- ✅ `L2-print-to-logger`：把 `print()` 替换成 logger 调用，涉及创建 logger 模块
+- ✅ `L2-cache-decorator`：给 3 个请求方法加缓存装饰器 + 失效测试
+- ✅ `L2-split-large-function`：把 100+ 行的函数拆成小函数（验证：单函数行数上限 + 测试通过）
 
 ### Level 3（3 个，探索 + 修改）
 
-- `L3-find-and-fix-bugs`：测试 suite 里有 2 个 failing test，找出根因并修
-- `L3-refactor-module`：把 `auth.py` 里的 session 逻辑抽出到 `session.py`
-- `L3-api-integration`：基于现有 HTTP client 给未实现的 endpoint 补完（含错误处理 + 重试 + 测试）
+- ⬜ `L3-find-and-fix-bugs`：测试 suite 里有 2 个 failing test，找出根因并修
+- ⬜ `L3-refactor-module`：把 `auth.py` 里的 session 逻辑抽出到 `session.py`
+- ⬜ `L3-api-integration`：基于现有 HTTP client 给未实现的 endpoint 补完（含错误处理 + 重试 + 测试）
 
 **强制开发顺序**：先只写 `L1-add-function` 一个任务，把 runner / validate / snapshot / tracker 全流程打通再扩量。fixture 和 validate 的坑一次性暴露比较好。
 
