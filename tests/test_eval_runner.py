@@ -856,3 +856,59 @@ class TestEvalRunnerE2E:
         assert suite_result.summary.by_failure_category == {}
         # timestamp 是 ISO 格式
         assert "T" in suite_result.timestamp
+
+    async def test_trace_dump_when_trace_dir_set(
+        self, tmp_path: Path, l1_task: BenchmarkTask,
+    ) -> None:
+        """给 trace_dir 时，每次 run 应落一份 conversation + metadata JSON."""
+        trace_dir = tmp_path / "traces"
+        runner = EvalRunner(
+            agent_factory=_success_factory,
+            model_name="mock",
+            pricing=ModelPricing(0.0, 0.0),
+            runs_per_task=1,
+            workspace_root=tmp_path / "workspaces",
+            trace_dir=trace_dir,
+        )
+        [r] = await runner.run_task(l1_task)
+
+        assert r.trace_path is not None
+        trace_file = Path(r.trace_path)
+        assert trace_file.is_file()
+        assert trace_file.parent == trace_dir
+
+        payload = json.loads(trace_file.read_text())
+        assert payload["task_id"] == "L1-add-function"
+        assert payload["run_index"] == 0
+        assert payload["stop_reason"] == "ok"
+        assert payload["passed"] is True
+        assert payload["tool_calls_count"] == 2
+        assert payload["usage"]["input_tokens"] == 100 + 150 + 50
+        assert payload["usage"]["output_tokens"] == 50 + 40 + 10
+        # messages 至少含 system + user + 3 轮 assistant（有 tool_calls 的 2 轮 + 纯文本收尾）+ 2 轮 tool result
+        assert len(payload["messages"]) >= 5
+        roles = [m["role"] for m in payload["messages"]]
+        assert roles[0] == "system"
+        assert "user" in roles
+        assert "assistant" in roles
+        assert "tool" in roles
+        # assistant 里带 tool_calls 的至少一条
+        assert any(
+            m["role"] == "assistant" and m.get("tool_calls")
+            for m in payload["messages"]
+        )
+
+    async def test_no_trace_when_trace_dir_none(
+        self, tmp_path: Path, l1_task: BenchmarkTask,
+    ) -> None:
+        """trace_dir=None（默认）时不落 trace，trace_path 字段为 None."""
+        runner = EvalRunner(
+            agent_factory=_success_factory,
+            model_name="mock",
+            pricing=ModelPricing(0.0, 0.0),
+            runs_per_task=1,
+            workspace_root=tmp_path / "workspaces",
+            # trace_dir 不传
+        )
+        [r] = await runner.run_task(l1_task)
+        assert r.trace_path is None

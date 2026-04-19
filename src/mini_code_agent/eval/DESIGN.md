@@ -23,6 +23,7 @@
 | PR4d-fix: L1-add-classmethod 规约精确化 + snapshot 过滤 `.agent-backups`/`.pytest_cache` | ✅ 已 merge (PR #15) |
 | PR4d-polish: `expected_files` 支持 `a|b` OR 组 + `KNOWN_MODELS` 加 deepseek-v3.2 定价 | ✅ 已 merge (PR #17) |
 | PR4e: L2-split-large-function + L2-print-to-logger（2 个 L2 任务） | ✅ 本 PR |
+| PR4e-fix: L2 任务 max_tokens 80k→150k、system prompt 加自测引导、Runner 加 trace 落盘 | ✅ 本 PR |
 | PR4f+: 剩余 5 个 benchmark 任务（L2×2 + L3×3，分批） | ⬜ 未开始 |
 
 ---
@@ -511,6 +512,32 @@ expected_files:
 这样 L1-add-classmethod Agent 写 `tests/test_config.py` 的情况下，precision 和 recall 都到 1.0，指标真正反映能力。
 
 **什么时候用 OR 组**：当**位置选择**对任务结果无关（放 tests/ 还是根目录都能跑通）时。不要用来掩盖规约模糊 —— 如果 Agent 可能写两种**不等价**的方案（例如写到 `config.py` 或写到 `settings.py`，语义不一样），仍应在 description 锁死。OR 组是"规约允许的多条合理路径"的显式表达，不是"反正都算对"。
+
+### 9.10 LoopGuard 的 token 记账语义 + L2 任务 budget + trace 落盘
+
+**背景**：PR4e 合并后，本地用 deepseek-v3.2 跑 `L2-split-large-function`，`passed=true` 但 `stop_reason=max_tokens`、`verifier_first_passed=null`、9 步 `prompt_tokens=80860`。同步任务 L1-add-classmethod 9 步只耗 29k prompt。看起来 Agent "侥幸过线"，实际分析下来发现三件事需要修。
+
+**LoopGuard 的记账不是"prompt 上限"，是"API usage 累计"**：`loop_guard.add_tokens(response.usage.input_tokens + response.usage.output_tokens)` 每轮累加。对于 Chat Completions 这种多轮对话，每轮 input 都完整 replay 历史 → `sum_over_rounds(input_tokens)` 增长很快。80860 = Σ9 轮的 input_tokens，不是单轮 prompt 大小，也不是 conversation 实际 token 数。
+
+**prompt cache 帮不上忙**：DeepSeek/OpenAI/Anthropic 都有 context cache，但 `usage.prompt_tokens` 返回的是**完整原始 prompt 的 token 数**，cache 命中只在辅助字段（如 `prompt_cache_hit_tokens`）体现。LoopGuard 读的是完整数，所以 cache 影响 $$ 和延迟，不影响预算判定。
+
+**改动**：
+
+1. **短期 — 放宽 L2 budget**：`L2-split-large-function` 和 `L2-print-to-logger` 的 `task.yaml` 把 `max_tokens: 80000` 提到 `150000`。L2 平均每轮 ~9k prompt（上下文 ×9 轮累加 ~81k），留出自测 + 1-2 步缓冲到 150k 更合理。L1 保持 50000 不变（实测 29k 够用，~40% 余量）。
+
+2. **长期 — system prompt 加自测引导**：`_build_eval_system_prompt` 加一段"提交前必须用 Bash 跑一次 `pytest` 确认无回归"。目的是把 `verifier_first_pass_rate` 从恒 0 拉起来（现在这个指标没信号）。同时 reword 收尾语使汇报里带上测试结果（便于人看日志诊断）。这不等同于 `Verifier` 子系统，但先让 Agent 养成跑测的习惯。
+
+3. **中期 — Runner 加 trace 落盘**：`EvalRunner.__init__` 接 `trace_dir: Path | None`（CLI 默认 `<results_dir>/traces/`，`--no-trace` 关，`--no-save` 隐含 `--no-trace`）。每个 run 落一份 `<ws_name>.trace.json`，含：
+   - `task_id`/`run_index`/`timestamp`/`stop_reason`/`passed`/`usage`/`tool_calls_count`/`tool_calls_errors`/`validation_details`
+   - `messages`: 完整对话历史（system + user + assistant + tool），每条带 `role`/`content`/`tool_calls`/`tool_result`
+
+   `TaskResult` 加 `trace_path: str | None` 字段反查回 trace 文件。以后再问"为什么这次跑 80k token / 2 个 tool error 从哪来"，直接读 trace 不再靠猜。
+
+**什么时候再动 LoopGuard 记账逻辑**：如果 L2/L3 任务跨多 run 普遍在 100-150k budget 里挣扎，说明"累计 usage" 语义对多轮任务天然不友好。届时两条备选：
+- **A.** 按"当前 conversation token 数"而不是累计判 —— 语义更准但改 stop_reason 的意义，慎重。
+- **B.** 把 cache hit 字段考虑进去按"折后 billable token" 累加 —— 贴近成本含义，但偏离"流量保护"。
+
+眼下不碰，先用 trace 攒几次数据再说。
 
 ---
 

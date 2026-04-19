@@ -258,6 +258,97 @@ def _current_git_commit(cwd: Path | None = None) -> str | None:
 
 
 # ---------------------------------------------------------------------------
+# Trace 落盘（DESIGN §9.10：事后回查 Agent 在做什么）
+# ---------------------------------------------------------------------------
+
+
+def _serialize_message(msg) -> dict:  # type: ignore[no-untyped-def]
+    """把 llm.base.Message 序列化成可 JSON 的 dict.
+
+    只走属性读取，不 import Message —— 保持 runner 对 llm 模块的 import 面最小。
+    """
+    out: dict = {"role": msg.role.value, "content": msg.content}
+    if msg.tool_calls:
+        out["tool_calls"] = [
+            {
+                "id": tc.id,
+                "name": tc.name,
+                "arguments": tc.arguments,
+            }
+            for tc in msg.tool_calls
+        ]
+    if msg.tool_result is not None:
+        out["tool_result"] = {
+            "tool_call_id": msg.tool_result.tool_call_id,
+            "content": msg.tool_result.content,
+            "is_error": msg.tool_result.is_error,
+        }
+    return out
+
+
+def _dump_trace(
+    *,
+    trace_dir: Path,
+    ws_name: str,
+    task: BenchmarkTask,
+    run_index: int,
+    agent,  # Agent；避免顶层 import cycle
+    agent_result: AgentResult | None,
+    agent_error: BaseException | None,
+    stop_reason: str,
+    wall_time: float,
+    validation_passed: bool,
+    validation_details: str,
+) -> str:
+    """把一次 run 的完整 conversation + metadata 写到 trace_dir 下.
+
+    文件名：`<ws_name>.trace.json`（ws_name 本身已含 task_id / run_index / uuid）。
+    结构：
+      {
+        "task_id": str,
+        "run_index": int,
+        "timestamp": iso8601,
+        "stop_reason": str,
+        "passed": bool,
+        "wall_time_seconds": float,
+        "usage": {"input_tokens": int, "output_tokens": int},
+        "tool_calls_count": int,
+        "tool_calls_errors": int,
+        "agent_error": str | None,
+        "validation_passed": bool,
+        "validation_details": str,
+        "messages": [ {role, content, tool_calls?, tool_result?}, ... ]
+      }
+    """
+    trace_dir.mkdir(parents=True, exist_ok=True)
+    path = trace_dir / f"{ws_name}.trace.json"
+
+    payload: dict = {
+        "task_id": task.id,
+        "run_index": run_index,
+        "timestamp": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "stop_reason": stop_reason,
+        "passed": validation_passed,
+        "wall_time_seconds": wall_time,
+        "tool_calls_count": agent_result.tool_calls_count if agent_result else 0,
+        "tool_calls_errors": agent_result.tool_calls_errors if agent_result else 0,
+        "usage": {
+            "input_tokens": agent_result.usage.input_tokens if agent_result else 0,
+            "output_tokens": agent_result.usage.output_tokens if agent_result else 0,
+        },
+        "agent_error": (
+            f"{type(agent_error).__name__}: {agent_error}"
+            if agent_error is not None else None
+        ),
+        "validation_passed": validation_passed,
+        "validation_details": validation_details,
+        "messages": [_serialize_message(m) for m in agent.conversation.messages],
+    }
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return str(path)
+
+
+# ---------------------------------------------------------------------------
 # Result dataclasses（DESIGN.md §2）
 # ---------------------------------------------------------------------------
 
@@ -285,6 +376,10 @@ class TaskResult:
     failure_category: str | None
     validation_details: str
     workspace_path: str | None = None  # 保留给调试：对应的临时目录
+    # trace 落盘路径（见 EvalRunner.trace_dir）；None 表示本次 run 没落 trace。
+    # trace 文件是 JSON，含 system/user/assistant/tool 消息全记录 + per-run
+    # metadata，用来事后回查 Agent 的上下文是怎么膨胀的 / token 花在了哪里。
+    trace_path: str | None = None
 
 
 @dataclass
@@ -451,6 +546,7 @@ class EvalRunner:
         runs_per_task: int = 3,
         parallel_tasks: int = 1,
         workspace_root: Path | None = None,
+        trace_dir: Path | None = None,
     ) -> None:
         self.agent_factory = agent_factory
         self.model_name = model_name
@@ -469,6 +565,10 @@ class EvalRunner:
             Path(workspace_root) if workspace_root is not None
             else Path(tempfile.gettempdir())
         )
+        # trace_dir 不为 None 时，每次 run 会把 agent.conversation.messages
+        # 序列化到 <trace_dir>/<ws_name>.trace.json，方便事后回查上下文膨胀。
+        # None = 不落 trace。
+        self.trace_dir = Path(trace_dir) if trace_dir is not None else None
 
     async def run_task(self, task: BenchmarkTask) -> list[TaskResult]:
         """串行跑 n 次 task（同一任务的多次 run 必须串行，避免 tmp workspace 重名争抢）."""
@@ -564,6 +664,27 @@ class EvalRunner:
         )
         cost = self.pricing.cost_usd(prompt_tokens, completion_tokens)
 
+        # 7. 落 trace（可选）
+        trace_path: str | None = None
+        if self.trace_dir is not None:
+            try:
+                trace_path = _dump_trace(
+                    trace_dir=self.trace_dir,
+                    ws_name=ws_name,
+                    task=task,
+                    run_index=run_index,
+                    agent=agent,
+                    agent_result=agent_result,
+                    agent_error=agent_error,
+                    stop_reason=stop_reason,
+                    wall_time=wall_time,
+                    validation_passed=validation_passed,
+                    validation_details=validation_details,
+                )
+            except Exception:  # noqa: BLE001
+                # trace 落盘失败不能影响主流程
+                logger.exception("trace 落盘失败，忽略")
+
         return TaskResult(
             task_id=task.id,
             task_hash=task.task_hash,
@@ -588,4 +709,5 @@ class EvalRunner:
             failure_category=category,
             validation_details=validation_details,
             workspace_path=str(workspace),
+            trace_path=trace_path,
         )
