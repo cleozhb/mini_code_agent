@@ -1,0 +1,41 @@
+id: L2-print-to-logger
+level: 2
+description: |
+  `app/service.py` 和 `app/utils.py` 里用 `print(...)` 打日志；请把这些调用
+  统一替换成 Python `logging` 模块的调用，并新建一个 `app/logging_config.py`
+  负责 logger 配置。
+
+  具体要求：
+
+  1. 新建文件 `app/logging_config.py`：
+     - 在该模块被 **import 时**就完成 `app` logger 的基础配置（至少一个
+       StreamHandler，级别 ≥ INFO，一致的格式）。换句话说，只要 import 过
+       `app.logging_config` 一次，后面 `logging.getLogger("app")` 就能直接用。
+     - 可以在顶层调用 `logging.basicConfig(...)` 或手工构造 handler 挂到
+       `logging.getLogger("app")` 上，两种都行。
+  2. 在 `app/service.py` 和 `app/utils.py` 顶部 import `logging` 和
+     `app.logging_config`（触发配置），模块级拿一个 logger：
+     `logger = logging.getLogger(__name__)`（或 `logging.getLogger("app")`
+     开头的子名都行，因为日志会冒泡到 `"app"` logger）。
+  3. 把每处 `print(...)` 按**语义映射**替换成 logger 调用：
+     - `print("ERROR: ...")` → `logger.error(...)`
+     - `print("WARNING: ...")` → `logger.warning(...)`
+     - `print("INFO: ...")` → `logger.info(...)`
+     - 日志消息内容本身不用带 "INFO:"/"ERROR:" 前缀了（logger 自己会加级别）。
+  4. `app/service.py` 和 `app/utils.py` **不能再有任何 `print()` 调用**。
+  5. **不要改 `tests/` 下的任何文件**，也不要改函数签名 / 返回值 / 抛错行为 —— 原有
+     15 个测试必须继续全部通过。
+
+  修改范围：新建 `app/logging_config.py`；编辑 `app/service.py` 和 `app/utils.py`。
+expected_files:
+  - app/logging_config.py
+  - app/service.py
+  - app/utils.py
+max_steps: 30
+max_tokens: 80000
+max_wall_time_seconds: 400
+tags:
+  - multi-file
+  - python
+  - refactor
+  - logging
