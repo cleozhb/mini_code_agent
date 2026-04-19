@@ -6,7 +6,9 @@ import difflib
 import textwrap
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
+
+from pydantic import BaseModel, Field
 
 from .base import PermissionLevel, Tool, ToolResult
 
@@ -38,9 +40,17 @@ def _preview(text: str, max_lines: int = 3) -> str:
     return preview
 
 
+class EditFileInput(BaseModel):
+    path: str = Field(description="文件路径")
+    old_content: str = Field(description="要替换的原始文本（必须在文件中唯一匹配）")
+    new_content: str = Field(description="替换后的文本（空字符串表示删除）")
+
+
 @dataclass
 class EditFileTool(Tool):
     """局部编辑文件：查找并替换唯一匹配的文本片段."""
+
+    InputModel: ClassVar[type[BaseModel]] = EditFileInput
 
     name: str = "EditFile"
     description: str = (
@@ -48,24 +58,6 @@ class EditFileTool(Tool):
         "old_content 必须在文件中唯一匹配。new_content 为空字符串表示删除该片段。"
         "修改已有文件时优先使用此工具而不是 WriteFile。"
     )
-    parameters: dict[str, Any] = field(default_factory=lambda: {
-        "type": "object",
-        "properties": {
-            "path": {
-                "type": "string",
-                "description": "文件路径",
-            },
-            "old_content": {
-                "type": "string",
-                "description": "要替换的原始文本（必须在文件中唯一匹配）",
-            },
-            "new_content": {
-                "type": "string",
-                "description": "替换后的文本（空字符串表示删除）",
-            },
-        },
-        "required": ["path", "old_content", "new_content"],
-    })
     permission_level: PermissionLevel = PermissionLevel.CONFIRM
 
     async def execute(self, **kwargs: Any) -> ToolResult:

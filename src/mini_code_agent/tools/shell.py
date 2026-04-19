@@ -4,30 +4,28 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar
+
+from pydantic import BaseModel, Field
 
 from .base import PermissionLevel, Tool, ToolResult
+
+
+class BashInput(BaseModel):
+    command: str = Field(description="要执行的 shell 命令")
 
 
 @dataclass
 class BashTool(Tool):
     """执行 Shell 命令."""
 
+    InputModel: ClassVar[type[BaseModel]] = BashInput
+
     name: str = "Bash"
     description: str = (
         "在 shell 中执行命令，返回 stdout+stderr 合并输出和 exit_code。"
         "超时 30 秒。输出超过 200 行会截断中间部分。"
     )
-    parameters: dict[str, Any] = field(default_factory=lambda: {
-        "type": "object",
-        "properties": {
-            "command": {
-                "type": "string",
-                "description": "要执行的 shell 命令",
-            },
-        },
-        "required": ["command"],
-    })
     permission_level: PermissionLevel = PermissionLevel.CONFIRM
 
     timeout: int = 30

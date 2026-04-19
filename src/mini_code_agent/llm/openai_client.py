@@ -152,6 +152,7 @@ class OpenAIClient(LLMClient):
         self,
         messages: list[Message],
         tools: list[ToolParam] | None = None,
+        response_format: dict | None = None,
     ) -> LLMResponse:
         api_messages = self._convert_messages(messages)
         api_tools = self._convert_tools(tools)
@@ -162,6 +163,8 @@ class OpenAIClient(LLMClient):
         }
         if api_tools:
             kwargs["tools"] = api_tools
+        if response_format:
+            kwargs["response_format"] = response_format
 
         try:
             resp = await self._client.chat.completions.create(**kwargs)
@@ -178,6 +181,7 @@ class OpenAIClient(LLMClient):
         self,
         messages: list[Message],
         tools: list[ToolParam] | None = None,
+        response_format: dict | None = None,
     ) -> AsyncIterator[StreamDelta]:
         api_messages = self._convert_messages(messages)
         api_tools = self._convert_tools(tools)
@@ -190,6 +194,8 @@ class OpenAIClient(LLMClient):
         }
         if api_tools:
             kwargs["tools"] = api_tools
+        if response_format:
+            kwargs["response_format"] = response_format
 
         try:
             stream = await self._client.chat.completions.create(**kwargs)

@@ -6,7 +6,9 @@ import asyncio
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
+
+from pydantic import BaseModel, Field
 
 from .base import PermissionLevel, Tool, ToolResult
 
@@ -16,29 +18,22 @@ from .base import PermissionLevel, Tool, ToolResult
 # ---------------------------------------------------------------------------
 
 
+class GrepInput(BaseModel):
+    pattern: str = Field(description="搜索模式（正则表达式）")
+    path: str = Field(default=".", description="搜索路径，默认当前目录")
+
+
 @dataclass
 class GrepTool(Tool):
     """用 grep 搜索代码."""
+
+    InputModel: ClassVar[type[BaseModel]] = GrepInput
 
     name: str = "Grep"
     description: str = (
         "在指定路径下递归搜索匹配 pattern 的内容。"
         "返回匹配的文件名、行号和内容。结果最多 50 条。"
     )
-    parameters: dict[str, Any] = field(default_factory=lambda: {
-        "type": "object",
-        "properties": {
-            "pattern": {
-                "type": "string",
-                "description": "搜索模式（正则表达式）",
-            },
-            "path": {
-                "type": "string",
-                "description": "搜索路径，默认当前目录",
-            },
-        },
-        "required": ["pattern"],
-    })
     permission_level: PermissionLevel = PermissionLevel.AUTO
 
     max_results: int = 50
@@ -114,29 +109,22 @@ _IGNORE_DIRS = {
 }
 
 
+class ListDirInput(BaseModel):
+    path: str = Field(default=".", description="目录路径，默认当前目录")
+    max_depth: int = Field(default=2, description="最大递归深度，默认 2")
+
+
 @dataclass
 class ListDirTool(Tool):
     """列出目录结构."""
+
+    InputModel: ClassVar[type[BaseModel]] = ListDirInput
 
     name: str = "ListDir"
     description: str = (
         "列出指定目录的树形结构。"
         "自动忽略 .git, node_modules, __pycache__ 等目录。"
     )
-    parameters: dict[str, Any] = field(default_factory=lambda: {
-        "type": "object",
-        "properties": {
-            "path": {
-                "type": "string",
-                "description": "目录路径，默认当前目录",
-            },
-            "max_depth": {
-                "type": "integer",
-                "description": "最大递归深度，默认 2",
-            },
-        },
-        "required": [],
-    })
     permission_level: PermissionLevel = PermissionLevel.AUTO
 
     async def execute(self, **kwargs: Any) -> ToolResult:

@@ -5,7 +5,9 @@ from __future__ import annotations
 import os
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
+
+from pydantic import BaseModel, Field
 
 from .base import PermissionLevel, Tool, ToolResult
 
@@ -20,9 +22,21 @@ def _format_line(line_num: int, line: str, width: int) -> str:
     return f"{line_num:>{width}}\t{line}"
 
 
+class ReadFileInput(BaseModel):
+    path: str = Field(description="文件路径")
+    start_line: int | None = Field(
+        default=None, description="起始行号（从 1 开始），不传则从第 1 行开始"
+    )
+    end_line: int | None = Field(
+        default=None, description="结束行号（包含），不传则到文件末尾"
+    )
+
+
 @dataclass
 class ReadFileTool(Tool):
     """读取文件内容，支持行号范围."""
+
+    InputModel: ClassVar[type[BaseModel]] = ReadFileInput
 
     name: str = "ReadFile"
     description: str = (
@@ -30,24 +44,6 @@ class ReadFileTool(Tool):
         "大文件（>500 行）未指定范围时会自动截断中间部分，"
         "保留首 200 行和末 50 行。"
     )
-    parameters: dict[str, Any] = field(default_factory=lambda: {
-        "type": "object",
-        "properties": {
-            "path": {
-                "type": "string",
-                "description": "文件路径",
-            },
-            "start_line": {
-                "type": "integer",
-                "description": "起始行号（从 1 开始），不传则从第 1 行开始",
-            },
-            "end_line": {
-                "type": "integer",
-                "description": "结束行号（包含），不传则到文件末尾",
-            },
-        },
-        "required": ["path"],
-    })
     permission_level: PermissionLevel = PermissionLevel.AUTO
 
     # 截断阈值
@@ -147,26 +143,19 @@ class ReadFileTool(Tool):
 # ---------------------------------------------------------------------------
 
 
+class WriteFileInput(BaseModel):
+    path: str = Field(description="文件路径")
+    content: str = Field(description="要写入的内容")
+
+
 @dataclass
 class WriteFileTool(Tool):
     """写入文件内容，写之前记录原始内容用于回滚."""
 
+    InputModel: ClassVar[type[BaseModel]] = WriteFileInput
+
     name: str = "WriteFile"
     description: str = "将内容写入指定文件。如果文件已存在会覆盖，会自动创建不存在的父目录。"
-    parameters: dict[str, Any] = field(default_factory=lambda: {
-        "type": "object",
-        "properties": {
-            "path": {
-                "type": "string",
-                "description": "文件路径",
-            },
-            "content": {
-                "type": "string",
-                "description": "要写入的内容",
-            },
-        },
-        "required": ["path", "content"],
-    })
     permission_level: PermissionLevel = PermissionLevel.CONFIRM
 
     # 记录写入前的原始内容，用于回滚

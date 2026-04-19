@@ -5,7 +5,9 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any
+from typing import Any, ClassVar
+
+from pydantic import BaseModel, ValidationError
 
 from ..llm.base import ToolParam
 
@@ -52,17 +54,49 @@ class Tool(ABC):
 
     子类需实现 execute() 和在类属性中定义 name / description /
     parameters / permission_level。
+
+    子类可定义 InputModel (Pydantic BaseModel) 来自动生成 parameters
+    JSON Schema 并在执行前校验输入参数。
     """
+
+    InputModel: ClassVar[type[BaseModel] | None] = None
 
     name: str = ""
     description: str = ""
     parameters: dict[str, Any] = field(default_factory=dict)  # JSON Schema
     permission_level: PermissionLevel = PermissionLevel.AUTO
 
+    def __post_init__(self) -> None:
+        """如果子类定义了 InputModel 且 parameters 为空，自动生成 JSON Schema."""
+        if self.InputModel is not None and not self.parameters:
+            schema = self.InputModel.model_json_schema()
+            schema.pop("title", None)
+            self.parameters = schema
+
     @abstractmethod
     async def execute(self, **kwargs: Any) -> ToolResult:
         """执行工具，返回结果."""
         ...
+
+    async def run(self, arguments: dict[str, Any]) -> ToolResult:
+        """校验参数并执行工具.
+
+        如果定义了 InputModel，先做 Pydantic 校验：
+        - 校验失败 → 返回 ToolResult(error=...) 让 LLM 自我修正
+        - 校验通过 → 调用 execute(**validated_data)
+
+        未定义 InputModel 时退化为直接调用 execute(**arguments)。
+        """
+        if self.InputModel is not None:
+            try:
+                validated = self.InputModel.model_validate(arguments)
+            except ValidationError as e:
+                return ToolResult(
+                    output="",
+                    error=f"参数校验失败:\n{e}",
+                )
+            return await self.execute(**validated.model_dump())
+        return await self.execute(**arguments)
 
     def to_schema(self) -> dict[str, Any]:
         """返回 OpenAI function calling 格式的 JSON Schema.

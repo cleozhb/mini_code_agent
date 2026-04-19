@@ -827,7 +827,7 @@ class Agent:
 
         # 执行工具
         try:
-            result: ExecToolResult = await tool.execute(**tool_call.arguments)
+            result: ExecToolResult = await tool.run(tool_call.arguments)
         except Exception as e:
             logger.exception("工具 '%s' 执行异常", tool_call.name)
             return Message.tool(
@@ -929,7 +929,7 @@ class Agent:
 
         # 执行工具
         try:
-            result: ExecToolResult = await tool.execute(**tool_call.arguments)
+            result: ExecToolResult = await tool.run(tool_call.arguments)
         except Exception as e:
             logger.exception("工具 '%s' 执行异常", tool_call.name)
             err_result = ExecToolResult(

@@ -182,8 +182,16 @@ class LLMClient(ABC):
         self,
         messages: list[Message],
         tools: list[ToolParam] | None = None,
+        response_format: dict | None = None,  # 新增：支持结构化输出
     ) -> LLMResponse:
-        """发送消息并获取完整响应."""
+        """发送消息并获取完整响应.
+
+        Args:
+            messages: 消息列表
+            tools: 可选的工具定义
+            response_format: 可选的响应格式，用于结构化输出
+                例如: {"type": "json_object"} 或 {"type": "json_schema", "json_schema": {...}}
+        """
         ...
 
     @abstractmethod
@@ -191,6 +199,13 @@ class LLMClient(ABC):
         self,
         messages: list[Message],
         tools: list[ToolParam] | None = None,
+        response_format: dict | None = None,  # 新增：支持结构化输出
     ) -> AsyncIterator[StreamDelta]:
-        """发送消息并获取流式响应."""
+        """发送消息并获取流式响应.
+
+        Args:
+            messages: 消息列表
+            tools: 可选的工具定义
+            response_format: 可选的响应格式，用于结构化输出
+        """
         ...

@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, ClassVar, Literal
+
+from pydantic import BaseModel, Field
 
 from .base import PermissionLevel, Tool, ToolResult
 
@@ -13,9 +15,24 @@ from .base import PermissionLevel, Tool, ToolResult
 # ---------------------------------------------------------------------------
 
 
+class AddMemoryInput(BaseModel):
+    type: Literal["convention", "decision", "known_issue"] = Field(
+        description="记忆类型：convention=项目约定, decision=技术决策, known_issue=已知问题"
+    )
+    content: str = Field(description="记忆内容（约定文本 / 决策描述 / 问题描述）")
+    reason: str | None = Field(
+        default=None, description="原因说明（仅 decision 类型需要）"
+    )
+    solution: str | None = Field(
+        default=None, description="解决方案（仅 known_issue 类型需要）"
+    )
+
+
 @dataclass
 class AddMemoryTool(Tool):
     """向项目长期记忆中添加一条记录."""
+
+    InputModel: ClassVar[type[BaseModel]] = AddMemoryInput
 
     name: str = "add_memory"
     description: str = (
@@ -23,29 +40,6 @@ class AddMemoryTool(Tool):
         "支持三种类型：convention（项目约定）、decision（技术决策）、"
         "known_issue（已知问题及解法）。记忆会持久化到磁盘。"
     )
-    parameters: dict[str, Any] = field(default_factory=lambda: {
-        "type": "object",
-        "properties": {
-            "type": {
-                "type": "string",
-                "enum": ["convention", "decision", "known_issue"],
-                "description": "记忆类型：convention=项目约定, decision=技术决策, known_issue=已知问题",
-            },
-            "content": {
-                "type": "string",
-                "description": "记忆内容（约定文本 / 决策描述 / 问题描述）",
-            },
-            "reason": {
-                "type": "string",
-                "description": "原因说明（仅 decision 类型需要）",
-            },
-            "solution": {
-                "type": "string",
-                "description": "解决方案（仅 known_issue 类型需要）",
-            },
-        },
-        "required": ["type", "content"],
-    })
     permission_level: PermissionLevel = PermissionLevel.AUTO
 
     # 由外部注入的 ProjectMemory 实例
@@ -63,12 +57,12 @@ class AddMemoryTool(Tool):
             return ToolResult(output=f"已添加项目约定: {content}")
 
         if mem_type == "decision":
-            reason = kwargs.get("reason", "")
+            reason = kwargs.get("reason") or ""
             self._project_memory.add_decision(content, reason)
             return ToolResult(output=f"已添加技术决策: {content}")
 
         if mem_type == "known_issue":
-            solution = kwargs.get("solution", "")
+            solution = kwargs.get("solution") or ""
             self._project_memory.add_known_issue(content, solution)
             return ToolResult(output=f"已添加已知问题: {content}")
 
@@ -80,25 +74,21 @@ class AddMemoryTool(Tool):
 # ---------------------------------------------------------------------------
 
 
+class RecallMemoryInput(BaseModel):
+    keyword: str = Field(description="搜索关键词")
+
+
 @dataclass
 class RecallMemoryTool(Tool):
     """搜索项目长期记忆."""
+
+    InputModel: ClassVar[type[BaseModel]] = RecallMemoryInput
 
     name: str = "recall_memory"
     description: str = (
         "搜索项目长期记忆，查找包含关键词的约定、决策、已知问题。"
         "返回匹配到的所有记忆条目。"
     )
-    parameters: dict[str, Any] = field(default_factory=lambda: {
-        "type": "object",
-        "properties": {
-            "keyword": {
-                "type": "string",
-                "description": "搜索关键词",
-            },
-        },
-        "required": ["keyword"],
-    })
     permission_level: PermissionLevel = PermissionLevel.AUTO
 
     # 由外部注入的 ProjectMemory 实例

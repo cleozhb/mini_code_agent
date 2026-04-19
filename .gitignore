@@ -11,3 +11,10 @@ wheels/
 
 # Environment variables
 .env
+
+.agent_history
+.claude/
+.vscode/
+.agent-backups/
+.agent/
+examples/
