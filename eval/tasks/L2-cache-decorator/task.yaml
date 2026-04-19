@@ -1,0 +1,36 @@
+id: L2-cache-decorator
+level: 2
+description: |
+  `app/client.py` 里 `Client` 的三个读方法（`get_user` / `get_profile` /
+  `list_orders`）每次都穿透到 `backend`，高并发下压力过大。请加一层进程内缓存。
+
+  具体要求：
+
+  1. 在 `app/cache.py` 里实现两个公共符号：
+     - `cached(func)`：装饰器，返回和 `func` 同签名的 wrapper；按
+       `(func, args, kwargs)` 做 key 缓存返回值（同样入参再次调用直接返回，
+       不再调底层函数）。
+     - `clear_cache()`：清空**所有**被 `cached` 装饰过的函数累积的缓存条目
+       （供手工失效用）。
+  2. 在 `app/client.py` 里把 `cached` 应用到 `Client.get_user` /
+     `Client.get_profile` / `Client.list_orders` 三个方法上。应用方式不限
+     （`@cached` 语法糖或手工 `foo = cached(foo)` 都可以），只要最终这三个
+     方法实际是被 `cached` 包装过的版本即可。
+  3. 方法签名保持不变；返回值内容保持不变（第一次调用的结果会被缓存下来
+     当作后续返回值）。
+  4. **不要改 `app/backend.py`**（它是我们用来数调用次数的桩）。
+  5. **不要改 `tests/` 下的任何文件**。初始状态下 tests 是失败的（因为
+     `app/cache.py` 里的 `cached` / `clear_cache` 还没实现），改完应全绿。
+
+  修改范围：编辑 `app/cache.py`、`app/client.py`；不要新建文件。
+expected_files:
+  - app/cache.py
+  - app/client.py
+max_steps: 30
+max_tokens: 150000
+max_wall_time_seconds: 400
+tags:
+  - multi-file
+  - python
+  - decorator
+  - caching
