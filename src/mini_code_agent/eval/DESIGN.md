@@ -21,8 +21,9 @@
 | PR4c-fix: 给 eval 模式注入 workspace 上下文到 system prompt | ✅ 已 merge (PR #13) |
 | PR4c-fix2: runner 在 agent.run() 外 chdir 到 workspace（修 FileGuard 相对路径误拦） | ✅ 已 merge (PR #14) |
 | PR4d-fix: L1-add-classmethod 规约精确化 + snapshot 过滤 `.agent-backups`/`.pytest_cache` | ✅ 已 merge (PR #15) |
-| PR4d-polish: `expected_files` 支持 `a|b` OR 组 + `KNOWN_MODELS` 加 deepseek-v3.2 定价 | ✅ 本 PR |
-| PR4d+: 剩余 7 个 benchmark 任务（L2×4 + L3×3，分批） | ⬜ 未开始 |
+| PR4d-polish: `expected_files` 支持 `a|b` OR 组 + `KNOWN_MODELS` 加 deepseek-v3.2 定价 | ✅ 已 merge (PR #17) |
+| PR4e: L2-split-large-function + L2-print-to-logger（2 个 L2 任务） | ✅ 本 PR |
+| PR4f+: 剩余 5 个 benchmark 任务（L2×2 + L3×3，分批） | ⬜ 未开始 |
 
 ---
 

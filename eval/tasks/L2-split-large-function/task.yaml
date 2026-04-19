@@ -1,0 +1,28 @@
+id: L2-split-large-function
+level: 2
+description: |
+  `order_processor.py` 里的 `process_order` 函数现在约 78 行，职责过重
+  （校验 / 小计 / 折扣 / 税金 / 运费 / 结算都混在一起）。请把它拆成多个职责
+  单一的小函数，要求：
+
+  1. **每个函数体 ≤ 30 行**（不算函数签名本身，也不算 docstring；指从签名下
+     一行到 return/函数结束之间的所有代码行，包含空行）。`process_order` 自己
+     也要满足这个上限 —— 拆完它应该只剩下串流程的几行调用。
+  2. `process_order(order: Order) -> Order` 的**签名不能改**，它仍是公开入口。
+  3. **外部可观测行为完全不变**：返回值各字段、抛出的异常类型和匹配消息、
+     `order.audit_log` 的**顺序和内容**都要与现在一致。tests/ 下的测试就是
+     行为契约，不允许修改或删除测试。
+  4. 不要改 `order_processor.py` 里的 `TIER_DISCOUNTS` / `TAX_RATES` /
+     `COUPON_DISCOUNTS` / `SHIPPING_BASE` 这四个常量的数值。
+  5. 拆出来的函数放在 `order_processor.py` 同一文件里（不要新建 module）。
+
+  只修改 `order_processor.py`；不要动 `tests/` 下的任何文件。
+expected_files:
+  - order_processor.py
+max_steps: 30
+max_tokens: 80000
+max_wall_time_seconds: 400
+tags:
+  - single-file
+  - python
+  - refactor
