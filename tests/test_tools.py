@@ -324,9 +324,18 @@ class TestBashTool:
         assert result.exit_code == 0
 
     async def test_failing_command(self, tool: BashTool) -> None:
+        # 非零 exit 不算工具错误；exit code 以脚注形式附在 output 末尾
         result = await tool.execute(command="exit 42")
-        assert result.is_error
+        assert not result.is_error
         assert result.exit_code == 42
+        assert "[exit code: 42]" in result.output
+
+    async def test_failing_command_with_output(self, tool: BashTool) -> None:
+        result = await tool.execute(command="echo fail; exit 1")
+        assert not result.is_error
+        assert result.exit_code == 1
+        assert "fail" in result.output
+        assert "[exit code: 1]" in result.output
 
     async def test_stderr_merged(self, tool: BashTool) -> None:
         result = await tool.execute(command="echo err >&2")

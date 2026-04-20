@@ -171,7 +171,7 @@ class TaskResult:
     passed: bool                       # validate.py 最终判定
     stop_reason: str                   # 来自 AgentResult.stop_reason
     step_count: int                    # tool_calls_count
-    tool_error_count: int              # tool_calls_errors
+    tool_error_count: int              # tool_calls_errors（真·工具故障；不含 Bash 非零 exit）
     prompt_tokens: int
     completion_tokens: int
     cost_usd: float                    # tokens × 模型单价
@@ -204,6 +204,10 @@ class EvalSummary:
 
     avg_step_count: float
     tool_error_rate: float             # sum(tool_errors) / sum(tool_calls)
+    # 注：tool_error 只包含真·工具故障（安全拦截、权限拒绝、参数校验失败、
+    # 工具抛异常、Bash 超时等）。Bash 命令的非零 exit code 不计入 —— pytest /
+    # grep / diff 这类命令的非零退出是业务信号（"测试挂了" / "没匹配"），
+    # 由 Agent 从 output 末尾的 `[exit code: N]` 自行判断，不应算工具故障。
     verifier_first_pass_rate: float | None   # 无 verifier 触发 → None（非 0.0）
     verifier_recovery_rate: float | None     # 从失败中挽回的比例（见下）；无样本 → None
 

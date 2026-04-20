@@ -58,7 +58,8 @@ class AgentResult:
     # - "timeout"     超过 max_wall_time_seconds 墙钟上限
     # - "error"       发生异常
     stop_reason: StopReason = "ok"
-    # 工具调用里 is_error=True 的次数（含安全拦截、权限拒绝、工具异常、Bash exit≠0 等）
+    # 工具调用里 is_error=True 的次数（含安全拦截、权限拒绝、工具异常、Bash 超时等，
+    # 但不含 Bash 非零 exit —— 那是业务信号，附在 output 的 `[exit code: N]` 里）
     tool_calls_errors: int = 0
     # Verifier 触发的统计；从未触发时为 None / 0
     #   verifier_attempts      = 跑过几次 verifier（>=1 即触发过）
