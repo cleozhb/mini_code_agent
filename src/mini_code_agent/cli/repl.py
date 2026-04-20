@@ -76,6 +76,7 @@ class REPL:
             [
                 "/quit", "/exit", "/q", "/clear", "/cost", "/model",
                 "/memory", "/save", "/plan",
+                "/undo", "/checkpoints", "/diff",
             ],
             sentence=True,  # 整条匹配，不拆词
         )
@@ -167,9 +168,22 @@ class REPL:
             self._toggle_plan_mode(plan_arg)
             return True
 
+        if command == "/undo":
+            await self._undo()
+            return True
+
+        if command == "/checkpoints":
+            await self._show_checkpoints()
+            return True
+
+        if command == "/diff":
+            await self._show_agent_diff()
+            return True
+
         self.console.print(f"[red]未知命令: {command}[/red]")
         self.console.print(
-            "[dim]可用命令: /quit  /clear  /cost  /model  /memory  /save  /plan[/dim]"
+            "[dim]可用命令: /quit  /clear  /cost  /model  /memory  /save  /plan"
+            "  /undo  /checkpoints  /diff[/dim]"
         )
         return True
 
@@ -193,6 +207,98 @@ class REPL:
         status = "开启" if self.agent.plan_mode else "关闭"
         color = "green" if self.agent.plan_mode else "yellow"
         self.console.print(f"[{color}]Plan mode 已{status}[/{color}]")
+
+    async def _undo(self) -> None:
+        """回滚最近一次 Agent 的所有修改."""
+        cp = self.agent.git_checkpoint
+        if cp is None:
+            self.console.print("[red]Git checkpoint 未启用[/red]")
+            return
+
+        if not await cp.is_git_repo():
+            self.console.print("[red]当前目录不是 git 仓库，无法回滚[/red]")
+            return
+
+        checkpoints = await cp.list_checkpoints()
+        if not checkpoints:
+            self.console.print("[yellow]没有找到 checkpoint，无法回滚[/yellow]")
+            return
+
+        latest = checkpoints[0]
+        self.console.print(
+            f"[dim]将回滚到 checkpoint 之前的状态: "
+            f"{latest.message} ({latest.commit_hash[:8]})[/dim]"
+        )
+
+        success = await cp.rollback_last()
+        if success:
+            self.console.print("[green]回滚成功[/green]")
+        else:
+            self.console.print("[red]回滚失败[/red]")
+
+    async def _show_checkpoints(self) -> None:
+        """列出所有 agent checkpoint."""
+        cp = self.agent.git_checkpoint
+        if cp is None:
+            self.console.print("[red]Git checkpoint 未启用[/red]")
+            return
+
+        checkpoints = await cp.list_checkpoints()
+        if not checkpoints:
+            self.console.print("[dim]暂无 checkpoint[/dim]")
+            return
+
+        lines = []
+        for i, c in enumerate(checkpoints):
+            lines.append(
+                f"  {i + 1}. [{c.commit_hash[:8]}] {c.message}  "
+                f"[dim]({c.timestamp})[/dim]"
+            )
+
+        self.console.print(Panel(
+            "\n".join(lines),
+            title=f"[bold]Agent Checkpoints ({len(checkpoints)})[/bold]",
+            border_style="cyan",
+        ))
+
+    async def _show_agent_diff(self) -> None:
+        """查看 Agent 自最近 checkpoint 以来的所有修改."""
+        cp = self.agent.git_checkpoint
+        if cp is None:
+            self.console.print("[red]Git checkpoint 未启用[/red]")
+            return
+
+        checkpoints = await cp.list_checkpoints()
+        if not checkpoints:
+            self.console.print("[dim]暂无 checkpoint，无法显示 diff[/dim]")
+            return
+
+        # 找最早的 "before:" checkpoint 作为基准
+        base_hash = checkpoints[-1].commit_hash
+        from ..tools.git import _run_git
+
+        code, diff_output = await _run_git(
+            "diff", f"{base_hash}~1", "HEAD", cwd=cp.cwd
+        )
+        if code != 0:
+            # 如果 ~1 不存在（首个 commit），直接 show
+            code, diff_output = await _run_git(
+                "diff", base_hash, "HEAD", cwd=cp.cwd
+            )
+
+        if not diff_output.strip():
+            self.console.print("[dim]无改动[/dim]")
+            return
+
+        lines = diff_output.splitlines()
+        if len(lines) > 200:
+            display = "\n".join(lines[:200])
+            display += f"\n\n... [截断：共 {len(lines)} 行，仅显示前 200 行]"
+        else:
+            display = diff_output
+
+        from rich.syntax import Syntax
+        self.console.print(Syntax(display, "diff", theme="monokai"))
 
     def _show_cost(self) -> None:
         """显示 token 消耗和费用估算."""
@@ -376,6 +482,19 @@ class REPL:
         elif tool_call.name == "ListDir":
             path = args.get("path", ".")
             self.console.print(f"    [dim]📁 {path}[/dim]")
+        elif tool_call.name == "GitStatus":
+            path = args.get("path", ".")
+            self.console.print(f"    [dim]📋 git status ({path})[/dim]")
+        elif tool_call.name == "GitDiff":
+            staged = args.get("staged", False)
+            label = "staged" if staged else "unstaged"
+            self.console.print(f"    [dim]📋 git diff ({label})[/dim]")
+        elif tool_call.name == "GitCommit":
+            msg = args.get("message", "")
+            self.console.print(f"    [dim]📝 git commit -m \"{msg}\"[/dim]")
+        elif tool_call.name == "GitLog":
+            count = args.get("count", 10)
+            self.console.print(f"    [dim]📋 git log -{count}[/dim]")
         else:
             compact = json.dumps(args, ensure_ascii=False)
             if len(compact) > 120:
@@ -424,13 +543,16 @@ class REPL:
             f"[bold]Mini Code Agent[/bold]\n"
             f"模型: {model}\n"
             f"输入消息开始对话，特殊命令：\n"
-            f"  /quit   — 退出\n"
-            f"  /clear  — 清空对话\n"
-            f"  /cost   — 查看 token 消耗\n"
-            f"  /model  — 切换模型\n"
-            f"  /memory — 查看记忆状态\n"
-            f"  /save   — 保存信息到项目记忆\n"
-            f"  /plan   — 切换 Plan 模式（先规划后执行）\n"
+            f"  /quit        — 退出\n"
+            f"  /clear       — 清空对话\n"
+            f"  /cost        — 查看 token 消耗\n"
+            f"  /model       — 切换模型\n"
+            f"  /memory      — 查看记忆状态\n"
+            f"  /save        — 保存信息到项目记忆\n"
+            f"  /plan        — 切换 Plan 模式（先规划后执行）\n"
+            f"  /undo        — 回滚最近一次 Agent 修改\n"
+            f"  /checkpoints — 列出所有 checkpoint\n"
+            f"  /diff        — 查看 Agent 的所有修改\n"
             f"  Ctrl+C  — 中断当前操作\n"
             f"  多行输入：Alt+Enter 换行，Enter 提交",
             border_style="blue",

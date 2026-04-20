@@ -88,6 +88,10 @@ async def async_main() -> None:
         AddMemoryTool,
         BashTool,
         EditFileTool,
+        GitCommitTool,
+        GitDiffTool,
+        GitLogTool,
+        GitStatusTool,
         GrepTool,
         ListDirTool,
         ReadFileTool,
@@ -115,6 +119,10 @@ async def async_main() -> None:
     registry.register(ListDirTool())
     registry.register(add_memory_tool)
     registry.register(recall_memory_tool)
+    registry.register(GitStatusTool())
+    registry.register(GitDiffTool())
+    registry.register(GitCommitTool())
+    registry.register(GitLogTool())
 
     # 3. 构建 system prompt（使用项目上下文感知）
     from mini_code_agent.core import build_system_prompt_with_context
@@ -139,11 +147,12 @@ async def async_main() -> None:
         )
 
     # 4. 创建安全控制层
-    from mini_code_agent.safety import CommandFilter, FileGuard, LoopGuard
+    from mini_code_agent.safety import CommandFilter, FileGuard, GitCheckpoint, LoopGuard
 
     command_filter = CommandFilter()
     file_guard = FileGuard(work_dir=project_dir)
     loop_guard = LoopGuard()
+    git_checkpoint = GitCheckpoint(cwd=str(project_dir))
 
     # 5. 创建确认回调
     from prompt_toolkit import PromptSession
@@ -193,6 +202,7 @@ async def async_main() -> None:
         file_guard=file_guard,
         loop_guard=loop_guard,
         project_memory=project_memory,
+        git_checkpoint=git_checkpoint,
         plan_mode=args.plan,
         planner=planner,
         plan_confirm_callback=_plan_confirm_cb,

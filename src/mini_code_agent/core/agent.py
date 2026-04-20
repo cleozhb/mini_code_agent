@@ -22,6 +22,7 @@ from ..memory.conversation import ConversationManager
 from ..memory.project_memory import ProjectMemory
 from ..safety.command_filter import CommandFilter, SafetyLevel
 from ..safety.file_guard import FileGuard
+from ..safety.git_checkpoint import GitCheckpoint
 from ..safety.loop_guard import LoopGuard
 from ..tools.base import PermissionLevel, ToolRegistry
 from ..tools.base import ToolResult as ExecToolResult
@@ -138,6 +139,7 @@ class Agent:
         verifier: Verifier | None = None,
         retry_controller: RetryController | None = None,
         project_path: str | None = None,
+        git_checkpoint: GitCheckpoint | None = None,
         plan_mode: bool = False,
         planner: Planner | None = None,
         plan_confirm_callback: PlanConfirmCallback | None = None,
@@ -160,6 +162,7 @@ class Agent:
             RetryController() if verifier is not None else None
         )
         self.project_path = project_path
+        self.git_checkpoint = git_checkpoint
         self.max_wall_time_seconds = max_wall_time_seconds
 
         # Plan mode 相关
@@ -234,6 +237,11 @@ class Agent:
         if self.retry_controller is not None:
             self.retry_controller.reset()
 
+        # 自动 checkpoint：任务开始前
+        task_desc = user_message[:80]
+        if self.git_checkpoint is not None:
+            await self.git_checkpoint.create_checkpoint(f"before: {task_desc}")
+
         total_usage = TokenUsage()
         total_tool_calls = 0
         total_tool_errors = 0
@@ -302,6 +310,10 @@ class Agent:
             retry_prompt = self.retry_controller.build_retry_prompt(vr.errors)
             self._files_changed = []
             current_user_msg = retry_prompt
+
+        # 自动 checkpoint：任务完成后（仅在有文件改动时）
+        if self.git_checkpoint is not None and self._files_changed:
+            await self.git_checkpoint.create_checkpoint(f"after: {task_desc}")
 
         return AgentResult(
             content=last_content,
