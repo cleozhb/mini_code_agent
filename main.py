@@ -152,7 +152,15 @@ async def async_main() -> None:
     command_filter = CommandFilter()
     file_guard = FileGuard(work_dir=project_dir)
     loop_guard = LoopGuard()
+
+    # Git checkpoint：检查项目目录是否为 git 仓库
     git_checkpoint = GitCheckpoint(cwd=str(project_dir))
+    if not await git_checkpoint.is_git_repo():
+        console.print(
+            "[yellow]⚠ 项目目录不是 git 仓库，自动 checkpoint 和 /undo 将不可用。"
+            f"\n  如需启用，请先在 {project_dir} 执行 git init[/yellow]"
+        )
+        git_checkpoint = None
 
     # 5. 创建确认回调
     from prompt_toolkit import PromptSession
