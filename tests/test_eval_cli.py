@@ -448,9 +448,10 @@ class TestRunEvalEndToEnd:
         assert rc == 2
         assert "任务不存在" in capsys.readouterr().out
 
-    async def test_level_filter_eliminates_all_returns_2(
+    async def test_filter_eliminates_all_returns_2(
         self, tmp_path: Path, monkeypatch, capsys,
     ) -> None:
+        """过滤条件一个任务都匹配不上时，应该返回 2 并提示"没有任务"。"""
         tasks = tmp_path / "tasks"
         shutil.copytree(TASKS_DIR, tasks)
 
@@ -459,8 +460,10 @@ class TestRunEvalEndToEnd:
             lambda **_kw: _ScriptedLLM([LLMResponse("ok", usage=TokenUsage(1, 1))]),
         )
 
+        # 用一个不存在的 tag 过滤（--level 1/2/3 都已有任务覆盖，--task 不存在
+        # 走的是另一条"任务不存在"分支，这里要的是"过滤后没有任务"分支）
         args = _make_parser().parse_args([
-            "eval", "--level", "3",
+            "eval", "--tag", "no_such_tag_xyz",
             "--tasks-dir", str(tasks),
             "--no-save",
         ])

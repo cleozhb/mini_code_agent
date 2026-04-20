@@ -1,0 +1,41 @@
+id: L3-api-integration
+level: 3
+description: |
+  `app/api_client.py` 是一个调后端 REST 服务的 API 客户端。`get_user` 已经写好
+  了，作为"4xx 抛 ApiError、5xx 重试 MAX_RETRIES 次（指数退避）"的参考模板。
+  剩下两个端点 `create_item` 和 `list_items` 还是 `raise NotImplementedError`。
+
+  你的任务：把这两个端点补完，错误处理和重试行为与 `get_user` 保持一致。
+
+  具体要求：
+
+  1. **`create_item(name, qty) -> Item`**：
+     - 发 `POST /items`，请求 body 是 `{"name": name, "qty": qty}`
+     - 成功响应（2xx，通常是 201）body 形如 `{"id": int, "name": str, "qty": int}`
+     - 返回对应 `Item(id, name, qty)`
+  2. **`list_items() -> list[Item]`**：
+     - 发 `GET /items`
+     - 成功响应 body 是 `list[dict]`，每项形如 `{"id":..., "name":..., "qty":...}`
+     - 返回 `list[Item]`（空列表也要正确处理）
+  3. **错误处理 + 重试**：
+     - 两个端点都必须复用 `_request_with_retry`（**不要**自己重新写一套重试
+       逻辑，那样会漏掉 `_SLEEP` 可 monkeypatch 的测试契约）
+     - 4xx → 原样抛 `ApiError`（不重试）
+     - 5xx → 重试 `MAX_RETRIES` 次（= 总共 `MAX_RETRIES + 1` 次请求），仍失
+       败则抛 `ApiError`
+  4. **不要改** `app/http.py`、`tests/` 下任何文件、`_request_with_retry` /
+     `get_user` / `ApiError` / `Item` / `User` / `MAX_RETRIES` / `_SLEEP` 这些
+     已有符号。
+  5. 完成后 `pytest tests/ -q` 必须全绿（初态：get_user 的 3 个通过，
+     create_item / list_items 的 8 个全挂）。
+
+  修改范围：仅 `app/api_client.py` 里那两个 `raise NotImplementedError` 的函数体。
+expected_files:
+  - app/api_client.py
+max_steps: 40
+max_tokens: 200000
+max_wall_time_seconds: 500
+tags:
+  - feature
+  - python
+  - api
