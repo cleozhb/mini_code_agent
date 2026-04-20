@@ -7,7 +7,7 @@ expected_files:
   - src/utils.py
   - tests/test_utils.py
 max_steps: 20
-max_tokens: 50000
+max_tokens: 200000
 max_wall_time_seconds: 300
 tags:
   - single-file

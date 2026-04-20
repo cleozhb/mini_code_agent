@@ -15,7 +15,7 @@ expected_files:
   # （语义见 benchmark.py 的 expected_file_groups）
   - test_config.py|tests/test_config.py
 max_steps: 20
-max_tokens: 50000
+max_tokens: 200000
 max_wall_time_seconds: 300
 tags:
   - single-file

@@ -8,7 +8,7 @@ expected_files:
   - user.py
   - tests/test_user.py
 max_steps: 20
-max_tokens: 50000
+max_tokens: 200000
 max_wall_time_seconds: 300
 tags:
   - single-file

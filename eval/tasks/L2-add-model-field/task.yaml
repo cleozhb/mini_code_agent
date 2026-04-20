@@ -24,7 +24,7 @@ expected_files:
   - app/schemas.py
   - app/api.py
 max_steps: 30
-max_tokens: 150000
+max_tokens: 200000
 max_wall_time_seconds: 400
 tags:
   - multi-file
