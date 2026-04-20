@@ -311,8 +311,8 @@ class Agent:
             self._files_changed = []
             current_user_msg = retry_prompt
 
-        # 自动 checkpoint：任务完成后（仅在有文件改动时）
-        if self.git_checkpoint is not None and self._files_changed:
+        # 自动 checkpoint：任务完成后（create_checkpoint 内部会检测无改动则跳过）
+        if self.git_checkpoint is not None:
             await self.git_checkpoint.create_checkpoint(f"after: {task_desc}")
 
         return AgentResult(
@@ -582,6 +582,7 @@ class Agent:
         """
         # 自动 checkpoint：任务开始前
         task_desc = user_message[:80]
+        self._files_changed = []
         if self.git_checkpoint is not None:
             await self.git_checkpoint.create_checkpoint(f"before: {task_desc}")
 
@@ -687,7 +688,7 @@ class Agent:
                 self._accumulate_usage(round_usage)
                 await self._maybe_compress()
                 # 自动 checkpoint：任务完成后
-                if self.git_checkpoint is not None and self._files_changed:
+                if self.git_checkpoint is not None:
                     await self.git_checkpoint.create_checkpoint(f"after: {task_desc}")
                 yield AgentEvent(
                     type=AgentEventType.FINISH,
@@ -739,7 +740,7 @@ class Agent:
         self._accumulate_usage(round_usage)
         await self._maybe_compress()
         # 自动 checkpoint：超轮数收尾后
-        if self.git_checkpoint is not None and self._files_changed:
+        if self.git_checkpoint is not None:
             await self.git_checkpoint.create_checkpoint(f"after: {task_desc}")
         yield AgentEvent(type=AgentEventType.FINISH, usage=round_usage)
 

@@ -439,6 +439,16 @@ class REPL:
                         sys.stdout.write("\n")
                         sys.stdout.flush()
                         in_text = False
+                    # 显示 checkpoint 信息
+                    cp = self.agent.git_checkpoint
+                    if cp is not None:
+                        cps = await cp.list_checkpoints()
+                        if cps:
+                            latest = cps[0]
+                            self.console.print(
+                                f"  [dim]checkpoint: {latest.message} "
+                                f"({latest.commit_hash[:8]})[/dim]"
+                            )
                     if event.usage:
                         self._render_usage_brief(event.usage)
 
