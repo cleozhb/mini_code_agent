@@ -204,8 +204,8 @@ class EvalSummary:
 
     avg_step_count: float
     tool_error_rate: float             # sum(tool_errors) / sum(tool_calls)
-    verifier_first_pass_rate: float
-    verifier_recovery_rate: float      # 从失败中挽回的比例（见下）
+    verifier_first_pass_rate: float | None   # 无 verifier 触发 → None（非 0.0）
+    verifier_recovery_rate: float | None     # 从失败中挽回的比例（见下）；无样本 → None
 
     avg_prompt_tokens: float
     avg_completion_tokens: float

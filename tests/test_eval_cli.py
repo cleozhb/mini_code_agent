@@ -73,7 +73,7 @@ def _summary(**kwargs) -> EvalSummary:
     base = dict(
         task_success_rate=1.0, by_level={1: 1.0}, by_failure_category={},
         avg_step_count=3.0, tool_error_rate=0.0,
-        verifier_first_pass_rate=0.0, verifier_recovery_rate=0.0,
+        verifier_first_pass_rate=None, verifier_recovery_rate=None,
         avg_prompt_tokens=100.0, avg_completion_tokens=50.0,
         total_cost_usd=0.01, avg_wall_time_seconds=1.0,
         avg_edit_precision=1.0, avg_edit_recall=1.0,
