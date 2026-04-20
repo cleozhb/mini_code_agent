@@ -580,6 +580,11 @@ class Agent:
         yields:
             AgentEvent 事件流：TEXT_DELTA / TOOL_CALL_* / TOOL_RESULT / FINISH
         """
+        # 自动 checkpoint：任务开始前
+        task_desc = user_message[:80]
+        if self.git_checkpoint is not None:
+            await self.git_checkpoint.create_checkpoint(f"before: {task_desc}")
+
         self.conversation.append(Message.user(user_message))
 
         tool_params = self.tool_registry.to_tool_params()
@@ -681,6 +686,9 @@ class Agent:
                 self.conversation.append(Message.assistant(full_content))
                 self._accumulate_usage(round_usage)
                 await self._maybe_compress()
+                # 自动 checkpoint：任务完成后
+                if self.git_checkpoint is not None and self._files_changed:
+                    await self.git_checkpoint.create_checkpoint(f"after: {task_desc}")
                 yield AgentEvent(
                     type=AgentEventType.FINISH,
                     usage=round_usage,
@@ -730,6 +738,9 @@ class Agent:
         self.conversation.append(Message.assistant(full_content))
         self._accumulate_usage(round_usage)
         await self._maybe_compress()
+        # 自动 checkpoint：超轮数收尾后
+        if self.git_checkpoint is not None and self._files_changed:
+            await self.git_checkpoint.create_checkpoint(f"after: {task_desc}")
         yield AgentEvent(type=AgentEventType.FINISH, usage=round_usage)
 
     async def _maybe_compress(self) -> None:
