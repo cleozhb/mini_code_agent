@@ -25,7 +25,7 @@
 | PR4e: L2-split-large-function + L2-print-to-logger（2 个 L2 任务） | ✅ 已 merge (PR #18) |
 | PR4e-fix: L2 任务 max_tokens 80k→150k、system prompt 加自测引导、Runner 加 trace 落盘 | ✅ 已 merge (PR #19) |
 | PR4f: L2-add-model-field + L2-cache-decorator（补齐 L2×4） | ✅ 已 merge (PR #20) |
-| PR4g+: 剩余 3 个 L3 任务（find-and-fix-bugs / refactor-module / api-integration，可分批） | ⬜ 未开始 |
+| PR4g: 剩余 3 个 L3 任务（find-and-fix-bugs / refactor-module / api-integration） | ✅ 已开 PR |
 
 ---
 
@@ -241,7 +241,7 @@ class EvalSummary:
 
 任务描述必须**脱敏**（像真实用户输入，不泄漏修复思路或答案），否则测不出真实能力。
 
-> **当前进度（2026-04-20）**：L1×5 + L2×4 全部落地，剩 L3×3 未开工。每项后面的 ✅/⬜ 代表 `eval/tasks/<id>/` 是否已存在。
+> **当前进度（2026-04-20）**：L1×5 + L2×4 + L3×3 全部落地，benchmark 12 任务全齐。每项后面的 ✅/⬜ 代表 `eval/tasks/<id>/` 是否已存在。
 
 ### Level 1（5 个，单文件修改）
 
@@ -260,9 +260,9 @@ class EvalSummary:
 
 ### Level 3（3 个，探索 + 修改）
 
-- ⬜ `L3-find-and-fix-bugs`：测试 suite 里有 2 个 failing test，找出根因并修
-- ⬜ `L3-refactor-module`：把 `auth.py` 里的 session 逻辑抽出到 `session.py`
-- ⬜ `L3-api-integration`：基于现有 HTTP client 给未实现的 endpoint 补完（含错误处理 + 重试 + 测试）
+- ✅ `L3-find-and-fix-bugs`：购物车结算（discount / tax / cart）里埋了 2 个 bug，跑测试会看到若干挂掉，自己定位根因并修
+- ✅ `L3-refactor-module`：把 `auth.py` 里的 session 逻辑抽出到 `session.py`（纯重构，运行期 store 只有一份）
+- ✅ `L3-api-integration`：基于现有 HTTP client 把 `create_item` / `list_items` 两个 stub 补完，复用 `_request_with_retry`（4xx 不重试 / 5xx 重试 MAX_RETRIES 次）
 
 **强制开发顺序**：先只写 `L1-add-function` 一个任务，把 runner / validate / snapshot / tracker 全流程打通再扩量。fixture 和 validate 的坑一次性暴露比较好。
 

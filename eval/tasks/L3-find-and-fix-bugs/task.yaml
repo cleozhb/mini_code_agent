@@ -1,0 +1,26 @@
+id: L3-find-and-fix-bugs
+level: 3
+description: |
+  这是个迷你电商结算项目（`app/` 下 3 个模块 + `tests/` 下一套 pytest）。
+  跑 `pytest tests/ -q` 会看到若干测试挂掉。
+
+  你的任务是：
+
+  1. 自己跑测试、读源码、**定位 bug 根因**。不要靠猜 —— 要能把"为什么挂"说清楚。
+  2. 只改 `app/` 下的源码修复 bug。**不要** 改 `tests/` 下任何文件，也不要
+     绕过断言（比如把失败的 case 删掉）。
+  3. 保持对外 API 签名不变：`apply_discount(price, pct)` / `compute_tax(subtotal, rate)` /
+     `checkout(items, discount_pct, tax_rate)` 的参数名、参数顺序、返回类型都维持原样。
+  4. 修完后，`pytest tests/ -q` 必须全绿。
+
+  修改范围：仅 `app/` 下的文件。不要新建文件、不要删文件。
+expected_files:
+  - app/discount.py
+  - app/tax.py
+max_steps: 40
+max_tokens: 200000
+max_wall_time_seconds: 500
+tags:
+  - bugfix
+  - python
+  - multi-file

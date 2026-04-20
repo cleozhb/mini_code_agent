@@ -1,0 +1,39 @@
+id: L3-refactor-module
+level: 3
+description: |
+  `app/auth.py` 现在既管"登录鉴权"（login / logout / verify / AuthError）又管
+  "会话存储"（Session / create_session / get_session / expire_session /
+  purge_expired / reset_sessions / SessionNotFound）。随着 session 逻辑越长越
+  复杂，把它从 auth.py 抽到独立的 `app/session.py` 是时候了。
+
+  你的任务：做一次**纯重构**，代码行为不变。
+
+  具体要求：
+
+  1. **新建 `app/session.py`**，把 session 相关的类、异常、函数全部挪过去：
+     - 类：`Session`
+     - 异常：`SessionNotFound`
+     - 函数：`create_session`, `get_session`, `expire_session`, `purge_expired`,
+       `reset_sessions`
+     - 模块级 `_SESSIONS` 字典也搬过去（全局只留一份，不要两边都有）。
+  2. **修改 `app/auth.py`**：
+     - 删掉所有 session 的实现（类 / 异常 / 函数 / `_SESSIONS`）
+     - 保留 `login`, `logout`, `verify`, `AuthError` 的**签名和行为完全不变**
+     - auth 内部通过 `from app.session import ...` 来用 session 设施
+     - 必要时可以从 `app.session` re-export `Session`（tests 用
+       `from app.auth import Session`，所以 auth.py 得能导出这个名字）
+  3. **不要** 改 `tests/` 下任何文件（包括 `conftest.py`）。
+  4. 重构完成后 `pytest tests/ -q` 必须全绿（当前初态 `test_session.py` 会
+     因为 `app.session` 不存在而直接 collection 失败）。
+
+  修改范围：新建 `app/session.py` + 改写 `app/auth.py`。不要改 `tests/`。
+expected_files:
+  - app/auth.py
+  - app/session.py
+max_steps: 40
+max_tokens: 200000
+max_wall_time_seconds: 500
+tags:
+  - refactor
+  - python
+  - multi-file
