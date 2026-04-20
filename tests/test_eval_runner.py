@@ -602,11 +602,29 @@ class TestComputeSummary:
         assert s.verifier_recovery_rate == 0.5
 
     def test_verifier_rates_when_never_triggered(self) -> None:
+        """eval 模式 Agent 不挂 Verifier → 两项应为 None（N/A），不是 0.0。"""
         suite = _fake_suite([("A", 1)])
         results = [_make_result("A", 0, True)]  # verifier_first_passed=None
         s = compute_summary(results, suite)
-        assert s.verifier_first_pass_rate == 0.0
-        assert s.verifier_recovery_rate == 0.0
+        assert s.verifier_first_pass_rate is None
+        assert s.verifier_recovery_rate is None
+
+    def test_verifier_recovery_rate_when_all_first_pass(self) -> None:
+        """全部首验通过 → 没有"需要挽回的样本"，recovery_rate 报 None。"""
+        suite = _fake_suite([("A", 1)])
+        results = [
+            _make_result("A", 0, True, verifier_first_passed=True, verifier_final_passed=True),
+            _make_result("A", 1, True, verifier_first_passed=True, verifier_final_passed=True),
+        ]
+        s = compute_summary(results, suite)
+        assert s.verifier_first_pass_rate == 1.0
+        assert s.verifier_recovery_rate is None
+
+    def test_verifier_rates_empty_results(self) -> None:
+        suite = _fake_suite([("A", 1)])
+        s = compute_summary([], suite)
+        assert s.verifier_first_pass_rate is None
+        assert s.verifier_recovery_rate is None
 
     def test_averages(self) -> None:
         suite = _fake_suite([("A", 1), ("B", 2)])

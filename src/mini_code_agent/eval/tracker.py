@@ -150,7 +150,8 @@ class TrendPoint:
     tool_error_rate: float
     avg_cost_usd: float
     avg_wall_time_seconds: float
-    verifier_recovery_rate: float
+    # eval 模式 Agent 不挂 Verifier → 该列全 None，要和"全部首验失败"区分
+    verifier_recovery_rate: float | None
 
 
 # 核心 5 指标的名字 → TrendPoint 字段 & 显示名
@@ -169,7 +170,7 @@ class TrendReport:
 
     points: list[TrendPoint]                    # 按 timestamp 升序
 
-    def series(self, metric: str) -> list[float]:
+    def series(self, metric: str) -> list[float | None]:
         return [getattr(p, metric) for p in self.points]
 
     def sparkline(self, metric: str) -> str:
@@ -372,17 +373,28 @@ def _build_task_diff(
 _SPARK_CHARS = "▁▂▃▄▅▆▇█"
 
 
-def _sparkline(values: list[float]) -> str:
-    """unicode 块字符 sparkline；空序列返回空串，常数序列返回"中间高"字符."""
+def _sparkline(values: list[float | None]) -> str:
+    """unicode 块字符 sparkline；空序列返回空串，常数序列返回"中间高"字符。
+
+    None 位置用空格占位（表示该次 run 无该指标）；若整列都是 None 则返回空串。
+    """
     if not values:
         return ""
-    lo, hi = min(values), max(values)
-    if hi == lo:
-        return _SPARK_CHARS[len(_SPARK_CHARS) // 2] * len(values)
+    present = [v for v in values if v is not None]
+    if not present:
+        return ""
+    lo, hi = min(present), max(present)
+    mid = _SPARK_CHARS[len(_SPARK_CHARS) // 2]
     n = len(_SPARK_CHARS) - 1
-    return "".join(
-        _SPARK_CHARS[int(round((v - lo) / (hi - lo) * n))] for v in values
-    )
+
+    def _cell(v: float | None) -> str:
+        if v is None:
+            return " "
+        if hi == lo:
+            return mid
+        return _SPARK_CHARS[int(round((v - lo) / (hi - lo) * n))]
+
+    return "".join(_cell(v) for v in values)
 
 
 # ---------------------------------------------------------------------------
@@ -446,12 +458,18 @@ def _render_comparison(rep: ComparisonReport) -> Group:
         ):
             a = getattr(rep.summary.a, name)
             b = getattr(rep.summary.b, name)
-            t.add_row(
-                name,
-                f"{a:.4f}" if isinstance(a, float) else str(a),
-                f"{b:.4f}" if isinstance(b, float) else str(b),
-                _fmt_delta(b - a, higher_is_better=higher_better, fmt=fmt),
+            a_cell = "n/a" if a is None else (
+                f"{a:.4f}" if isinstance(a, float) else str(a)
             )
+            b_cell = "n/a" if b is None else (
+                f"{b:.4f}" if isinstance(b, float) else str(b)
+            )
+            # 任一侧 None → delta 无意义，用 · 占位（颜色 dim）
+            if a is None or b is None:
+                delta_cell: Text | str = Text("·", style="dim")
+            else:
+                delta_cell = _fmt_delta(b - a, higher_is_better=higher_better, fmt=fmt)
+            t.add_row(name, a_cell, b_cell, delta_cell)
         parts.append(t)
 
     # 共有任务
@@ -504,15 +522,20 @@ def _render_trend(rep: TrendReport) -> Group:
     for attr, _field, label in _TREND_METRICS:
         series = rep.series(attr)
         first, last = series[0], series[-1]
-        delta = last - first
         # 哪些指标越高越好
         higher_better = attr in {"task_success_rate", "verifier_recovery_rate"}
+        first_cell = "n/a" if first is None else f"{first:.4f}"
+        last_cell = "n/a" if last is None else f"{last:.4f}"
+        if first is None or last is None:
+            delta_cell: Text | str = Text("·", style="dim")
+        else:
+            delta_cell = _fmt_delta(last - first, higher_is_better=higher_better, fmt="+.4f")
         t.add_row(
             label,
             rep.sparkline(attr),
-            f"{first:.4f}",
-            f"{last:.4f}",
-            _fmt_delta(delta, higher_is_better=higher_better, fmt="+.4f"),
+            first_cell,
+            last_cell,
+            delta_cell,
         )
     return Group(t)
 

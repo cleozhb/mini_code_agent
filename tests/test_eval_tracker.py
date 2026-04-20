@@ -77,8 +77,8 @@ def _make_summary(**overrides) -> EvalSummary:
         by_failure_category={},
         avg_step_count=5.0,
         tool_error_rate=0.0,
-        verifier_first_pass_rate=0.0,
-        verifier_recovery_rate=0.0,
+        verifier_first_pass_rate=None,
+        verifier_recovery_rate=None,
         avg_prompt_tokens=100.0,
         avg_completion_tokens=50.0,
         total_cost_usd=0.02,
@@ -498,3 +498,15 @@ class TestSparkline:
     def test_ranges_normalized(self) -> None:
         # 相对高低而非绝对；10 和 20 的 sparkline 与 0.1 和 0.2 的相同
         assert _sparkline([10.0, 20.0]) == _sparkline([0.1, 0.2])
+
+    def test_all_none(self) -> None:
+        # eval 模式下 verifier_recovery_rate 一列会全是 None：返回空串而不是报错
+        assert _sparkline([None, None, None]) == ""
+
+    def test_partial_none(self) -> None:
+        # None 位置用空格占位，非 None 位置按有效值的 min/max 归一化
+        s = _sparkline([1.0, None, 2.0, 3.0])
+        assert len(s) == 4
+        assert s[1] == " "
+        assert s[0] == "▁"
+        assert s[-1] == "█"

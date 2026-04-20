@@ -385,6 +385,11 @@ def build_agent_factory(
 # ---------------------------------------------------------------------------
 
 
+def _fmt_opt_rate(v: float | None) -> str:
+    """None 显示 n/a，表示该指标在当前 run 场景下不适用（eval 模式常见）."""
+    return "n/a" if v is None else f"{v:.3f}"
+
+
 def _render_suite_result(result: SuiteResult, console: Console) -> None:
     """把一次 SuiteResult 的关键信息渲染成两张表 + 一段 summary."""
     s = result.summary
@@ -396,8 +401,8 @@ def _render_suite_result(result: SuiteResult, console: Console) -> None:
     rows: list[tuple[str, str]] = [
         ("task_success_rate",        f"{s.task_success_rate:.3f}"),
         ("tool_error_rate",          f"{s.tool_error_rate:.3f}"),
-        ("verifier_first_pass_rate", f"{s.verifier_first_pass_rate:.3f}"),
-        ("verifier_recovery_rate",   f"{s.verifier_recovery_rate:.3f}"),
+        ("verifier_first_pass_rate", _fmt_opt_rate(s.verifier_first_pass_rate)),
+        ("verifier_recovery_rate",   _fmt_opt_rate(s.verifier_recovery_rate)),
         ("avg_step_count",           f"{s.avg_step_count:.2f}"),
         ("avg_prompt_tokens",        f"{s.avg_prompt_tokens:.0f}"),
         ("avg_completion_tokens",    f"{s.avg_completion_tokens:.0f}"),

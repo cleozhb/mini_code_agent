@@ -391,8 +391,11 @@ class EvalSummary:
     by_failure_category: dict[str, int]
     avg_step_count: float
     tool_error_rate: float
-    verifier_first_pass_rate: float
-    verifier_recovery_rate: float
+    # 这两项只有当 Agent 内部带 Verifier 时才有意义（REPL 模式）；eval 模式
+    # 不挂 Verifier，"是否通过" 由外部 validate.py 定义，两项为 None 表示
+    # 该指标 N/A，不等于"全部首验失败"。
+    verifier_first_pass_rate: float | None
+    verifier_recovery_rate: float | None
     avg_prompt_tokens: float
     avg_completion_tokens: float
     total_cost_usd: float
@@ -437,8 +440,8 @@ def compute_summary(
             by_failure_category={},
             avg_step_count=0.0,
             tool_error_rate=0.0,
-            verifier_first_pass_rate=0.0,
-            verifier_recovery_rate=0.0,
+            verifier_first_pass_rate=None,
+            verifier_recovery_rate=None,
             avg_prompt_tokens=0.0,
             avg_completion_tokens=0.0,
             total_cost_usd=0.0,
@@ -485,20 +488,27 @@ def compute_summary(
         total_tool_errors / total_tool_calls if total_tool_calls else 0.0
     )
 
-    # verifier 指标（只在触发过 verifier 的 run 里算）
+    # verifier 指标（只在触发过 verifier 的 run 里算）；eval 模式下 Agent 不挂
+    # Verifier → 整列都是 None → 两项报 None 表示 N/A，不要伪造成 0.0
+    # （以免和"所有任务首验都失败"混淆）。recovery_rate 在 "没有首验失败的任务"
+    # 时也回落到 None，同样避免 0.0 歧义。
     verified = [r for r in results if r.verifier_first_passed is not None]
+    verifier_first_pass_rate: float | None
+    verifier_recovery_rate: float | None
     if verified:
         verifier_first_pass_rate = (
             sum(1 for r in verified if r.verifier_first_passed) / len(verified)
         )
         failed_first = [r for r in verified if r.verifier_first_passed is False]
-        recovered = [r for r in failed_first if r.verifier_final_passed is True]
-        verifier_recovery_rate = (
-            len(recovered) / len(failed_first) if failed_first else 0.0
-        )
+        if failed_first:
+            recovered = [r for r in failed_first if r.verifier_final_passed is True]
+            verifier_recovery_rate = len(recovered) / len(failed_first)
+        else:
+            # 全部首验都通过 —— "恢复率" 无分母可算
+            verifier_recovery_rate = None
     else:
-        verifier_first_pass_rate = 0.0
-        verifier_recovery_rate = 0.0
+        verifier_first_pass_rate = None
+        verifier_recovery_rate = None
 
     n = len(results)
     return EvalSummary(
