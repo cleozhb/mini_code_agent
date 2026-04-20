@@ -236,6 +236,24 @@ class TestGitCheckpoint:
         cp = GitCheckpoint(cwd=str(non_git_dir))
         assert await cp.is_git_repo() is False
 
+    async def test_save_head(self, checkpoint: GitCheckpoint, git_repo: Path) -> None:
+        """save_head 只记录 HEAD hash，不创建 commit."""
+        code, expected_head = await _run_git("rev-parse", "HEAD", cwd=str(git_repo))
+        expected_head = expected_head.strip()
+
+        result = await checkpoint.save_head()
+        assert result == expected_head
+        assert checkpoint._before_head == expected_head
+
+        # 不应该有新的 commit
+        code, current_head = await _run_git("rev-parse", "HEAD", cwd=str(git_repo))
+        assert current_head.strip() == expected_head
+
+    async def test_save_head_non_git(self, non_git_dir: Path) -> None:
+        cp = GitCheckpoint(cwd=str(non_git_dir))
+        result = await cp.save_head()
+        assert result is None
+
     async def test_create_checkpoint(
         self, checkpoint: GitCheckpoint, git_repo: Path
     ) -> None:

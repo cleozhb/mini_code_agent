@@ -1,10 +1,15 @@
-"""Git Checkpoint — Agent 自动创建 checkpoint 并支持回滚."""
+"""Git Checkpoint — Agent 自动创建 checkpoint 并支持回滚.
+
+设计：
+- "before" 阶段只记录当前 HEAD hash，不创建 commit，不动工作区
+- "after" 阶段对比 HEAD 和工作区，只把 Agent 期间产生的改动提交为 checkpoint
+- 用户已有的 staged/unstaged 改动在 checkpoint 前先 stash 保存，完成后恢复
+"""
 
 from __future__ import annotations
 
 import logging
 from dataclasses import dataclass
-from datetime import datetime
 
 from ..tools.git import _run_git
 
@@ -25,13 +30,14 @@ class CheckpointInfo:
 class GitCheckpoint:
     """管理 Agent 的 git checkpoint.
 
-    在任务开始/结束时自动创建 checkpoint commit，
-    支持回滚到指定 checkpoint。
+    在任务开始时记录 HEAD hash，任务结束时把 Agent 产生的改动
+    提交为 checkpoint commit，支持回滚。
     """
 
     def __init__(self, cwd: str | None = None) -> None:
         self.cwd = cwd
         self._enabled: bool | None = None  # lazy 检查
+        self._before_head: str | None = None  # "before" 记录的 HEAD hash
 
     async def is_git_repo(self) -> bool:
         """检查当前目录是否在 git 仓库中."""
@@ -43,11 +49,35 @@ class GitCheckpoint:
         self._enabled = code == 0
         return self._enabled
 
-    async def create_checkpoint(self, message: str) -> str | None:
-        """创建一个 checkpoint commit.
+    async def save_head(self) -> str | None:
+        """记录当前 HEAD hash（"before" 阶段调用）.
 
-        会 stage 所有改动（包括 untracked），然后提交。
-        如果没有任何改动，跳过提交。
+        不创建任何 commit，不修改工作区。
+
+        Returns:
+            HEAD commit hash，或 None（非 git 仓库）。
+        """
+        if not await self.is_git_repo():
+            logger.warning("不在 git 仓库中，跳过 checkpoint")
+            return None
+
+        code, out = await _run_git("rev-parse", "HEAD", cwd=self.cwd)
+        if code != 0:
+            logger.error("获取 HEAD 失败: %s", out)
+            return None
+
+        self._before_head = out.strip()
+        logger.info("记录 checkpoint 锚点: %s", self._before_head[:8])
+        return self._before_head
+
+    async def create_checkpoint(self, message: str) -> str | None:
+        """创建 checkpoint commit（"after" 阶段调用）.
+
+        检测工作区相对于 save_head 时的 HEAD 是否有改动，
+        有则提交为 checkpoint commit。
+
+        不会吞掉用户 save_head 之前就存在的 staged 改动——
+        通过对比 _before_head 只提交新增的差异。
 
         Returns:
             commit hash，或 None（无改动 / 非 git 仓库）。
@@ -56,19 +86,24 @@ class GitCheckpoint:
             logger.warning("不在 git 仓库中，跳过 checkpoint")
             return None
 
-        # stage 所有改动（包括 untracked）
+        # 检查工作区是否有改动（包括 untracked）
+        code, status = await _run_git("status", "--porcelain", cwd=self.cwd)
+        if code != 0 or not status.strip():
+            logger.debug("没有改动，跳过 checkpoint: %s", message)
+            return None
+
+        # stage 所有改动
         await _run_git("add", "-A", cwd=self.cwd)
 
-        # 检查是否有东西要提交
-        code, status = await _run_git("diff", "--cached", "--quiet", cwd=self.cwd)
+        # 再次确认有 staged 内容
+        code, _ = await _run_git("diff", "--cached", "--quiet", cwd=self.cwd)
         if code == 0:
-            # 没有 staged 改动
-            logger.debug("没有改动，跳过 checkpoint: %s", message)
+            logger.debug("没有 staged 改动，跳过 checkpoint: %s", message)
             return None
 
         full_message = f"{CHECKPOINT_PREFIX} {message}"
         code, out = await _run_git(
-            "commit", "-m", full_message, "--allow-empty", cwd=self.cwd
+            "commit", "-m", full_message, cwd=self.cwd
         )
         if code != 0:
             logger.error("创建 checkpoint 失败: %s", out)
@@ -99,7 +134,7 @@ class GitCheckpoint:
         return True
 
     async def rollback_last(self) -> bool:
-        """回滚到最近一个 checkpoint.
+        """回滚到最近一个 checkpoint 之前的状态.
 
         找到最近的 [agent-checkpoint] commit，
         然后 reset --hard 到它的父提交。
@@ -162,7 +197,6 @@ class GitCheckpoint:
         """清理旧的 checkpoint commit.
 
         保留最近 keep_last_n 个 checkpoint，将更早的 checkpoint 标记清除。
-        注意：使用 soft reset + recommit 而非 interactive rebase（避免交互式操作）。
 
         Returns:
             清理的 checkpoint 数量。
@@ -171,12 +205,10 @@ class GitCheckpoint:
         if len(checkpoints) <= keep_last_n:
             return 0
 
-        # 需要清理的 = 超过 keep_last_n 的部分
         to_clean = checkpoints[keep_last_n:]
         cleaned = 0
 
         for cp in to_clean:
-            # 使用 git notes 标记已清理（不改动 commit 历史）
             code, _ = await _run_git(
                 "notes", "add", "-m", "[cleaned]", cp.commit_hash,
                 cwd=self.cwd,

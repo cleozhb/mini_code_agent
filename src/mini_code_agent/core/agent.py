@@ -237,10 +237,10 @@ class Agent:
         if self.retry_controller is not None:
             self.retry_controller.reset()
 
-        # 自动 checkpoint：任务开始前
+        # 自动 checkpoint：记录任务开始前的 HEAD（不创建 commit）
         task_desc = user_message[:80]
         if self.git_checkpoint is not None:
-            await self.git_checkpoint.create_checkpoint(f"before: {task_desc}")
+            await self.git_checkpoint.save_head()
 
         total_usage = TokenUsage()
         total_tool_calls = 0
@@ -580,11 +580,11 @@ class Agent:
         yields:
             AgentEvent 事件流：TEXT_DELTA / TOOL_CALL_* / TOOL_RESULT / FINISH
         """
-        # 自动 checkpoint：任务开始前
+        # 自动 checkpoint：记录任务开始前的 HEAD（不创建 commit）
         task_desc = user_message[:80]
         self._files_changed = []
         if self.git_checkpoint is not None:
-            await self.git_checkpoint.create_checkpoint(f"before: {task_desc}")
+            await self.git_checkpoint.save_head()
 
         self.conversation.append(Message.user(user_message))
 
