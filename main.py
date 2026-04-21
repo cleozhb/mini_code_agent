@@ -88,12 +88,17 @@ async def async_main() -> None:
         AddMemoryTool,
         BashTool,
         EditFileTool,
+        FindReferencesTool,
+        GetDiagnosticsTool,
+        GetHoverInfoTool,
         GitCommitTool,
         GitDiffTool,
         GitLogTool,
         GitStatusTool,
+        GotoDefinitionTool,
         GrepTool,
         ListDirTool,
+        LSPManager,
         ReadFileTool,
         RecallMemoryTool,
         ToolRegistry,
@@ -110,6 +115,17 @@ async def async_main() -> None:
     recall_memory_tool = RecallMemoryTool()
     recall_memory_tool._project_memory = project_memory
 
+    # 创建 LSP 工具并注入 LSPManager
+    lsp_manager = LSPManager()
+    goto_def_tool = GotoDefinitionTool()
+    goto_def_tool._lsp_manager = lsp_manager
+    find_refs_tool = FindReferencesTool()
+    find_refs_tool._lsp_manager = lsp_manager
+    hover_tool = GetHoverInfoTool()
+    hover_tool._lsp_manager = lsp_manager
+    diagnostics_tool = GetDiagnosticsTool()
+    diagnostics_tool._lsp_manager = lsp_manager
+
     registry = ToolRegistry()
     registry.register(ReadFileTool())
     registry.register(WriteFileTool())
@@ -123,6 +139,10 @@ async def async_main() -> None:
     registry.register(GitDiffTool())
     registry.register(GitCommitTool())
     registry.register(GitLogTool())
+    registry.register(goto_def_tool)
+    registry.register(find_refs_tool)
+    registry.register(hover_tool)
+    registry.register(diagnostics_tool)
 
     # 3. 构建 system prompt（使用项目上下文感知）
     from mini_code_agent.core import build_system_prompt_with_context
@@ -222,7 +242,11 @@ async def async_main() -> None:
     from mini_code_agent.cli import REPL
 
     repl = REPL(agent=agent, console=console)
-    await repl.run()
+    try:
+        await repl.run()
+    finally:
+        # 清理 LSP 服务器
+        await lsp_manager.stop_server()
 
 
 def main() -> None:
