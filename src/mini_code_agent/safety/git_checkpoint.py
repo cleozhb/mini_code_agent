@@ -38,6 +38,7 @@ class GitCheckpoint:
         self.cwd = cwd
         self._enabled: bool | None = None  # lazy 检查
         self._before_head: str | None = None  # "before" 记录的 HEAD hash
+        self._before_status: set[str] = set()  # "before" 记录的 git status 快照
 
     async def is_git_repo(self) -> bool:
         """检查当前目录是否在 git 仓库中."""
@@ -50,9 +51,11 @@ class GitCheckpoint:
         return self._enabled
 
     async def save_head(self) -> str | None:
-        """记录当前 HEAD hash（"before" 阶段调用）.
+        """记录当前 HEAD hash 和工作区状态（"before" 阶段调用）.
 
         不创建任何 commit，不修改工作区。
+        同时记录当前 git status 快照，用于后续区分
+        哪些改动是 Agent 产生的、哪些是用户之前就有的。
 
         Returns:
             HEAD commit hash，或 None（非 git 仓库）。
@@ -67,35 +70,53 @@ class GitCheckpoint:
             return None
 
         self._before_head = out.strip()
+
+        # 记录当前工作区状态快照（每行是一个文件的变更条目）
+        code, status = await _run_git("status", "--porcelain", cwd=self.cwd)
+        if code == 0 and status.strip():
+            self._before_status = set(status.rstrip("\n").split("\n"))
+        else:
+            self._before_status = set()
+
         logger.info("记录 checkpoint 锚点: %s", self._before_head[:8])
         return self._before_head
 
     async def create_checkpoint(self, message: str) -> str | None:
         """创建 checkpoint commit（"after" 阶段调用）.
 
-        检测工作区相对于 save_head 时的 HEAD 是否有改动，
-        有则提交为 checkpoint commit。
-
-        不会吞掉用户 save_head 之前就存在的 staged 改动——
-        通过对比 _before_head 只提交新增的差异。
+        对比 save_head 时的工作区快照，只有出现**新的**改动
+        （即不在 _before_status 中的条目）时才创建 checkpoint。
+        这样可以避免把用户之前就有的未提交改动误 commit。
 
         Returns:
-            commit hash，或 None（无改动 / 非 git 仓库）。
+            commit hash，或 None（无新增改动 / 非 git 仓库）。
         """
         if not await self.is_git_repo():
             logger.warning("不在 git 仓库中，跳过 checkpoint")
             return None
 
-        # 检查工作区是否有改动（包括 untracked）
+        # 获取当前工作区状态
         code, status = await _run_git("status", "--porcelain", cwd=self.cwd)
         if code != 0 or not status.strip():
             logger.debug("没有改动，跳过 checkpoint: %s", message)
             return None
 
-        # stage 所有改动
-        await _run_git("add", "-A", cwd=self.cwd)
+        # 对比：只看新增的改动条目
+        current_status = set(status.rstrip("\n").split("\n"))
+        new_changes = current_status - self._before_status
+        if not new_changes:
+            logger.debug("没有新增改动（均为 Agent 运行前已有），跳过 checkpoint: %s", message)
+            return None
 
-        # 再次确认有 staged 内容
+        # 只 stage 新增改动的文件（从 porcelain 输出中提取文件路径）
+        for entry in new_changes:
+            # git status --porcelain 格式: "XY filename" 或 "XY orig -> filename"
+            raw = entry[3:]  # 跳过状态码和空格
+            if " -> " in raw:
+                raw = raw.split(" -> ", 1)[1]
+            await _run_git("add", "--", raw, cwd=self.cwd)
+
+        # 确认有 staged 内容
         code, _ = await _run_git("diff", "--cached", "--quiet", cwd=self.cwd)
         if code == 0:
             logger.debug("没有 staged 改动，跳过 checkpoint: %s", message)
