@@ -1,0 +1,54 @@
+id: L4-express-auth
+level: 4
+description: |
+  给这个 Express 应用添加完整的用户认证系统。当前只有一个 `app.js` 提供
+  基础的 Express 服务和一些公共路由。
+
+  你的任务：实现完整的用户认证功能，需要多个文件协同工作。
+
+  具体要求：
+
+  1. **数据模型** (`models/user.js`)：
+     - User 类，包含 id、username、email、password_hash 字段
+     - 提供 create / findByUsername / findById 方法
+     - 使用内存存储（Map），不需要数据库
+
+  2. **注册/登录 API** (`routes/auth.js`)：
+     - POST /auth/register — 创建用户，密码需要 hash
+     - POST /auth/login — 验证用户名密码，返回 JWT token
+     - POST /auth/logout — 目前只返回成功（token 由客户端丢弃）
+
+  3. **JWT 中间件** (`middleware/auth.js`)：
+     - verifyToken 中间件：从 Authorization header 解析 Bearer token
+     - 验证失败返回 401
+     - 验证成功把 user 信息挂到 req.user
+
+  4. **权限校验** (`middleware/roles.js`)：
+     - requireRole(role) 中间件工厂
+     - 检查 req.user.role 是否匹配
+
+  5. **受保护路由** (`routes/protected.js`)：
+     - GET /api/profile — 需要认证，返回当前用户信息
+     - GET /api/admin — 需要 admin 角色
+
+  6. **测试** (`tests/auth.test.js`)：
+     - 注册、登录、token 验证、权限校验的基本测试
+
+  完成后 `npm test` 必须全部通过。
+expected_files:
+  - models/user.js
+  - routes/auth.js
+  - middleware/auth.js
+  - middleware/roles.js
+  - routes/protected.js
+  - tests/auth.test.js
+  - app.js
+max_steps: 60
+max_tokens: 400000
+max_wall_time_seconds: 900
+tags:
+  - feature
+  - javascript
+  - multi-file
+  - auth
+  - graph

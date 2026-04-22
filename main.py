@@ -45,6 +45,11 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="启动时默认开启 Plan 模式（先规划再执行）",
     )
+    parser.add_argument(
+        "--graph",
+        action="store_true",
+        help="启动时默认开启 Graph 模式（DAG 任务图规划与执行）",
+    )
 
     # 子命令：不带 → REPL（保持原行为）；带 → 分派
     subparsers = parser.add_subparsers(dest="command", metavar="COMMAND")
@@ -218,6 +223,27 @@ async def async_main() -> None:
     async def _plan_replan_cb(plan, failed_step, last_content):
         return await ask_replan(console, prompt_session)
 
+    # 6b. 创建 GraphPlanner + GraphExecutor + Graph mode 回调
+    from mini_code_agent.core import GraphPlanner, GraphExecutor
+    from mini_code_agent.cli.graph_display import (
+        ask_graph_blocked,
+        render_task_progress,
+    )
+
+    graph_planner = GraphPlanner(llm_client=llm_client)
+
+    async def _graph_blocked_cb(graph, failed, blocked):
+        return await ask_graph_blocked(graph, failed, blocked, console, prompt_session)
+
+    async def _graph_progress_cb(task_index, total, task, phase):
+        render_task_progress(task_index, total, task, phase, console)
+
+    graph_executor = GraphExecutor(
+        project_path=str(project_dir),
+        blocked_callback=_graph_blocked_cb,
+        progress_callback=_graph_progress_cb,
+    )
+
     # 7. 创建 Agent
     from mini_code_agent.core import Agent
 
@@ -241,7 +267,13 @@ async def async_main() -> None:
     # 8. 启动 REPL
     from mini_code_agent.cli import REPL
 
-    repl = REPL(agent=agent, console=console)
+    repl = REPL(
+        agent=agent,
+        console=console,
+        graph_planner=graph_planner,
+        graph_executor=graph_executor,
+        graph_mode=args.graph,
+    )
     try:
         await repl.run()
     finally:

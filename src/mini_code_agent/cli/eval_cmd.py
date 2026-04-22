@@ -98,6 +98,10 @@ def _build_eval_system_prompt(workspace: Path) -> str:
         "  - 如果工作区有 `tests/` 目录：`python -m pytest tests/ -q`\n"
         "  - 如果是单文件任务（根目录下有 `test_*.py`）：`python -m pytest -q`\n"
         "- 测试挂了就继续修，通过后再收尾。不要跳过这一步直接汇报。\n"
+        "\n"
+        "收尾纪律（严格遵守）：\n"
+        "- 测试通过后**立即汇报并停止**。不要做额外的手动验证、集成测试、\n"
+        "  创建样例数据、手动跑 CLI、或检查输出文件。这些都是浪费 token。\n"
         "- 汇报时一句话说明做了什么 + 测试结果（如 `改了 X，pytest 全绿`），不要冗长解释。\n"
     )
 
@@ -115,7 +119,7 @@ def add_eval_subparser(subparsers: argparse._SubParsersAction) -> argparse.Argum
         description="mini-code-agent 自带的 benchmark 评估命令",
     )
     # 过滤
-    p.add_argument("--level", type=int, default=None, choices=[1, 2, 3],
+    p.add_argument("--level", type=int, default=None, choices=[1, 2, 3, 4],
                    help="只跑指定 level")
     p.add_argument("--task", type=str, default=None,
                    help="只跑指定 task id")

@@ -520,6 +520,9 @@ class Agent:
                 )
                 if token_msg:
                     logger.warning(token_msg)
+                    # 软警告（80%）：注入 conversation 让 LLM 感知到预算压力
+                    if self.loop_guard.total_tokens < self.loop_guard.max_tokens:
+                        self.conversation.append(Message.user(token_msg))
                 # 硬超限：push 提示后直接停掉本轮，且标记 stop_reason
                 if self.loop_guard.total_tokens >= self.loop_guard.max_tokens:
                     if response.content:

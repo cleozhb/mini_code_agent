@@ -32,6 +32,7 @@ src/mini_code_agent/
 - 每个模块有 __init__.py 导出公共接口
 - 异步优先（async/await）
 - 错误处理用自定义异常，不要裸 except
+- 需要 LLM 返回结构化数据时，用 Pydantic model 定义 schema + `response_format` 约束输出，不要手动解析 JSON
 
 ## LLM 配置
 - 所有配置从 .env 文件读取（不读系统环境变量），参考 .env.example

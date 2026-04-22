@@ -67,9 +67,16 @@ class REPL:
         self,
         agent: Agent,
         console: Console | None = None,
+        graph_planner: object | None = None,
+        graph_executor: object | None = None,
+        graph_mode: bool = False,
     ) -> None:
         self.agent = agent
         self.console = console or Console()
+        self.graph_planner = graph_planner
+        self.graph_executor = graph_executor
+        self.graph_mode = graph_mode
+        self._current_graph = None  # 当前 TaskGraph（用于 /graph 查看）
 
         # 斜杠命令补全
         self._completer = WordCompleter(
@@ -77,6 +84,7 @@ class REPL:
                 "/quit", "/exit", "/q", "/clear", "/cost", "/model",
                 "/memory", "/save", "/plan",
                 "/undo", "/checkpoints", "/diff",
+                "/graph", "/graph-export",
             ],
             sentence=True,  # 整条匹配，不拆词
         )
@@ -108,8 +116,10 @@ class REPL:
                     break
                 continue
 
-            # Plan mode 用非流式（在步骤间渲染进度）；否则走流式
-            if self.agent.plan_mode and self.agent.planner is not None:
+            # Graph mode 用非流式执行；Plan mode 用非流式；否则走流式
+            if self.graph_mode and self.graph_planner is not None:
+                await self._run_agent_graph(user_input)
+            elif self.agent.plan_mode and self.agent.planner is not None:
                 await self._run_agent_plan(user_input)
             else:
                 await self._run_agent_stream(user_input)
@@ -180,10 +190,19 @@ class REPL:
             await self._show_agent_diff()
             return True
 
+        if command == "/graph":
+            graph_arg = parts[1].strip().lower() if len(parts) > 1 else ""
+            self._handle_graph_command(graph_arg)
+            return True
+
+        if command == "/graph-export":
+            self._export_graph_mermaid()
+            return True
+
         self.console.print(f"[red]未知命令: {command}[/red]")
         self.console.print(
             "[dim]可用命令: /quit  /clear  /cost  /model  /memory  /save  /plan"
-            "  /undo  /checkpoints  /diff[/dim]"
+            "  /undo  /checkpoints  /diff  /graph  /graph-export[/dim]"
         )
         return True
 
@@ -207,6 +226,38 @@ class REPL:
         status = "开启" if self.agent.plan_mode else "关闭"
         color = "green" if self.agent.plan_mode else "yellow"
         self.console.print(f"[{color}]Plan mode 已{status}[/{color}]")
+
+    def _handle_graph_command(self, arg: str) -> None:
+        """处理 /graph 命令：无参查看当前图，on/off 切换模式."""
+        if arg in ("on", "enable", "true", "1"):
+            if self.graph_planner is None:
+                self.console.print("[red]Graph mode 未初始化（缺少 GraphPlanner）[/red]")
+                return
+            self.graph_mode = True
+            self.console.print("[green]Graph mode 已开启[/green]")
+        elif arg in ("off", "disable", "false", "0"):
+            self.graph_mode = False
+            self.console.print("[yellow]Graph mode 已关闭[/yellow]")
+        elif arg == "":
+            # 无参数：如果有当前图则展示，否则显示开关状态
+            if self._current_graph is not None:
+                from .graph_display import render_graph_table
+                render_graph_table(self._current_graph, self.console)
+            else:
+                status = "开启" if self.graph_mode else "关闭"
+                self.console.print(f"[dim]Graph mode: {status}[/dim]")
+                self.console.print("[dim]用法: /graph [on|off]  — 无任务图时切换模式[/dim]")
+        else:
+            self.console.print(f"[red]无法识别的参数: {arg}[/red]")
+            self.console.print("[dim]用法: /graph [on|off][/dim]")
+
+    def _export_graph_mermaid(self) -> None:
+        """导出当前 TaskGraph 为 Mermaid 格式."""
+        if self._current_graph is None:
+            self.console.print("[dim]当前没有任务图可导出[/dim]")
+            return
+        from .graph_display import render_mermaid
+        render_mermaid(self._current_graph, self.console)
 
     async def _undo(self) -> None:
         """回滚最近一次 Agent 的所有修改."""
@@ -378,6 +429,57 @@ class REPL:
         old = self.agent.llm_client.model
         self.agent.llm_client.model = model_name
         self.console.print(f"[green]模型已切换: {old} → {model_name}[/green]")
+
+    async def _run_agent_graph(self, user_input: str) -> None:
+        """Graph mode：生成 Task Graph → 展示给用户 → 按 DAG 执行."""
+        self.console.print()
+        self.console.print("[dim]进入 Graph mode，正在生成任务图...[/dim]")
+
+        from .graph_display import render_graph_table, render_graph_result
+
+        try:
+            graph = await self.graph_planner.plan_as_graph(user_input)
+        except Exception as e:
+            self.console.print(f"\n[red]生成任务图失败: {type(e).__name__}: {e}[/red]")
+            self.console.print("[dim]回退到普通模式执行[/dim]")
+            await self._run_agent_stream(user_input)
+            return
+
+        # 展示任务图
+        render_graph_table(graph, self.console)
+        self._current_graph = graph
+
+        # 简单确认
+        self.console.print(
+            "\n[bold]操作：[/bold] "
+            "[green]y[/green]=执行  "
+            "[red]n[/red]=放弃"
+        )
+        try:
+            ans = await self._prompt_session.prompt_async(
+                HTML("<b>执行任务图？ [y/n]: </b>")
+            )
+        except (EOFError, KeyboardInterrupt):
+            self.console.print("[yellow]已取消[/yellow]")
+            return
+
+        if (ans or "").strip().lower() not in ("y", "yes", ""):
+            self.console.print("[yellow]已放弃[/yellow]")
+            return
+
+        # 执行
+        try:
+            result = await self.graph_executor.execute(graph, self.agent)
+        except KeyboardInterrupt:
+            self.console.print("\n[yellow]已中断[/yellow]")
+            return
+        except Exception as e:
+            self.console.print(f"\n[red]执行错误: {type(e).__name__}: {e}[/red]")
+            return
+
+        # 展示结果
+        self._current_graph = result.graph
+        render_graph_result(result, self.console)
 
     async def _run_agent_plan(self, user_input: str) -> None:
         """Plan mode：调用非流式 Agent.run()，中间通过回调渲染进度."""
@@ -553,16 +655,18 @@ class REPL:
             f"[bold]Mini Code Agent[/bold]\n"
             f"模型: {model}\n"
             f"输入消息开始对话，特殊命令：\n"
-            f"  /quit        — 退出\n"
-            f"  /clear       — 清空对话\n"
-            f"  /cost        — 查看 token 消耗\n"
-            f"  /model       — 切换模型\n"
-            f"  /memory      — 查看记忆状态\n"
-            f"  /save        — 保存信息到项目记忆\n"
-            f"  /plan        — 切换 Plan 模式（先规划后执行）\n"
-            f"  /undo        — 回滚最近一次 Agent 修改\n"
-            f"  /checkpoints — 列出所有 checkpoint\n"
-            f"  /diff        — 查看 Agent 的所有修改\n"
+            f"  /quit         — 退出\n"
+            f"  /clear        — 清空对话\n"
+            f"  /cost         — 查看 token 消耗\n"
+            f"  /model        — 切换模型\n"
+            f"  /memory       — 查看记忆状态\n"
+            f"  /save         — 保存信息到项目记忆\n"
+            f"  /plan         — 切换 Plan 模式（先规划后执行）\n"
+            f"  /graph        — 切换 Graph 模式 / 查看当前任务图\n"
+            f"  /graph-export — 导出 Mermaid 图表\n"
+            f"  /undo         — 回滚最近一次 Agent 修改\n"
+            f"  /checkpoints  — 列出所有 checkpoint\n"
+            f"  /diff         — 查看 Agent 的所有修改\n"
             f"  Ctrl+C  — 中断当前操作\n"
             f"  多行输入：Alt+Enter 换行，Enter 提交",
             border_style="blue",

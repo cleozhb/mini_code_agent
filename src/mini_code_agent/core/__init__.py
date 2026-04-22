@@ -11,6 +11,8 @@ from .agent import (
     PlanProgressCallback,
     PlanReplanCallback,
 )
+from .graph_executor import GraphExecutor, GraphResult, run_verification
+from .graph_planner import GRAPH_PLANNER_SYSTEM_PROMPT, GraphPlanner, GraphPlannerError
 from .planner import (
     PLANNER_SYSTEM_PROMPT,
     Plan,
@@ -20,6 +22,7 @@ from .planner import (
 )
 from .retry import AttemptRecord, RetryController
 from .system_prompt import DEFAULT_SYSTEM_PROMPT, build_system_prompt, build_system_prompt_with_context
+from .task_graph import CyclicDependencyError, TaskGraph, TaskNode, TaskStatus
 from .verifier import VerificationResult, Verifier
 
 __all__ = [
@@ -30,7 +33,13 @@ __all__ = [
     "AgentResult",
     "AttemptRecord",
     "ConfirmCallback",
+    "CyclicDependencyError",
     "DEFAULT_SYSTEM_PROMPT",
+    "GRAPH_PLANNER_SYSTEM_PROMPT",
+    "GraphExecutor",
+    "GraphPlanner",
+    "GraphPlannerError",
+    "GraphResult",
     "PLANNER_SYSTEM_PROMPT",
     "Plan",
     "PlanConfirmCallback",
@@ -40,8 +49,12 @@ __all__ = [
     "Planner",
     "PlannerError",
     "RetryController",
+    "TaskGraph",
+    "TaskNode",
+    "TaskStatus",
     "VerificationResult",
     "Verifier",
     "build_system_prompt",
     "build_system_prompt_with_context",
+    "run_verification",
 ]

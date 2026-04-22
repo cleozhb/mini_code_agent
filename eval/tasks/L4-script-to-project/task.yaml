@@ -1,0 +1,63 @@
+id: L4-script-to-project
+level: 4
+description: |
+  将一个单文件 Python 脚本 `converter.py` 重构为一个有 CLI、配置、日志的
+  完整项目结构。当前脚本能工作，但所有功能揉在一个 300 多行的文件里。
+
+  你的任务：拆分为标准 Python 项目结构，行为不变。
+
+  具体要求：
+
+  1. **项目结构**：
+     ```
+     converter/
+       __init__.py
+       cli.py         — argparse CLI 入口
+       config.py      — 配置类（dataclass），支持从 YAML 加载
+       core.py        — 核心转换逻辑（从原 converter.py 提取）
+       logger.py      — 日志配置（file + console handler）
+       utils.py       — 工具函数（文件 I/O、格式检测等）
+     config.yaml      — 默认配置文件
+     main.py          — 入口脚本（调用 cli.main()）
+     tests/
+       test_core.py   — 核心逻辑测试
+       test_cli.py    — CLI 参数解析测试
+     ```
+
+  2. **CLI** (`converter/cli.py`)：
+     - 支持 `--input`、`--output`、`--format`、`--config`、`--verbose` 参数
+     - `--config` 加载 YAML 配置覆盖默认值
+
+  3. **配置** (`converter/config.py`)：
+     - Config dataclass 包含 input_dir、output_dir、format、verbose 字段
+     - classmethod `from_yaml(path)` 从 YAML 加载
+     - classmethod `from_args(namespace)` 从 argparse 结果加载
+
+  4. **日志** (`converter/logger.py`)：
+     - setup_logging(verbose) 配置根 logger
+     - verbose 模式输出 DEBUG 级别到控制台
+
+  5. **测试**：
+     - `pytest tests/ -q` 必须全绿
+
+  修改范围：保留原 `converter.py` 不改（作为参考），新建上述所有文件。
+expected_files:
+  - converter/__init__.py
+  - converter/cli.py
+  - converter/config.py
+  - converter/core.py
+  - converter/logger.py
+  - converter/utils.py
+  - config.yaml
+  - main.py
+  - tests/test_core.py
+  - tests/test_cli.py
+max_steps: 60
+max_tokens: 400000
+max_wall_time_seconds: 900
+tags:
+  - refactor
+  - python
+  - multi-file
+  - project-structure
+  - graph
