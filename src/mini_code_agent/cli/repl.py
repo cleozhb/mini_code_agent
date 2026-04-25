@@ -23,6 +23,11 @@ from ..llm.base import LLMClient, TokenUsage, ToolCall
 from ..tools.base import ToolRegistry
 from .confirm import confirm_tool_call
 
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from ..longrun.ledger_manager import TaskLedgerManager
+
 # ---------------------------------------------------------------------------
 # Token 费用估算（每百万 token 美元价格, 可按模型调整）
 # ---------------------------------------------------------------------------
@@ -70,6 +75,9 @@ class REPL:
         graph_planner: object | None = None,
         graph_executor: object | None = None,
         graph_mode: bool = False,
+        pending_graph: object | None = None,
+        long_run_deferred: bool = False,
+        token_budget: int = 500_000,
     ) -> None:
         self.agent = agent
         self.console = console or Console()
@@ -77,6 +85,9 @@ class REPL:
         self.graph_executor = graph_executor
         self.graph_mode = graph_mode
         self._current_graph = None  # 当前 TaskGraph（用于 /graph 查看）
+        self._pending_graph = pending_graph  # --long-run / --resume 预生成的图
+        self._long_run_deferred = long_run_deferred  # --long-run 不带目标
+        self._token_budget = token_budget
 
         # 斜杠命令补全
         self._completer = WordCompleter(
@@ -85,6 +96,8 @@ class REPL:
                 "/memory", "/save", "/plan",
                 "/undo", "/checkpoints", "/diff",
                 "/graph", "/graph-export",
+                "/status", "/ledger",
+                "/longrun",
             ],
             sentence=True,  # 整条匹配，不拆词
         )
@@ -98,6 +111,15 @@ class REPL:
     async def run(self) -> None:
         """启动 REPL 主循环."""
         self._print_welcome()
+
+        # --long-run / --resume：有预生成的 TaskGraph，直接执行
+        if self._pending_graph is not None:
+            await self._execute_pending_graph()
+
+        # --long-run (无目标)：交互式输入后进入长程任务流程
+        elif self._long_run_deferred:
+            self._long_run_deferred = False
+            await self._prompt_and_start_longrun()
 
         while True:
             try:
@@ -199,10 +221,25 @@ class REPL:
             self._export_graph_mermaid()
             return True
 
+        if command == "/status":
+            self._show_ledger_status()
+            return True
+
+        if command == "/ledger":
+            ledger_arg = parts[1].strip() if len(parts) > 1 else ""
+            self._handle_ledger_command(ledger_arg)
+            return True
+
+        if command == "/longrun":
+            longrun_arg = parts[1].strip() if len(parts) > 1 else ""
+            await self._handle_longrun_command(longrun_arg)
+            return True
+
         self.console.print(f"[red]未知命令: {command}[/red]")
         self.console.print(
             "[dim]可用命令: /quit  /clear  /cost  /model  /memory  /save  /plan"
-            "  /undo  /checkpoints  /diff  /graph  /graph-export[/dim]"
+            "  /undo  /checkpoints  /diff  /graph  /graph-export"
+            "  /status  /ledger  /longrun[/dim]"
         )
         return True
 
@@ -258,6 +295,108 @@ class REPL:
             return
         from .graph_display import render_mermaid
         render_mermaid(self._current_graph, self.console)
+
+    def _show_ledger_status(self) -> None:
+        """展示 ledger 当前状态（/status 命令）."""
+        ledger = self.agent.ledger
+        manager = self.agent.ledger_manager
+        if ledger is None or manager is None:
+            self.console.print("[dim]当前没有活跃的 Task Ledger[/dim]")
+            return
+
+        stats = manager.get_stats(ledger)
+        summary = manager.build_context_summary(ledger)
+
+        lines = [
+            f"Task ID: {stats['task_id']}",
+            f"目标: {stats['goal']}",
+            f"状态: {stats['status']}",
+            f"阶段: {stats['current_phase']}",
+            f"当前子任务: {stats['current_task_id'] or '(无)'}",
+            f"完成: {stats['completion_rate']}",
+            f"失败尝试: {stats['failed_attempts']}",
+            f"步数: {stats['total_steps']}",
+            f"Token: {stats['total_tokens_used']:,} / {stats['token_budget']:,}"
+            f" (剩余 {stats['token_budget_remaining']:,})",
+            f"平均 token/任务: {stats['avg_tokens_per_task']:,}",
+            f"墙钟: {stats['total_wall_time_seconds']:.1f}s",
+            f"问题: {stats['issues_open']} 个未解决, {stats['issues_resolved']} 个已解决",
+            f"决策: {stats['decisions_count']} 个",
+            f"里程碑: {stats['milestones_reached']}/{stats['milestones_total']}",
+        ]
+
+        self.console.print(Panel(
+            "\n".join(lines),
+            title="[bold]Task Ledger 状态[/bold]",
+            border_style="cyan",
+        ))
+
+        if summary:
+            self.console.print()
+            self.console.print(Panel(
+                summary,
+                title="[bold]上下文摘要[/bold]",
+                border_style="dim",
+            ))
+
+    def _handle_ledger_command(self, arg: str) -> None:
+        """处理 /ledger 命令."""
+        ledger = self.agent.ledger
+        manager = self.agent.ledger_manager
+        if ledger is None or manager is None:
+            self.console.print("[dim]当前没有活跃的 Task Ledger[/dim]")
+            return
+
+        if not arg:
+            # 打印完整 JSON
+            data = ledger.to_dict()
+            self.console.print_json(json.dumps(data, ensure_ascii=False, indent=2))
+            return
+
+        parts = arg.split(maxsplit=1)
+        subcmd = parts[0].lower()
+
+        if subcmd == "export":
+            export_path = parts[1].strip() if len(parts) > 1 else ""
+            if not export_path:
+                self.console.print("[dim]用法: /ledger export <path>[/dim]")
+                return
+            data = ledger.to_dict()
+            try:
+                from pathlib import Path
+                p = Path(export_path)
+                p.parent.mkdir(parents=True, exist_ok=True)
+                p.write_text(
+                    json.dumps(data, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+                self.console.print(f"[green]Ledger 已导出到: {export_path}[/green]")
+            except Exception as e:
+                self.console.print(f"[red]导出失败: {e}[/red]")
+
+        elif subcmd == "history":
+            entries = manager.get_history(ledger.task_id)
+            if not entries:
+                self.console.print("[dim]暂无历史记录[/dim]")
+                return
+            lines = []
+            for i, entry in enumerate(entries):
+                lines.append(
+                    f"  {i + 1}. [{entry['timestamp']}] "
+                    f"status={entry['status']} "
+                    f"phase={entry['current_phase']} "
+                    f"tasks={entry['completed_tasks']} "
+                    f"tokens={entry['total_tokens_used']:,} "
+                    f"steps={entry['total_steps']}"
+                )
+            self.console.print(Panel(
+                "\n".join(lines),
+                title=f"[bold]Ledger 变更历史（最近 {len(entries)} 条）[/bold]",
+                border_style="cyan",
+            ))
+        else:
+            self.console.print(f"[red]未知子命令: {subcmd}[/red]")
+            self.console.print("[dim]用法: /ledger [export <path> | history][/dim]")
 
     async def _undo(self) -> None:
         """回滚最近一次 Agent 的所有修改."""
@@ -481,6 +620,223 @@ class REPL:
         self._current_graph = result.graph
         render_graph_result(result, self.console)
 
+    async def _execute_pending_graph(self) -> None:
+        """执行 --long-run / --resume 预生成的 TaskGraph（跳过 planner 生成阶段）."""
+        graph = self._pending_graph
+        self._pending_graph = None  # 只执行一次
+        self._current_graph = graph
+        await self._execute_graph_with_ledger(graph)
+
+    async def _execute_graph_with_ledger(self, graph) -> None:
+        """确认并执行 TaskGraph，更新 Ledger 状态.
+
+        供 _execute_pending_graph / _start_longrun 复用。
+        """
+        from .graph_display import render_graph_result
+
+        # 确认
+        self.console.print(
+            "\n[bold]操作：[/bold] "
+            "[green]y[/green]=开始执行  "
+            "[red]n[/red]=进入 REPL 手动操作"
+        )
+        try:
+            ans = await self._prompt_session.prompt_async(
+                HTML("<b>开始执行任务图？ [y/n]: </b>")
+            )
+        except (EOFError, KeyboardInterrupt):
+            self.console.print("[yellow]已跳过，进入 REPL[/yellow]")
+            return
+
+        if (ans or "").strip().lower() not in ("y", "yes", ""):
+            self.console.print("[dim]已跳过自动执行，可在 REPL 中手动操作[/dim]")
+            return
+
+        # 更新 Ledger 状态
+        ledger = self.agent.ledger
+        manager = self.agent.ledger_manager
+        if ledger and manager:
+            from mini_code_agent.longrun.ledger_types import TaskRunStatus
+            ledger.status = TaskRunStatus.RUNNING
+            manager.update_phase(ledger, "execution")
+
+        # 执行
+        self.console.print()
+        try:
+            result = await self.graph_executor.execute(graph, self.agent)
+        except KeyboardInterrupt:
+            self.console.print("\n[yellow]已中断，进入 REPL 可用 /status 查看进度[/yellow]")
+            return
+        except Exception as e:
+            self.console.print(f"\n[red]执行错误: {type(e).__name__}: {e}[/red]")
+            return
+
+        # 展示结果
+        self._current_graph = result.graph
+        render_graph_result(result, self.console)
+
+        # 更新 Ledger 完成状态
+        if ledger and manager:
+            from mini_code_agent.core.task_graph import TaskStatus as GraphTaskStatus
+            from mini_code_agent.longrun.ledger_types import TaskRunStatus
+
+            # 从 graph 同步已完成子任务到 ledger.completed_tasks
+            self._sync_completed_tasks_to_ledger(result.graph, ledger, manager)
+
+            if result.tasks_failed == 0:
+                ledger.status = TaskRunStatus.COMPLETED
+            else:
+                ledger.status = TaskRunStatus.FAILED
+            manager.update_phase(ledger, "done")
+            manager.update_resources(
+                ledger,
+                tokens=result.total_tokens,
+                steps=result.total_steps,
+                wall_time=result.wall_time,
+            )
+
+        self.console.print(
+            "\n[dim]任务图执行完毕，进入 REPL。"
+            "可用 /status 查看最终状态[/dim]"
+        )
+
+    async def _start_longrun(self, goal: str, token_budget: int) -> None:
+        """从目标字符串开始完整的长程任务流程：planning → confirm → execute."""
+        if self.graph_planner is None:
+            self.console.print("[red]GraphPlanner 未初始化[/red]")
+            return
+
+        self.console.print(f"[dim]正在为长程任务生成 TaskGraph...[/dim]")
+
+        try:
+            graph = await self.graph_planner.plan_as_graph(goal)
+        except Exception as e:
+            self.console.print(f"[red]生成 TaskGraph 失败: {type(e).__name__}: {e}[/red]")
+            return
+
+        from .graph_display import render_graph_table
+        render_graph_table(graph, self.console)
+        self._current_graph = graph
+
+        # 创建 Ledger
+        manager = self.agent.ledger_manager
+        if manager is None:
+            self.console.print("[red]TaskLedgerManager 未初始化[/red]")
+            return
+
+        ledger = manager.create(
+            goal=goal,
+            task_graph=graph,
+            budget=token_budget,
+        )
+        self.console.print(
+            f"[green]Ledger 已创建: {ledger.task_id[:8]}[/green]\n"
+            f"[dim]Token 预算: {token_budget:,}  "
+            f"里程碑: {len(ledger.milestones)} 个[/dim]"
+        )
+
+        # 注入到 Agent
+        self.agent.ledger = ledger
+        self.agent.ledger_manager = manager
+
+        # 执行
+        await self._execute_graph_with_ledger(graph)
+
+    async def _prompt_and_start_longrun(self) -> None:
+        """交互式输入长程任务目标，然后走 planning + execution."""
+        self.console.print(
+            "\n[bold]长程任务模式[/bold] — 请输入任务目标："
+        )
+        try:
+            goal = await self._prompt_session.prompt_async(
+                HTML("<b><ansigreen>目标: </ansigreen></b>"),
+            )
+        except (EOFError, KeyboardInterrupt):
+            self.console.print("[yellow]已取消，进入普通 REPL[/yellow]")
+            return
+
+        goal = goal.strip()
+        if not goal:
+            self.console.print("[yellow]目标为空，已取消[/yellow]")
+            return
+
+        await self._start_longrun(goal, self._token_budget)
+
+    async def _handle_longrun_command(self, arg: str) -> None:
+        """处理 /longrun [goal] 命令."""
+        if self.agent.ledger is not None:
+            self.console.print(
+                "[yellow]当前已有活跃的长程任务。"
+                "请先完成或用 /status 查看状态[/yellow]"
+            )
+            return
+
+        goal = arg.strip()
+        if not goal:
+            # 交互式输入
+            self.console.print("[bold]请输入长程任务目标：[/bold]")
+            try:
+                goal = await self._prompt_session.prompt_async(
+                    HTML("<b><ansigreen>目标: </ansigreen></b>"),
+                )
+            except (EOFError, KeyboardInterrupt):
+                self.console.print("[yellow]已取消[/yellow]")
+                return
+            goal = goal.strip()
+            if not goal:
+                self.console.print("[yellow]目标为空，已取消[/yellow]")
+                return
+
+        await self._start_longrun(goal, self._token_budget)
+
+    def _sync_completed_tasks_to_ledger(self, graph, ledger, manager) -> None:
+        """从已执行的 TaskGraph 同步已完成/失败的子任务到 Ledger.
+
+        GraphExecutor 不直接操作 Ledger，所以在图执行完成后需要
+        从 graph 的 COMPLETED 节点补充 CompletedTaskRecord。
+        """
+        from uuid import uuid4
+
+        from mini_code_agent.core.task_graph import TaskStatus as GraphTaskStatus
+        from mini_code_agent.longrun.ledger_types import (
+            CompletedTaskRecord,
+            FailedAttemptRecord,
+        )
+
+        existing_ids = {ct.task_id for ct in ledger.completed_tasks}
+
+        for node in graph.nodes.values():
+            if node.status == GraphTaskStatus.COMPLETED and node.id not in existing_ids:
+                record = CompletedTaskRecord(
+                    task_id=node.id,
+                    artifact_id=str(uuid4()),  # 占位 — Artifact Protocol 完善后替换
+                    description=node.description,
+                    self_summary=node.result or node.description,
+                    files_changed=node.files_involved,
+                    verification_passed=True,
+                    confidence="DONE",
+                    step_number_start=0,
+                    step_number_end=0,
+                    token_count=0,
+                )
+                ledger.completed_tasks.append(record)
+
+            elif node.status == GraphTaskStatus.FAILED and node.id not in {
+                fa.task_id for fa in ledger.failed_attempts
+            }:
+                record = FailedAttemptRecord(
+                    task_id=node.id,
+                    artifact_id=str(uuid4()),
+                    approach_description=node.description,
+                    failure_reason=node.error or "未知",
+                    step_number=0,
+                    lesson_learned=None,
+                )
+                ledger.failed_attempts.append(record)
+
+        # 检查里程碑
+        manager._check_milestones(ledger)
+
     async def _run_agent_plan(self, user_input: str) -> None:
         """Plan mode：调用非流式 Agent.run()，中间通过回调渲染进度."""
         self.console.print()
@@ -664,6 +1020,9 @@ class REPL:
             f"  /plan         — 切换 Plan 模式（先规划后执行）\n"
             f"  /graph        — 切换 Graph 模式 / 查看当前任务图\n"
             f"  /graph-export — 导出 Mermaid 图表\n"
+            f"  /status       — 查看 Task Ledger 状态\n"
+            f"  /ledger       — 查看/导出 Ledger 详情\n"
+            f"  /longrun      — 启动长程任务（交互输入或 /longrun 目标）\n"
             f"  /undo         — 回滚最近一次 Agent 修改\n"
             f"  /checkpoints  — 列出所有 checkpoint\n"
             f"  /diff         — 查看 Agent 的所有修改\n"

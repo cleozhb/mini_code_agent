@@ -54,6 +54,19 @@ class ConversationManager:
         self._messages = [Message.system(system_prompt)]
         self._token_count = estimate_tokens(system_prompt)
 
+    def update_system(self, system_prompt: str) -> None:
+        """就地替换 system prompt（不影响对话历史）."""
+        if self._messages and self._messages[0].role == Role.SYSTEM:
+            old_tokens = self._estimate_message_tokens(self._messages[0])
+            self._messages[0] = Message.system(system_prompt)
+            new_tokens = self._estimate_message_tokens(self._messages[0])
+            self._token_count += new_tokens - old_tokens
+        else:
+            # 没有 system prompt，直接插入
+            msg = Message.system(system_prompt)
+            self._messages.insert(0, msg)
+            self._token_count += self._estimate_message_tokens(msg)
+
     def append(self, message: Message) -> None:
         """追加一条消息并更新 token 计数."""
         self._messages.append(message)

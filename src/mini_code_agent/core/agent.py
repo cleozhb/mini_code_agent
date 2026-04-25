@@ -6,7 +6,7 @@ import asyncio
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, AsyncIterator, Callable, Awaitable, Literal
+from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Awaitable, Literal
 
 from ..llm.base import (
     LLMClient,
@@ -29,6 +29,10 @@ from ..tools.base import ToolResult as ExecToolResult
 from .planner import Plan, Planner, PlannerError
 from .retry import RetryController
 from .verifier import VerificationResult, Verifier
+
+if TYPE_CHECKING:
+    from ..longrun.ledger_manager import TaskLedgerManager
+    from ..longrun.task_ledger import TaskLedger
 
 logger = logging.getLogger(__name__)
 
@@ -146,6 +150,8 @@ class Agent:
         plan_progress_callback: PlanProgressCallback | None = None,
         plan_replan_callback: PlanReplanCallback | None = None,
         max_wall_time_seconds: float | None = None,
+        ledger: TaskLedger | None = None,
+        ledger_manager: TaskLedgerManager | None = None,
     ) -> None:
         self.llm_client = llm_client
         self.tool_registry = tool_registry
@@ -172,6 +178,10 @@ class Agent:
         self.plan_progress_callback = plan_progress_callback
         self.plan_replan_callback = plan_replan_callback
 
+        # Ledger（外部记忆）
+        self.ledger = ledger
+        self.ledger_manager = ledger_manager
+
         # 当前任务期间追踪改动过哪些文件（供 Verifier 使用）
         self._files_changed: list[str] = []
 
@@ -180,12 +190,16 @@ class Agent:
         self.conversation.init_system(self._build_full_system_prompt())
 
     def _build_full_system_prompt(self) -> str:
-        """拼接 system prompt + 项目记忆."""
+        """拼接 system prompt + 项目记忆 + Ledger 上下文."""
         prompt = self.system_prompt
         if self.project_memory:
             memory_text = self.project_memory.format_for_prompt()
             if memory_text:
                 prompt += f"\n\n<project-memory>\n{memory_text}\n</project-memory>"
+        if self.ledger and self.ledger_manager:
+            ledger_context = self.ledger_manager.build_context_summary(self.ledger)
+            if ledger_context:
+                prompt += f"\n\n<task-ledger>\n{ledger_context}\n</task-ledger>"
         return prompt
 
     @property
@@ -314,6 +328,13 @@ class Agent:
         # 自动 checkpoint：任务完成后（create_checkpoint 内部会检测无改动则跳过）
         if self.git_checkpoint is not None:
             await self.git_checkpoint.create_checkpoint(f"after: {task_desc}")
+
+        # Ledger 资源更新
+        if self.ledger and self.ledger_manager:
+            tokens_this_round = total_usage.input_tokens + total_usage.output_tokens
+            self.ledger_manager.update_resources(
+                self.ledger, tokens_this_round, 1, 0.0,
+            )
 
         return AgentResult(
             content=last_content,
@@ -487,6 +508,10 @@ class Agent:
         4. 如果 LLM 返回纯文本：返回给用户
         5. 最多 MAX_TOOL_ROUNDS 轮 tool calling
         """
+        # Ledger 上下文刷新：每轮替换 system prompt（防止累积）
+        if self.ledger and self.ledger_manager:
+            self.conversation.update_system(self._build_full_system_prompt())
+
         self.conversation.append(Message.user(user_message))
 
         tool_params = self.tool_registry.to_tool_params()

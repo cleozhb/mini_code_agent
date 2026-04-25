@@ -11,6 +11,8 @@ from pathlib import Path
 
 from rich.console import Console
 
+DEFAULT_TOKEN_BUDGET = 500_000
+
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
@@ -49,6 +51,27 @@ def parse_args() -> argparse.Namespace:
         "--graph",
         action="store_true",
         help="启动时默认开启 Graph 模式（DAG 任务图规划与执行）",
+    )
+    parser.add_argument(
+        "--long-run",
+        nargs="?",
+        const=True,
+        default=None,
+        metavar="GOAL",
+        help="启动长程任务模式。可直接传入目标，也可不带参数在 REPL 中交互输入",
+    )
+    parser.add_argument(
+        "--token-budget",
+        type=int,
+        default=DEFAULT_TOKEN_BUDGET,
+        help=f"长程任务的 token 预算 (默认: {DEFAULT_TOKEN_BUDGET:,})",
+    )
+    parser.add_argument(
+        "--resume",
+        type=str,
+        default=None,
+        metavar="TASK_ID",
+        help="恢复之前的长程任务（传入 task_id 或 'list' 列出所有）",
     )
 
     # 子命令：不带 → REPL（保持原行为）；带 → 分派
@@ -247,6 +270,84 @@ async def async_main() -> None:
     # 7. 创建 Agent
     from mini_code_agent.core import Agent
 
+    # 7b. 长程任务 Ledger
+    from mini_code_agent.longrun import TaskLedgerManager
+
+    ledger = None
+    ledger_manager = TaskLedgerManager(
+        storage_dir=str(project_dir / ".agent" / "ledger")
+    )
+    long_run_graph = None  # --long-run / --resume 生成的 TaskGraph
+
+    if args.resume == "list":
+        metas = ledger_manager.list_all()
+        if not metas:
+            console.print("[dim]没有可恢复的长程任务[/dim]")
+            sys.exit(0)
+        for m in metas:
+            console.print(
+                f"  {m.task_id[:8]}  [{m.status.value}]  "
+                f"{m.goal[:60]}  "
+                f"({m.completed_tasks} tasks, {m.total_tokens_used:,} tokens)"
+            )
+        sys.exit(0)
+    elif args.resume:
+        try:
+            ledger = ledger_manager.load(args.resume)
+            console.print(
+                f"[green]已恢复长程任务: {ledger.task_id[:8]}[/green]\n"
+                f"[dim]{ledger_manager.get_summary_for_resume(ledger)[:200]}...[/dim]"
+            )
+            # 从 ledger snapshot 重建 TaskGraph
+            snapshot = ledger.task_graph_snapshot
+            if snapshot and snapshot.get("nodes"):
+                from mini_code_agent.core.task_graph import TaskGraph, TaskNode, TaskStatus
+                long_run_graph = TaskGraph()
+                long_run_graph.original_goal = snapshot.get("original_goal", ledger.goal)
+                for _nid, ndata in snapshot["nodes"].items():
+                    long_run_graph.add_task(TaskNode(
+                        id=ndata["id"],
+                        description=ndata["description"],
+                        dependencies=ndata.get("dependencies", []),
+                        status=TaskStatus(ndata.get("status", "pending")),
+                        files_involved=ndata.get("files_involved", []),
+                        verification=ndata.get("verification", ""),
+                    ))
+                # 把已完成的任务标记上
+                for ct in ledger.completed_tasks:
+                    if ct.task_id in long_run_graph.nodes:
+                        node = long_run_graph.nodes[ct.task_id]
+                        if node.status not in (TaskStatus.COMPLETED,):
+                            long_run_graph.mark_completed(ct.task_id, ct.self_summary)
+        except Exception as e:
+            console.print(f"[red]恢复失败: {e}[/red]")
+            sys.exit(1)
+    elif args.long_run is True:
+        # --long-run 不带目标：延迟到 REPL 交互式输入
+        pass
+    elif isinstance(args.long_run, str):
+        # --long-run "目标"：立即生成 TaskGraph + 创建 Ledger
+        console.print(f"[dim]正在为长程任务生成 TaskGraph...[/dim]")
+        try:
+            long_run_graph = await graph_planner.plan_as_graph(args.long_run)
+        except Exception as e:
+            console.print(f"[red]生成 TaskGraph 失败: {e}[/red]")
+            sys.exit(1)
+
+        from mini_code_agent.cli.graph_display import render_graph_table
+        render_graph_table(long_run_graph, console)
+
+        ledger = ledger_manager.create(
+            goal=args.long_run,
+            task_graph=long_run_graph,
+            budget=args.token_budget,
+        )
+        console.print(
+            f"[green]Ledger 已创建: {ledger.task_id[:8]}[/green]\n"
+            f"[dim]Token 预算: {args.token_budget:,}  "
+            f"里程碑: {len(ledger.milestones)} 个[/dim]"
+        )
+
     agent = Agent(
         llm_client=llm_client,
         tool_registry=registry,
@@ -262,6 +363,8 @@ async def async_main() -> None:
         plan_confirm_callback=_plan_confirm_cb,
         plan_progress_callback=_plan_progress_cb,
         plan_replan_callback=_plan_replan_cb,
+        ledger=ledger,
+        ledger_manager=ledger_manager,
     )
 
     # 8. 启动 REPL
@@ -273,6 +376,9 @@ async def async_main() -> None:
         graph_planner=graph_planner,
         graph_executor=graph_executor,
         graph_mode=args.graph,
+        pending_graph=long_run_graph,
+        long_run_deferred=args.long_run is True,
+        token_budget=args.token_budget,
     )
     try:
         await repl.run()
