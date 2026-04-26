@@ -270,12 +270,29 @@ async def async_main() -> None:
     # 7. 创建 Agent
     from mini_code_agent.core import Agent
 
-    # 7b. 长程任务 Ledger
-    from mini_code_agent.longrun import TaskLedgerManager
+    # 7b. 长程任务 Ledger + Checkpoint + Resume
+    from mini_code_agent.longrun import (
+        CheckpointManager,
+        LongRunConfig,
+        ResumeManager,
+        TaskLedgerManager,
+    )
 
     ledger = None
     ledger_manager = TaskLedgerManager(
         storage_dir=str(project_dir / ".agent" / "ledger")
+    )
+    longrun_config = LongRunConfig(token_budget=args.token_budget)
+    checkpoint_manager = CheckpointManager(
+        checkpoint_dir=str(project_dir / ".agent" / "checkpoints"),
+        ledger_manager=ledger_manager,
+        git_checkpoint=git_checkpoint,
+        cwd=str(project_dir),
+    )
+    resume_manager = ResumeManager(
+        checkpoint_manager=checkpoint_manager,
+        ledger_manager=ledger_manager,
+        cwd=str(project_dir),
     )
     long_run_graph = None  # --long-run / --resume 生成的 TaskGraph
 
@@ -365,6 +382,9 @@ async def async_main() -> None:
         plan_replan_callback=_plan_replan_cb,
         ledger=ledger,
         ledger_manager=ledger_manager,
+        checkpoint_manager=checkpoint_manager,
+        longrun_config=longrun_config,
+        task_graph=long_run_graph,
     )
 
     # 8. 启动 REPL
@@ -379,6 +399,9 @@ async def async_main() -> None:
         pending_graph=long_run_graph,
         long_run_deferred=args.long_run is True,
         token_budget=args.token_budget,
+        checkpoint_manager=checkpoint_manager,
+        resume_manager=resume_manager,
+        longrun_config=longrun_config,
     )
     try:
         await repl.run()

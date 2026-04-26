@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections import deque
 from dataclasses import dataclass, field
 from enum import Enum
@@ -293,6 +294,47 @@ class TaskGraph:
             if count > 0:
                 counts[status.value] = count
         return counts
+
+    def to_json(self) -> str:
+        """序列化为 JSON 字符串."""
+        nodes: dict[str, dict] = {}
+        for node_id, node in self.nodes.items():
+            nodes[node_id] = {
+                "id": node.id,
+                "description": node.description,
+                "dependencies": node.dependencies,
+                "status": node.status.value,
+                "files_involved": node.files_involved,
+                "verification": node.verification,
+                "result": node.result,
+                "error": node.error,
+                "retry_count": node.retry_count,
+            }
+        data = {
+            "original_goal": self.original_goal,
+            "nodes": nodes,
+        }
+        return json.dumps(data, ensure_ascii=False, indent=2)
+
+    @classmethod
+    def from_json(cls, json_str: str) -> TaskGraph:
+        """从 JSON 字符串反序列化."""
+        data = json.loads(json_str)
+        graph = cls()
+        graph.original_goal = data.get("original_goal", "")
+        for _nid, ndata in data.get("nodes", {}).items():
+            graph.add_task(TaskNode(
+                id=ndata["id"],
+                description=ndata["description"],
+                dependencies=ndata.get("dependencies", []),
+                status=TaskStatus(ndata.get("status", "pending")),
+                files_involved=ndata.get("files_involved", []),
+                verification=ndata.get("verification", ""),
+                result=ndata.get("result"),
+                error=ndata.get("error"),
+                retry_count=ndata.get("retry_count", 0),
+            ))
+        return graph
 
     def __len__(self) -> int:
         return len(self.nodes)

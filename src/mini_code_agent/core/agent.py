@@ -31,8 +31,12 @@ from .retry import RetryController
 from .verifier import VerificationResult, Verifier
 
 if TYPE_CHECKING:
+    from ..longrun.checkpoint_manager import CheckpointManager
+    from ..longrun.config import LongRunConfig
     from ..longrun.ledger_manager import TaskLedgerManager
+    from ..longrun.session_state import SessionState
     from ..longrun.task_ledger import TaskLedger
+    from .task_graph import TaskGraph
 
 logger = logging.getLogger(__name__)
 
@@ -152,6 +156,9 @@ class Agent:
         max_wall_time_seconds: float | None = None,
         ledger: TaskLedger | None = None,
         ledger_manager: TaskLedgerManager | None = None,
+        checkpoint_manager: CheckpointManager | None = None,
+        longrun_config: LongRunConfig | None = None,
+        task_graph: TaskGraph | None = None,
     ) -> None:
         self.llm_client = llm_client
         self.tool_registry = tool_registry
@@ -181,6 +188,13 @@ class Agent:
         # Ledger（外部记忆）
         self.ledger = ledger
         self.ledger_manager = ledger_manager
+
+        # Checkpoint / Resume 系统
+        self.checkpoint_manager = checkpoint_manager
+        self.longrun_config = longrun_config
+        self.task_graph = task_graph
+        self.last_checkpoint: SessionState | None = None
+        self.current_task_id: str | None = None
 
         # 当前任务期间追踪改动过哪些文件（供 Verifier 使用）
         self._files_changed: list[str] = []
@@ -335,6 +349,9 @@ class Agent:
             self.ledger_manager.update_resources(
                 self.ledger, tokens_this_round, 1, 0.0,
             )
+
+        # 自动 checkpoint 检查
+        await self._maybe_auto_checkpoint()
 
         return AgentResult(
             content=last_content,
@@ -1070,3 +1087,58 @@ class Agent:
         self.conversation.reset(self._build_full_system_prompt())
         if self.loop_guard:
             self.loop_guard.reset()
+
+    def inject_initial_message(self, text: str) -> None:
+        """把一条 user message 注入 messages 列表.
+
+        这条消息不会触发 LLM 调用，而是在下一次 run() 时作为初始上下文。
+        """
+        self.conversation.append(Message.user(text))
+
+    async def _maybe_auto_checkpoint(self) -> None:
+        """在 Agent 主循环每轮结束后检查是否需要自动 checkpoint."""
+        if (
+            self.checkpoint_manager is None
+            or self.ledger is None
+            or self.longrun_config is None
+            or self.task_graph is None
+        ):
+            return
+
+        trigger = self.checkpoint_manager.auto_checkpoint_policy(
+            self.ledger, self.last_checkpoint, self.longrun_config,
+        )
+        if trigger is not None:
+            try:
+                # 将当前 token 数记入 config snapshot 以便下次比较
+                config = self.longrun_config
+                config_dict = config.to_dict()
+                config_dict["_tokens_at_checkpoint"] = self.ledger.total_tokens_used
+
+                # 临时用一个带 _tokens_at_checkpoint 的 config
+                from ..longrun.config import LongRunConfig
+                snapshot_config = LongRunConfig.from_dict(config_dict)
+                snapshot_config_dict = snapshot_config.to_dict()
+                snapshot_config_dict["_tokens_at_checkpoint"] = self.ledger.total_tokens_used
+
+                # 需要传 messages 作为 list[dict]
+                msg_dicts: list[dict] = []
+                for m in self.messages:
+                    entry: dict = {"role": m.role.value if hasattr(m.role, "value") else str(m.role)}
+                    if isinstance(m.content, str):
+                        entry["content"] = m.content[:500]
+                    else:
+                        entry["content"] = str(m.content)[:500]
+                    msg_dicts.append(entry)
+
+                self.last_checkpoint = await self.checkpoint_manager.save_checkpoint(
+                    ledger=self.ledger,
+                    task_graph=self.task_graph,
+                    trigger=trigger,
+                    config=self.longrun_config,
+                    current_task_id=self.current_task_id,
+                    recent_messages=msg_dicts,
+                )
+                logger.info("自动 checkpoint 已创建: trigger=%s", trigger.value)
+            except Exception as e:
+                logger.warning("自动 checkpoint 失败: %s", e)

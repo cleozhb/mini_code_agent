@@ -26,7 +26,10 @@ from .confirm import confirm_tool_call
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from ..longrun.checkpoint_manager import CheckpointManager
+    from ..longrun.config import LongRunConfig
     from ..longrun.ledger_manager import TaskLedgerManager
+    from ..longrun.resume_manager import ResumeManager
 
 # ---------------------------------------------------------------------------
 # Token 费用估算（每百万 token 美元价格, 可按模型调整）
@@ -78,6 +81,9 @@ class REPL:
         pending_graph: object | None = None,
         long_run_deferred: bool = False,
         token_budget: int = 500_000,
+        checkpoint_manager: CheckpointManager | None = None,
+        resume_manager: ResumeManager | None = None,
+        longrun_config: LongRunConfig | None = None,
     ) -> None:
         self.agent = agent
         self.console = console or Console()
@@ -88,6 +94,9 @@ class REPL:
         self._pending_graph = pending_graph  # --long-run / --resume 预生成的图
         self._long_run_deferred = long_run_deferred  # --long-run 不带目标
         self._token_budget = token_budget
+        self._checkpoint_manager = checkpoint_manager
+        self._resume_manager = resume_manager
+        self._longrun_config = longrun_config
 
         # 斜杠命令补全
         self._completer = WordCompleter(
@@ -98,6 +107,7 @@ class REPL:
                 "/graph", "/graph-export",
                 "/status", "/ledger",
                 "/longrun",
+                "/pause", "/resume",
             ],
             sentence=True,  # 整条匹配，不拆词
         )
@@ -111,6 +121,9 @@ class REPL:
     async def run(self) -> None:
         """启动 REPL 主循环."""
         self._print_welcome()
+
+        # 启动时自动检测未完成的任务
+        await self._detect_unfinished_tasks()
 
         # --long-run / --resume：有预生成的 TaskGraph，直接执行
         if self._pending_graph is not None:
@@ -235,11 +248,20 @@ class REPL:
             await self._handle_longrun_command(longrun_arg)
             return True
 
+        if command == "/pause":
+            await self._handle_pause()
+            return True
+
+        if command == "/resume":
+            resume_arg = parts[1].strip() if len(parts) > 1 else ""
+            await self._handle_resume_command(resume_arg)
+            return True
+
         self.console.print(f"[red]未知命令: {command}[/red]")
         self.console.print(
             "[dim]可用命令: /quit  /clear  /cost  /model  /memory  /save  /plan"
             "  /undo  /checkpoints  /diff  /graph  /graph-export"
-            "  /status  /ledger  /longrun[/dim]"
+            "  /status  /ledger  /longrun  /pause  /resume[/dim]"
         )
         return True
 
@@ -435,21 +457,23 @@ class REPL:
 
         checkpoints = await cp.list_checkpoints()
         if not checkpoints:
-            self.console.print("[dim]暂无 checkpoint[/dim]")
-            return
+            self.console.print("[dim]暂无 git checkpoint[/dim]")
+        else:
+            lines = []
+            for i, c in enumerate(checkpoints):
+                lines.append(
+                    f"  {i + 1}. [{c.commit_hash[:8]}] {c.message}  "
+                    f"[dim]({c.timestamp})[/dim]"
+                )
 
-        lines = []
-        for i, c in enumerate(checkpoints):
-            lines.append(
-                f"  {i + 1}. [{c.commit_hash[:8]}] {c.message}  "
-                f"[dim]({c.timestamp})[/dim]"
-            )
+            self.console.print(Panel(
+                "\n".join(lines),
+                title=f"[bold]Git Checkpoints ({len(checkpoints)})[/bold]",
+                border_style="cyan",
+            ))
 
-        self.console.print(Panel(
-            "\n".join(lines),
-            title=f"[bold]Agent Checkpoints ({len(checkpoints)})[/bold]",
-            border_style="cyan",
-        ))
+        # 同时展示 session checkpoints
+        await self._show_session_checkpoints()
 
     async def _show_agent_diff(self) -> None:
         """查看 Agent 自最近 checkpoint 以来的所有修改."""
@@ -837,6 +861,260 @@ class REPL:
         # 检查里程碑
         manager._check_milestones(ledger)
 
+    async def _handle_pause(self) -> None:
+        """触发 USER_PAUSE checkpoint，暂停当前长程任务."""
+        if self._checkpoint_manager is None:
+            self.console.print("[red]Checkpoint 系统未初始化[/red]")
+            return
+
+        ledger = self.agent.ledger
+        if ledger is None:
+            self.console.print("[yellow]当前没有活跃的长程任务，无需暂停[/yellow]")
+            return
+
+        task_graph = self.agent.task_graph
+        if task_graph is None:
+            self.console.print("[yellow]当前没有 TaskGraph，无法创建 checkpoint[/yellow]")
+            return
+
+        config = self._longrun_config
+        if config is None:
+            from ..longrun.config import LongRunConfig
+            config = LongRunConfig()
+
+        from ..longrun.session_state import CheckpointTrigger
+
+        self.console.print("[dim]正在创建 checkpoint...[/dim]")
+        try:
+            # 收集最近消息
+            msg_dicts: list[dict] = []
+            for m in self.agent.messages[-20:]:
+                entry: dict = {"role": m.role.value if hasattr(m.role, "value") else str(m.role)}
+                if isinstance(m.content, str):
+                    entry["content"] = m.content[:500]
+                else:
+                    entry["content"] = str(m.content)[:500]
+                msg_dicts.append(entry)
+
+            state = await self._checkpoint_manager.save_checkpoint(
+                ledger=ledger,
+                task_graph=task_graph,
+                trigger=CheckpointTrigger.USER_PAUSE,
+                config=config,
+                current_task_id=self.agent.current_task_id,
+                recent_messages=msg_dicts,
+            )
+
+            # 更新 Ledger 状态为 PAUSED
+            from ..longrun.ledger_types import TaskRunStatus
+            ledger.status = TaskRunStatus.PAUSED
+            if self.agent.ledger_manager:
+                self.agent.ledger_manager.save(ledger)
+
+            self.console.print(
+                f"[green]已创建 checkpoint: {state.checkpoint_id[:8]}[/green]\n"
+                f"[dim]Git: {state.git_checkpoint_hash[:8]}  "
+                f"步数: {state.step_number}  "
+                f"子任务: {state.current_task_id or '(无)'}[/dim]"
+            )
+            self.console.print(
+                "[dim]任务已暂停。使用 /resume 恢复，或继续在 REPL 中操作[/dim]"
+            )
+
+        except Exception as e:
+            self.console.print(f"[red]创建 checkpoint 失败: {e}[/red]")
+
+    async def _handle_resume_command(self, arg: str) -> None:
+        """处理 /resume 命令.
+
+        /resume              — 恢复最近的 checkpoint
+        /resume --list       — 列出所有任务及其 checkpoint
+        /resume --id <id>    — 恢复指定 checkpoint
+        """
+        if self._checkpoint_manager is None or self._resume_manager is None:
+            self.console.print("[red]Checkpoint/Resume 系统未初始化[/red]")
+            return
+
+        parts = arg.split()
+
+        if parts and parts[0] == "--list":
+            await self._resume_list()
+            return
+
+        if len(parts) >= 2 and parts[0] == "--id":
+            checkpoint_id = parts[1]
+            await self._resume_by_id(checkpoint_id)
+            return
+
+        # 默认：恢复最近的 checkpoint
+        await self._resume_latest()
+
+    async def _resume_list(self) -> None:
+        """列出所有任务及其最近 checkpoint."""
+        assert self._checkpoint_manager is not None
+        assert self.agent.ledger_manager is not None
+
+        metas = self.agent.ledger_manager.list_all()
+        if not metas:
+            self.console.print("[dim]没有可恢复的任务[/dim]")
+            return
+
+        lines: list[str] = []
+        for m in metas:
+            checkpoints = self._checkpoint_manager.list_checkpoints(m.task_id)
+            cp_count = len(checkpoints)
+            latest_cp = checkpoints[0] if checkpoints else None
+            cp_info = ""
+            if latest_cp:
+                cp_info = (
+                    f"最近 cp: {latest_cp.id[:8]} "
+                    f"({latest_cp.trigger.value}, step {latest_cp.step_number})"
+                )
+            else:
+                cp_info = "无 checkpoint"
+
+            lines.append(
+                f"  {m.task_id[:8]}  [{m.status.value:12s}]  "
+                f"{m.goal[:50]:50s}  "
+                f"({m.completed_tasks} tasks, {m.total_tokens_used:,} tokens)  "
+                f"{cp_info}"
+            )
+
+        self.console.print(Panel(
+            "\n".join(lines),
+            title=f"[bold]可恢复的任务 ({len(metas)})[/bold]",
+            border_style="cyan",
+        ))
+        self.console.print("[dim]使用 /resume --id <checkpoint_id> 恢复指定 checkpoint[/dim]")
+
+    async def _resume_latest(self) -> None:
+        """恢复最近的 checkpoint."""
+        assert self._checkpoint_manager is not None
+        assert self._resume_manager is not None
+        assert self.agent.ledger_manager is not None
+
+        # 找最近有 checkpoint 的任务
+        metas = self.agent.ledger_manager.list_all()
+        for m in metas:
+            latest = self._checkpoint_manager.find_latest(m.task_id)
+            if latest is not None:
+                await self._do_resume(m.task_id, latest.checkpoint_id)
+                return
+
+        self.console.print("[dim]没有可恢复的 checkpoint[/dim]")
+
+    async def _resume_by_id(self, checkpoint_id: str) -> None:
+        """恢复指定 checkpoint（需要先找到它属于哪个 task）."""
+        assert self._checkpoint_manager is not None
+        assert self.agent.ledger_manager is not None
+
+        # 搜索所有任务找到该 checkpoint
+        metas = self.agent.ledger_manager.list_all()
+        for m in metas:
+            checkpoints = self._checkpoint_manager.list_checkpoints(m.task_id)
+            for cp in checkpoints:
+                if cp.id.startswith(checkpoint_id):
+                    await self._do_resume(m.task_id, cp.id)
+                    return
+
+        self.console.print(f"[red]未找到 checkpoint: {checkpoint_id}[/red]")
+
+    async def _do_resume(self, task_id: str, checkpoint_id: str) -> None:
+        """执行恢复流程."""
+        assert self._resume_manager is not None
+
+        self.console.print(f"[dim]正在恢复 checkpoint {checkpoint_id[:8]}...[/dim]")
+
+        try:
+            context = await self._resume_manager.prepare_resume(task_id, checkpoint_id)
+        except Exception as e:
+            self.console.print(f"[red]恢复失败: {e}[/red]")
+            return
+
+        # 展示 warnings
+        for w in context.warnings:
+            self.console.print(f"[yellow]⚠ {w}[/yellow]")
+
+        # 展示恢复信息
+        state = context.session_state
+        self.console.print(Panel(
+            f"任务: {context.ledger.goal}\n"
+            f"暂停原因: {state.trigger.value}\n"
+            f"步数: {state.step_number}\n"
+            f"Git: {state.git_checkpoint_hash[:8]}\n"
+            f"子任务: {state.current_task_id or '(无)'}",
+            title="[bold]恢复 Checkpoint[/bold]",
+            border_style="green",
+        ))
+
+        # 确认
+        self.console.print(
+            "\n[bold]操作：[/bold] "
+            "[green]y[/green]=恢复  "
+            "[red]n[/red]=取消"
+        )
+        try:
+            ans = await self._prompt_session.prompt_async(
+                HTML("<b>恢复到此 checkpoint？ [y/n]: </b>")
+            )
+        except (EOFError, KeyboardInterrupt):
+            self.console.print("[yellow]已取消[/yellow]")
+            return
+
+        if (ans or "").strip().lower() not in ("y", "yes", ""):
+            self.console.print("[yellow]已取消[/yellow]")
+            return
+
+        # 更新 Agent 状态
+        self.agent.ledger = context.ledger
+        self.agent.task_graph = context.task_graph
+        self.agent.current_task_id = state.current_task_id
+        self._current_graph = context.task_graph
+
+        # 更新 Ledger 状态为 RUNNING
+        from ..longrun.ledger_types import TaskRunStatus
+        context.ledger.status = TaskRunStatus.RUNNING
+        if self.agent.ledger_manager:
+            self.agent.ledger_manager.save(context.ledger)
+
+        # 注入恢复 prompt
+        self.agent.inject_initial_message(context.initial_prompt)
+
+        self.console.print("[green]已恢复！Agent 将从断点继续执行。[/green]")
+        self.console.print("[dim]输入消息或使用 /status 查看状态[/dim]")
+
+    async def _show_session_checkpoints(self) -> None:
+        """列出当前任务的所有 session checkpoint（/checkpoints 增强版）."""
+        if self._checkpoint_manager is None:
+            return
+
+        ledger = self.agent.ledger
+        if ledger is None:
+            return
+
+        checkpoints = self._checkpoint_manager.list_checkpoints(ledger.task_id)
+        if not checkpoints:
+            return
+
+        self.console.print()
+        lines: list[str] = []
+        for i, cp in enumerate(checkpoints):
+            lines.append(
+                f"  {i + 1}. [{cp.id[:8]}]  "
+                f"{cp.trigger.value:20s}  "
+                f"step={cp.step_number:3d}  "
+                f"tokens={cp.token_count:,}  "
+                f"git={cp.git_hash[:8]}  "
+                f"task={cp.current_task_id or '(无)'}  "
+                f"[dim]({cp.created_at.isoformat()[:19]})[/dim]"
+            )
+
+        self.console.print(Panel(
+            "\n".join(lines),
+            title=f"[bold]Session Checkpoints ({len(checkpoints)})[/bold]",
+            border_style="cyan",
+        ))
+
     async def _run_agent_plan(self, user_input: str) -> None:
         """Plan mode：调用非流式 Agent.run()，中间通过回调渲染进度."""
         self.console.print()
@@ -1004,6 +1282,36 @@ class REPL:
             f"\n[dim]tokens: {usage.input_tokens:,} in / {usage.output_tokens:,} out[/dim]"
         )
 
+    async def _detect_unfinished_tasks(self) -> None:
+        """启动时自动检测是否有未完成的长程任务."""
+        if self.agent.ledger_manager is None:
+            return
+        if self.agent.ledger is not None:
+            # 已经有活跃的 ledger（可能来自 --resume）
+            return
+
+        from ..longrun.ledger_types import TaskRunStatus
+
+        metas = self.agent.ledger_manager.list_all()
+        unfinished = [
+            m for m in metas
+            if m.status in (TaskRunStatus.RUNNING, TaskRunStatus.PAUSED)
+        ]
+        if not unfinished:
+            return
+
+        self.console.print()
+        self.console.print("[yellow]发现未完成的任务：[/yellow]")
+        for m in unfinished:
+            self.console.print(
+                f"  {m.task_id[:8]}  [{m.status.value}]  "
+                f"{m.goal[:60]}  "
+                f"({m.completed_tasks} tasks, {m.total_tokens_used:,} tokens)"
+            )
+        self.console.print(
+            "[dim]使用 /resume 恢复，或 /longrun 开始新任务[/dim]"
+        )
+
     def _print_welcome(self) -> None:
         """打印欢迎信息."""
         model = self.agent.llm_client.model
@@ -1023,6 +1331,8 @@ class REPL:
             f"  /status       — 查看 Task Ledger 状态\n"
             f"  /ledger       — 查看/导出 Ledger 详情\n"
             f"  /longrun      — 启动长程任务（交互输入或 /longrun 目标）\n"
+            f"  /pause        — 暂停当前长程任务（创建 checkpoint）\n"
+            f"  /resume       — 恢复已暂停的长程任务\n"
             f"  /undo         — 回滚最近一次 Agent 修改\n"
             f"  /checkpoints  — 列出所有 checkpoint\n"
             f"  /diff         — 查看 Agent 的所有修改\n"
