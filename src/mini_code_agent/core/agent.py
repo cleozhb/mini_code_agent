@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from ..longrun.ledger_manager import TaskLedgerManager
     from ..longrun.session_state import SessionState
     from ..longrun.task_ledger import TaskLedger
+    from ..verify.verifier import IncrementalVerifier
     from .task_graph import TaskGraph
 
 logger = logging.getLogger(__name__)
@@ -159,6 +160,7 @@ class Agent:
         checkpoint_manager: CheckpointManager | None = None,
         longrun_config: LongRunConfig | None = None,
         task_graph: TaskGraph | None = None,
+        incremental_verifier: IncrementalVerifier | None = None,
     ) -> None:
         self.llm_client = llm_client
         self.tool_registry = tool_registry
@@ -198,6 +200,9 @@ class Agent:
 
         # 当前任务期间追踪改动过哪些文件（供 Verifier 使用）
         self._files_changed: list[str] = []
+
+        # Incremental Verifier（可选）—— 每次 Edit 后做层级 1 快速验证
+        self.incremental_verifier = incremental_verifier
 
         # 使用 ConversationManager 管理消息
         self.conversation = ConversationManager(llm_client=llm_client)
@@ -919,6 +924,11 @@ class Agent:
             content = result.output
             is_error = False
 
+        # Incremental Verifier — 层级 1 快速反馈
+        warning = await self._maybe_quick_verify(tool.name, tool_call.arguments, result)
+        if warning:
+            content = (content or "") + warning
+
         return Message.tool(
             LLMToolResult(
                 tool_call_id=tool_call.id,
@@ -1025,6 +1035,12 @@ class Agent:
             content = result.output
             is_error = False
 
+        # Incremental Verifier — 层级 1 快速反馈
+        warning = await self._maybe_quick_verify(tool.name, tool_call.arguments, result)
+        if warning:
+            content = (content or "") + warning
+            result.output = (result.output or "") + warning
+
         msg = Message.tool(
             LLMToolResult(
                 tool_call_id=tool_call.id,
@@ -1033,6 +1049,41 @@ class Agent:
             )
         )
         return msg, result
+
+    async def _maybe_quick_verify(
+        self,
+        tool_name: str,
+        arguments: dict[str, Any],
+        result: ExecToolResult,
+    ) -> str:
+        """如果配置了 incremental_verifier 且这是写文件类工具，跑一次层级 1 快检.
+
+        Returns:
+            一段附加到 tool 输出末尾的警告字符串（无问题或未配置时返回 ""）
+        """
+        if self.incremental_verifier is None or self.project_path is None:
+            return ""
+        if tool_name not in WRITE_TOOL_NAMES:
+            return ""
+        if result.is_error:
+            return ""
+        path = arguments.get("path") or arguments.get("file_path")
+        if not path or not isinstance(path, str):
+            return ""
+
+        try:
+            quick = await self.incremental_verifier.verify_after_edit(
+                files_changed=[path],
+                project_path=self.project_path,
+            )
+        except Exception as e:  # noqa: BLE001 — 验证失败不能挂掉 Agent
+            logger.debug("incremental quick verify error: %s", e)
+            return ""
+
+        if quick.overall_passed:
+            return ""
+
+        return f"\n\n[VERIFICATION WARNING]\n{quick.summary()}"
 
     def _track_file_change(
         self,

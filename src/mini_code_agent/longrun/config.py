@@ -23,6 +23,13 @@ class LongRunConfig:
     # === 超时 ===
     max_wall_time_seconds: float = 3600.0  # 墙钟时间上限（秒）
 
+    # === Incremental Verifier ===
+    quick_check_after_every_edit: bool = True
+    unit_test_after_subtask: bool = True
+    quick_check_timeout_seconds: int = 5
+    unit_test_timeout_seconds: int = 30
+    unit_test_timeout_shared_module: int = 60  # 命中公共模块规则时的超时
+
     def to_dict(self) -> dict:
         """序列化为 JSON 兼容的 dict."""
         return {
@@ -31,6 +38,11 @@ class LongRunConfig:
             "checkpoint_on_subtask_complete": self.checkpoint_on_subtask_complete,
             "max_checkpoints": self.max_checkpoints,
             "max_wall_time_seconds": self.max_wall_time_seconds,
+            "quick_check_after_every_edit": self.quick_check_after_every_edit,
+            "unit_test_after_subtask": self.unit_test_after_subtask,
+            "quick_check_timeout_seconds": self.quick_check_timeout_seconds,
+            "unit_test_timeout_seconds": self.unit_test_timeout_seconds,
+            "unit_test_timeout_shared_module": self.unit_test_timeout_shared_module,
         }
 
     @classmethod
@@ -42,4 +54,11 @@ class LongRunConfig:
             checkpoint_on_subtask_complete=d.get("checkpoint_on_subtask_complete", True),
             max_checkpoints=d.get("max_checkpoints", 10),
             max_wall_time_seconds=d.get("max_wall_time_seconds", 3600.0),
+            quick_check_after_every_edit=d.get("quick_check_after_every_edit", True),
+            unit_test_after_subtask=d.get("unit_test_after_subtask", True),
+            quick_check_timeout_seconds=d.get("quick_check_timeout_seconds", 5),
+            unit_test_timeout_seconds=d.get("unit_test_timeout_seconds", 30),
+            unit_test_timeout_shared_module=d.get(
+                "unit_test_timeout_shared_module", 60
+            ),
         )
