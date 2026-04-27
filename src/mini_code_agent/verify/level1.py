@@ -304,18 +304,22 @@ class QuickVerifier:
         proj_path = Path(project_path).resolve()
         file_dir = Path(file_full_path).resolve().parent
 
-        # 收集项目内可能的顶层包目录
+        # 收集项目内可能的顶层包目录。
+        # 不强制要求 __init__.py — 现代 Python 支持 namespace 包，
+        # 用户也可能正在创建包时尚未补 __init__.py。
         local_top: set[str] = set()
         for candidate in proj_path.iterdir() if proj_path.exists() else []:
-            if candidate.is_dir() and (candidate / "__init__.py").exists():
+            if candidate.is_dir() and not candidate.name.startswith("."):
                 local_top.add(candidate.name)
-            if candidate.is_file() and candidate.suffix == ".py":
+            elif candidate.is_file() and candidate.suffix == ".py":
                 local_top.add(candidate.stem)
-        # src/ layout
+        # src/ layout — 把 src 自身视为可解析（支持 `from src.x import y`），
+        # 同时把 src/ 下的子目录也加进 local_top（支持 `from x import y`）
         src_dir = proj_path / "src"
-        if src_dir.exists():
+        if src_dir.exists() and src_dir.is_dir():
+            local_top.add("src")
             for candidate in src_dir.iterdir():
-                if candidate.is_dir() and (candidate / "__init__.py").exists():
+                if candidate.is_dir() and not candidate.name.startswith("."):
                     local_top.add(candidate.name)
 
         stdlib_names = _stdlib_module_names()

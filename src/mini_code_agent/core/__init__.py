@@ -5,12 +5,15 @@ from .agent import (
     AgentError,
     AgentEvent,
     AgentEventType,
+    AgentObserver,
     AgentResult,
+    AgentStuckError,
     ConfirmCallback,
     PlanConfirmCallback,
     PlanProgressCallback,
     PlanReplanCallback,
 )
+from .subtask_runner import GraphContext, SubtaskRunner
 from .graph_executor import GraphExecutor, GraphResult, run_verification
 from .graph_planner import GRAPH_PLANNER_SYSTEM_PROMPT, GraphPlanner, GraphPlannerError
 from .planner import (
@@ -30,8 +33,12 @@ __all__ = [
     "AgentError",
     "AgentEvent",
     "AgentEventType",
+    "AgentObserver",
     "AgentResult",
+    "AgentStuckError",
     "AttemptRecord",
+    "GraphContext",
+    "SubtaskRunner",
     "ConfirmCallback",
     "CyclicDependencyError",
     "DEFAULT_SYSTEM_PROMPT",

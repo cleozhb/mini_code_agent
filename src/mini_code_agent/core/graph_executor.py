@@ -6,11 +6,22 @@ import asyncio
 import logging
 import re
 import time
+import uuid
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from ..llm.base import TokenUsage
 from .agent import Agent, AgentResult
 from .task_graph import TaskGraph, TaskNode, TaskStatus
+
+if TYPE_CHECKING:
+    from ..artifacts import SubtaskArtifact
+    from ..longrun.checkpoint_manager import CheckpointManager
+    from ..longrun.config import LongRunConfig
+    from ..longrun.ledger_manager import TaskLedgerManager
+    from ..longrun.session_state import SessionState
+    from ..longrun.task_ledger import TaskLedger
+    from .subtask_runner import SubtaskRunner
 
 logger = logging.getLogger(__name__)
 
@@ -153,6 +164,10 @@ class GraphExecutor:
         max_retries: int = 2,
         blocked_callback: object | None = None,
         progress_callback: object | None = None,
+        subtask_runner: "SubtaskRunner | None" = None,
+        ledger_manager: "TaskLedgerManager | None" = None,
+        checkpoint_manager: "CheckpointManager | None" = None,
+        longrun_config: "LongRunConfig | None" = None,
     ) -> None:
         """
         Args:
@@ -161,12 +176,21 @@ class GraphExecutor:
             max_retries: 每个子任务最大重试次数。
             blocked_callback: async (graph, failed, blocked) -> "replan" | "skip" | "abort"
             progress_callback: async (task_index, total, task, phase) -> None
+            subtask_runner: 走 Artifact 协议的子任务执行器；提供它时 execute_with_ledger 可用。
+            ledger_manager: execute_with_ledger 需要 — 即时把任务结果写进 Ledger。
+            checkpoint_manager: execute_with_ledger 需要 — 子任务完成后判断是否 checkpoint。
+            longrun_config: execute_with_ledger 需要 — checkpoint 阈值与重试上限。
         """
         self.agent_factory = agent_factory
         self.project_path = project_path
         self.max_retries = max_retries
         self.blocked_callback = blocked_callback
         self.progress_callback = progress_callback
+        self.subtask_runner = subtask_runner
+        self.ledger_manager = ledger_manager
+        self.checkpoint_manager = checkpoint_manager
+        self.longrun_config = longrun_config
+        self.last_checkpoint: "SessionState | None" = None
 
     async def execute(
         self,
@@ -306,6 +330,245 @@ class GraphExecutor:
                 1 for n in graph.nodes.values() if n.status == TaskStatus.SKIPPED
             ),
         )
+
+    async def execute_with_ledger(
+        self,
+        graph: TaskGraph,
+        ledger: "TaskLedger",
+        project_path: str,
+    ) -> GraphResult:
+        """长程任务执行路径：经 SubtaskRunner 产出 Artifact，即时写 Ledger.
+
+        与 execute() 的区别：
+        - 不直接调 Agent.run，而是经 SubtaskRunner 走 Artifact 协议
+        - 子任务完成后立即把 CompletedTaskRecord / FailedAttemptRecord 写入 Ledger
+        - 根据 Artifact.confidence 分别处理（DONE / UNCERTAIN / PARTIAL / STUCK）
+        - 自动触发 checkpoint
+        """
+        if self.subtask_runner is None or self.ledger_manager is None:
+            raise RuntimeError(
+                "execute_with_ledger 需要 subtask_runner 和 ledger_manager；"
+                "未提供时请使用 execute()"
+            )
+
+        from ..artifacts import Confidence
+        from ..longrun.ledger_types import ActiveIssue, TaskRunStatus
+
+        start_time = time.monotonic()
+        total_steps = 0
+        total_tokens = 0
+        max_retries = self.max_retries
+        budget_exhausted = False
+
+        # 进入 RUNNING 状态
+        ledger.status = TaskRunStatus.RUNNING
+        self.ledger_manager.update_phase(ledger, "execution")
+
+        while not graph.is_complete() and not graph.is_blocked():
+            # Budget 阻断
+            if (
+                ledger.token_budget > 0
+                and ledger.total_tokens_used >= ledger.token_budget
+            ):
+                logger.warning(
+                    "token 预算耗尽 (%d/%d)，中止执行",
+                    ledger.total_tokens_used, ledger.token_budget,
+                )
+                self.ledger_manager.record_active_issue(
+                    ledger,
+                    ActiveIssue(
+                        id=str(uuid.uuid4()),
+                        description=(
+                            f"Token 预算已耗尽 ({ledger.total_tokens_used:,}"
+                            f"/{ledger.token_budget:,})，剩余子任务未执行。"
+                        ),
+                        source_task_id=ledger.current_task_id or "",
+                        severity="blocker",
+                        first_seen_step=ledger.total_steps,
+                    ),
+                )
+                budget_exhausted = True
+                break
+
+            ready = graph.get_ready_tasks()
+            if not ready:
+                break
+
+            # 每轮一个任务（串行）
+            task = ready[0]
+            total_steps += 1
+            completed_count = sum(
+                1 for n in graph.nodes.values() if n.status == TaskStatus.COMPLETED
+            )
+            total_count = len(graph.nodes)
+
+            if self.progress_callback:
+                await self.progress_callback(
+                    completed_count + 1, total_count, task, "start"
+                )
+
+            graph.mark_running(task.id)
+            self.ledger_manager.update_current_task(ledger, task.id)
+
+            # 构造 GraphContext
+            from .subtask_runner import GraphContext
+            ctx = GraphContext(
+                original_goal=graph.original_goal or ledger.goal,
+                completed_summaries=[
+                    ct.self_summary for ct in ledger.completed_tasks[-5:]
+                ],
+                project_path=project_path,
+                allowed_paths=self.subtask_runner.derive_allowed_paths(task),
+            )
+
+            # 执行子任务
+            try:
+                artifact = await self.subtask_runner.run(task, ctx)
+            except Exception as e:
+                # 基础设施错误
+                logger.exception("子任务 %s 基础设施错误", task.id)
+                graph.mark_failed(task.id, f"infrastructure error: {e}")
+                if self.progress_callback:
+                    await self.progress_callback(
+                        completed_count + 1, total_count, task, "end_fail"
+                    )
+                continue
+
+            total_tokens += artifact.resource_usage.tokens_total
+
+            # 根据 confidence 处理
+            if artifact.confidence == Confidence.DONE:
+                self.ledger_manager.record_task_completed(ledger, artifact)
+                graph.mark_completed(task.id, artifact.self_summary)
+                if self.progress_callback:
+                    await self.progress_callback(
+                        completed_count + 1, total_count, task, "end_ok"
+                    )
+
+            elif artifact.confidence == Confidence.UNCERTAIN:
+                self.ledger_manager.record_task_completed(ledger, artifact)
+                self.ledger_manager.record_active_issue(
+                    ledger,
+                    ActiveIssue(
+                        id=str(uuid.uuid4()),
+                        description=(
+                            f"子任务 {task.id} 验证未通过但 Agent 认为已完成: "
+                            f"{artifact.self_summary[:120]}"
+                        ),
+                        source_task_id=task.id,
+                        severity="warning",
+                        first_seen_step=ledger.total_steps,
+                    ),
+                )
+                graph.mark_completed(task.id, artifact.self_summary)
+                if self.progress_callback:
+                    await self.progress_callback(
+                        completed_count + 1, total_count, task, "end_ok"
+                    )
+
+            elif artifact.confidence == Confidence.PARTIAL:
+                self.ledger_manager.record_task_completed(ledger, artifact)
+                for q in artifact.open_questions:
+                    self.ledger_manager.record_active_issue(
+                        ledger,
+                        ActiveIssue(
+                            id=str(uuid.uuid4()),
+                            description=q,
+                            source_task_id=task.id,
+                            severity="info",
+                            first_seen_step=ledger.total_steps,
+                        ),
+                    )
+                graph.mark_completed(task.id, artifact.self_summary)
+                if self.progress_callback:
+                    await self.progress_callback(
+                        completed_count + 1, total_count, task, "end_ok"
+                    )
+
+            else:  # Confidence.STUCK
+                self.ledger_manager.record_task_failed(
+                    ledger, artifact, failure_reason="agent declared STUCK",
+                )
+                if task.retry_count < max_retries:
+                    task.retry_count += 1
+                    task.status = TaskStatus.PENDING
+                    if self.progress_callback:
+                        await self.progress_callback(
+                            completed_count + 1, total_count, task, "retry"
+                        )
+                else:
+                    graph.mark_failed(task.id, "max retries exhausted (STUCK)")
+                    if self.progress_callback:
+                        await self.progress_callback(
+                            completed_count + 1, total_count, task, "end_fail"
+                        )
+
+            # 自动 checkpoint
+            await self._maybe_checkpoint(ledger, graph)
+
+        wall_time = time.monotonic() - start_time
+
+        # 收尾 Ledger — 不再依赖调用方
+        ledger.current_task_id = None
+        tasks_failed_count = sum(
+            1 for n in graph.nodes.values() if n.status == TaskStatus.FAILED
+        )
+        if budget_exhausted:
+            ledger.status = TaskRunStatus.PAUSED
+        elif tasks_failed_count > 0:
+            ledger.status = TaskRunStatus.FAILED
+        else:
+            ledger.status = TaskRunStatus.COMPLETED
+        self.ledger_manager.update_phase(ledger, "done")
+        # update_resources 既会保存 ledger，也会刷新 token_budget_remaining
+        self.ledger_manager.update_resources(
+            ledger, tokens=0, steps=0, wall_time=wall_time,
+        )
+
+        return GraphResult(
+            graph=graph,
+            total_steps=total_steps,
+            total_tokens=total_tokens,
+            wall_time=wall_time,
+            tasks_completed=sum(
+                1 for n in graph.nodes.values() if n.status == TaskStatus.COMPLETED
+            ),
+            tasks_failed=tasks_failed_count,
+            tasks_skipped=sum(
+                1 for n in graph.nodes.values() if n.status == TaskStatus.SKIPPED
+            ),
+        )
+
+    async def _maybe_checkpoint(
+        self,
+        ledger: "TaskLedger",
+        graph: TaskGraph,
+    ) -> None:
+        if (
+            self.checkpoint_manager is None
+            or self.longrun_config is None
+        ):
+            return
+        try:
+            trigger = self.checkpoint_manager.auto_checkpoint_policy(
+                ledger, self.last_checkpoint, self.longrun_config,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug("auto_checkpoint_policy error: %s", e)
+            return
+        if trigger is None:
+            return
+        try:
+            self.last_checkpoint = await self.checkpoint_manager.save_checkpoint(
+                ledger=ledger,
+                task_graph=graph,
+                trigger=trigger,
+                config=self.longrun_config,
+                current_task_id=ledger.current_task_id,
+                recent_messages=[],
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.warning("自动 checkpoint 失败: %s", e)
 
     def _build_task_prompt(self, graph: TaskGraph, task: TaskNode) -> str:
         """构建子任务的 prompt，包含上下文信息."""

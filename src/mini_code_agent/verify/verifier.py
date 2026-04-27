@@ -114,7 +114,7 @@ def attach_verification_to_builder(
     )
     builder.attach_self_verification(self_verif)
 
-    if not result.overall_passed and builder._confidence == Confidence.DONE:
+    if not result.overall_passed and builder.confidence == Confidence.DONE:
         builder.set_confidence(
             Confidence.UNCERTAIN,
             f"验证未通过：{result.summary()}",

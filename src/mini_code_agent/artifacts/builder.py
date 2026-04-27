@@ -152,6 +152,11 @@ class ArtifactBuilder:
         self._confidence = confidence
         self._self_summary = summary
 
+    @property
+    def confidence(self) -> Confidence | None:
+        """当前已设置的 confidence；未设置返回 None."""
+        return self._confidence
+
     def add_open_question(self, question: str) -> None:
         """添加一个遗留疑问."""
         self._check_not_finalized()

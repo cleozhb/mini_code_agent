@@ -261,11 +261,7 @@ async def async_main() -> None:
     async def _graph_progress_cb(task_index, total, task, phase):
         render_task_progress(task_index, total, task, phase, console)
 
-    graph_executor = GraphExecutor(
-        project_path=str(project_dir),
-        blocked_callback=_graph_blocked_cb,
-        progress_callback=_graph_progress_cb,
-    )
+    # GraphExecutor 在下面拿到 SubtaskRunner / Ledger / Checkpoint 之后再实例化
 
     # 7. 创建 Agent
     from mini_code_agent.core import Agent
@@ -365,6 +361,16 @@ async def async_main() -> None:
             f"里程碑: {len(ledger.milestones)} 个[/dim]"
         )
 
+    # 7c. Artifact + Incremental Verifier — L1 集成所需
+    from mini_code_agent.artifacts import ArtifactStore
+    from mini_code_agent.verify.verifier import IncrementalVerifier
+    from mini_code_agent.core import SubtaskRunner
+
+    artifact_store = ArtifactStore(
+        storage_dir=str(project_dir / ".agent" / "artifacts"),
+    )
+    incremental_verifier = IncrementalVerifier()
+
     agent = Agent(
         llm_client=llm_client,
         tool_registry=registry,
@@ -385,6 +391,24 @@ async def async_main() -> None:
         checkpoint_manager=checkpoint_manager,
         longrun_config=longrun_config,
         task_graph=long_run_graph,
+        incremental_verifier=incremental_verifier,
+    )
+
+    subtask_runner = SubtaskRunner(
+        agent=agent,
+        artifact_store=artifact_store,
+        verifier=incremental_verifier,
+        git_checkpoint=git_checkpoint,
+    )
+
+    graph_executor = GraphExecutor(
+        project_path=str(project_dir),
+        blocked_callback=_graph_blocked_cb,
+        progress_callback=_graph_progress_cb,
+        subtask_runner=subtask_runner,
+        ledger_manager=ledger_manager,
+        checkpoint_manager=checkpoint_manager,
+        longrun_config=longrun_config,
     )
 
     # 8. 启动 REPL
@@ -401,6 +425,7 @@ async def async_main() -> None:
         token_budget=args.token_budget,
         checkpoint_manager=checkpoint_manager,
         resume_manager=resume_manager,
+        artifact_store=artifact_store,
         longrun_config=longrun_config,
     )
     try:

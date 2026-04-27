@@ -26,6 +26,7 @@ from .confirm import confirm_tool_call
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from ..artifacts import ArtifactStore
     from ..longrun.checkpoint_manager import CheckpointManager
     from ..longrun.config import LongRunConfig
     from ..longrun.ledger_manager import TaskLedgerManager
@@ -84,6 +85,7 @@ class REPL:
         checkpoint_manager: CheckpointManager | None = None,
         resume_manager: ResumeManager | None = None,
         longrun_config: LongRunConfig | None = None,
+        artifact_store: ArtifactStore | None = None,
     ) -> None:
         self.agent = agent
         self.console = console or Console()
@@ -97,6 +99,7 @@ class REPL:
         self._checkpoint_manager = checkpoint_manager
         self._resume_manager = resume_manager
         self._longrun_config = longrun_config
+        self._artifact_store = artifact_store
 
         # 斜杠命令补全
         self._completer = WordCompleter(
@@ -108,6 +111,7 @@ class REPL:
                 "/status", "/ledger",
                 "/longrun",
                 "/pause", "/resume",
+                "/artifacts",
             ],
             sentence=True,  # 整条匹配，不拆词
         )
@@ -255,6 +259,11 @@ class REPL:
         if command == "/resume":
             resume_arg = parts[1].strip() if len(parts) > 1 else ""
             await self._handle_resume_command(resume_arg)
+            return True
+
+        if command == "/artifacts":
+            arg = parts[1].strip() if len(parts) > 1 else ""
+            await self._handle_artifacts_command(arg)
             return True
 
         self.console.print(f"[red]未知命令: {command}[/red]")
@@ -684,10 +693,24 @@ class REPL:
             ledger.status = TaskRunStatus.RUNNING
             manager.update_phase(ledger, "execution")
 
-        # 执行
+        # 执行（L1 集成路径：SubtaskRunner 在子任务完成时即时写 Ledger）
         self.console.print()
         try:
-            result = await self.graph_executor.execute(graph, self.agent)
+            if (
+                ledger is not None
+                and getattr(self.graph_executor, "subtask_runner", None) is not None
+            ):
+                cwd = "."
+                try:
+                    from pathlib import Path
+                    cwd = str(Path(".").resolve())
+                except Exception:
+                    pass
+                result = await self.graph_executor.execute_with_ledger(
+                    graph, ledger, cwd,
+                )
+            else:
+                result = await self.graph_executor.execute(graph, self.agent)
         except KeyboardInterrupt:
             self.console.print("\n[yellow]已中断，进入 REPL 可用 /status 查看进度[/yellow]")
             return
@@ -699,13 +722,13 @@ class REPL:
         self._current_graph = result.graph
         render_graph_result(result, self.console)
 
-        # 更新 Ledger 完成状态
-        if ledger and manager:
-            from mini_code_agent.core.task_graph import TaskStatus as GraphTaskStatus
+        # L1 路径下 execute_with_ledger 自己会收尾 status/phase/wall_time；
+        # 旧 execute() 路径（无 SubtaskRunner）仍由 REPL 收尾。
+        if (
+            ledger and manager
+            and getattr(self.graph_executor, "subtask_runner", None) is None
+        ):
             from mini_code_agent.longrun.ledger_types import TaskRunStatus
-
-            # 从 graph 同步已完成子任务到 ledger.completed_tasks
-            self._sync_completed_tasks_to_ledger(result.graph, ledger, manager)
 
             if result.tasks_failed == 0:
                 ledger.status = TaskRunStatus.COMPLETED
@@ -813,53 +836,54 @@ class REPL:
 
         await self._start_longrun(goal, self._token_budget)
 
-    def _sync_completed_tasks_to_ledger(self, graph, ledger, manager) -> None:
-        """从已执行的 TaskGraph 同步已完成/失败的子任务到 Ledger.
+    async def _handle_artifacts_command(self, arg: str) -> None:
+        """/artifacts [show <artifact_id>] — 列出当前任务的 Artifact 或展示某个详情."""
+        if self._artifact_store is None:
+            self.console.print("[red]ArtifactStore 未初始化[/red]")
+            return
 
-        GraphExecutor 不直接操作 Ledger，所以在图执行完成后需要
-        从 graph 的 COMPLETED 节点补充 CompletedTaskRecord。
-        """
-        from uuid import uuid4
+        ledger = self.agent.ledger
+        if ledger is None:
+            self.console.print("[yellow]当前没有活跃的长程任务[/yellow]")
+            return
 
-        from mini_code_agent.core.task_graph import TaskStatus as GraphTaskStatus
-        from mini_code_agent.longrun.ledger_types import (
-            CompletedTaskRecord,
-            FailedAttemptRecord,
-        )
+        parts = arg.split(maxsplit=1)
+        if parts and parts[0] == "show" and len(parts) > 1:
+            artifact_id = parts[1].strip()
+            try:
+                art = self._artifact_store.load(artifact_id)
+            except FileNotFoundError:
+                self.console.print(f"[red]找不到 Artifact: {artifact_id}[/red]")
+                return
+            self.console.print(art.summary_for_reviewer())
+            self.console.print("\n[dim]--- diff preview ---[/dim]")
+            self.console.print(art.diff_preview(max_lines=80))
+            return
 
-        existing_ids = {ct.task_id for ct in ledger.completed_tasks}
+        # 默认：列出当前 Ledger 引用过的所有 task 的 Artifact
+        task_ids: list[str] = []
+        for ct in ledger.completed_tasks:
+            if ct.task_id not in task_ids:
+                task_ids.append(ct.task_id)
+        for fa in ledger.failed_attempts:
+            if fa.task_id not in task_ids:
+                task_ids.append(fa.task_id)
 
-        for node in graph.nodes.values():
-            if node.status == GraphTaskStatus.COMPLETED and node.id not in existing_ids:
-                record = CompletedTaskRecord(
-                    task_id=node.id,
-                    artifact_id=str(uuid4()),  # 占位 — Artifact Protocol 完善后替换
-                    description=node.description,
-                    self_summary=node.result or node.description,
-                    files_changed=node.files_involved,
-                    verification_passed=True,
-                    confidence="DONE",
-                    step_number_start=0,
-                    step_number_end=0,
-                    token_count=0,
+        if not task_ids:
+            self.console.print("[dim]尚无 Artifact[/dim]")
+            return
+
+        for tid in task_ids:
+            metas = self._artifact_store.list_for_task(tid)
+            if not metas:
+                continue
+            self.console.print(f"[bold]{tid}[/bold]")
+            for m in metas:
+                self.console.print(
+                    f"  {m.artifact_id[:8]}  [{m.status}]  "
+                    f"conf={m.confidence}  files={m.files_changed}  "
+                    f"{m.created_at[:19]}"
                 )
-                ledger.completed_tasks.append(record)
-
-            elif node.status == GraphTaskStatus.FAILED and node.id not in {
-                fa.task_id for fa in ledger.failed_attempts
-            }:
-                record = FailedAttemptRecord(
-                    task_id=node.id,
-                    artifact_id=str(uuid4()),
-                    approach_description=node.description,
-                    failure_reason=node.error or "未知",
-                    step_number=0,
-                    lesson_learned=None,
-                )
-                ledger.failed_attempts.append(record)
-
-        # 检查里程碑
-        manager._check_milestones(ledger)
 
     async def _handle_pause(self) -> None:
         """触发 USER_PAUSE checkpoint，暂停当前长程任务."""
