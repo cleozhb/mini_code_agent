@@ -51,6 +51,29 @@ class AgentError(Exception):
     """Agent 运行时错误."""
 
 
+class AgentStuckError(Exception):
+    """Agent 主动宣告卡住，需要上层介入（例如 STUCK confidence）."""
+
+    def __init__(self, reason: str, question: str = "") -> None:
+        super().__init__(reason)
+        self.reason = reason
+        self.question = question
+
+
+class AgentObserver:
+    """观察者接口：Agent 在 tool / LLM 调用时通知 observer.
+
+    SubtaskRunner 的 ArtifactObserver 是主要使用方；
+    没人挂 observer 时 Agent 行为不变。
+    """
+
+    def on_tool_call(self, name: str, args: dict[str, Any], result: Any) -> None:
+        ...
+
+    def on_llm_call(self, tokens_in: int, tokens_out: int, model: str) -> None:
+        ...
+
+
 StopReason = Literal["ok", "max_rounds", "max_tokens", "timeout", "error"]
 
 
@@ -204,6 +227,9 @@ class Agent:
         # Incremental Verifier（可选）—— 每次 Edit 后做层级 1 快速验证
         self.incremental_verifier = incremental_verifier
 
+        # Observer 列表（可选）— SubtaskRunner 用来追踪 tool / LLM 调用
+        self.observers: list[AgentObserver] = []
+
         # 使用 ConversationManager 管理消息
         self.conversation = ConversationManager(llm_client=llm_client)
         self.conversation.init_system(self._build_full_system_prompt())
@@ -348,11 +374,12 @@ class Agent:
         if self.git_checkpoint is not None:
             await self.git_checkpoint.create_checkpoint(f"after: {task_desc}")
 
-        # Ledger 资源更新
+        # Ledger 资源更新 — 只记 +1 步；
+        # token 由 SubtaskRunner 经 Artifact.resource_usage 写入，
+        # 在这里再加一次会导致双重记账。
         if self.ledger and self.ledger_manager:
-            tokens_this_round = total_usage.input_tokens + total_usage.output_tokens
             self.ledger_manager.update_resources(
-                self.ledger, tokens_this_round, 1, 0.0,
+                self.ledger, 0, 1, 0.0,
             )
 
         # 自动 checkpoint 检查
@@ -559,6 +586,7 @@ class Agent:
             # 累计 token 用量
             round_usage.input_tokens += response.usage.input_tokens
             round_usage.output_tokens += response.usage.output_tokens
+            self._notify_llm_call(response.usage)
 
             # LoopGuard token 预算检查
             if self.loop_guard:
@@ -903,6 +931,9 @@ class Agent:
         # 执行工具
         try:
             result: ExecToolResult = await tool.run(tool_call.arguments)
+        except AgentStuckError:
+            # Agent 主动宣告卡住 — 让上层捕获，不要包成 tool error
+            raise
         except Exception as e:
             logger.exception("工具 '%s' 执行异常", tool_call.name)
             return Message.tool(
@@ -915,6 +946,7 @@ class Agent:
 
         # 追踪文件改动
         self._track_file_change(tool.name, tool_call.arguments, result)
+        self._notify_tool_call(tool.name, tool_call.arguments, result)
 
         # 将 tools.base.ToolResult 转为 llm.base.ToolResult
         if result.is_error:
@@ -1010,6 +1042,8 @@ class Agent:
         # 执行工具
         try:
             result: ExecToolResult = await tool.run(tool_call.arguments)
+        except AgentStuckError:
+            raise
         except Exception as e:
             logger.exception("工具 '%s' 执行异常", tool_call.name)
             err_result = ExecToolResult(
@@ -1026,6 +1060,7 @@ class Agent:
 
         # 追踪文件改动
         self._track_file_change(tool.name, tool_call.arguments, result)
+        self._notify_tool_call(tool.name, tool_call.arguments, result)
 
         # 转换
         if result.is_error:
@@ -1132,6 +1167,37 @@ class Agent:
         """累计本轮 token 用量到全局."""
         self.total_usage.input_tokens += usage.input_tokens
         self.total_usage.output_tokens += usage.output_tokens
+
+    def add_observer(self, obs: AgentObserver) -> None:
+        """挂载一个 observer."""
+        self.observers.append(obs)
+
+    def remove_observer(self, obs: AgentObserver | None = None) -> None:
+        """移除 observer：传入具体对象只移除该对象，否则清空所有."""
+        if obs is None:
+            self.observers.clear()
+        else:
+            try:
+                self.observers.remove(obs)
+            except ValueError:
+                pass
+
+    def _notify_tool_call(self, name: str, args: dict[str, Any], result: Any) -> None:
+        for obs in self.observers:
+            try:
+                obs.on_tool_call(name, args, result)
+            except Exception as e:  # noqa: BLE001 — observer 异常不能挂掉 Agent
+                logger.debug("observer.on_tool_call error: %s", e)
+
+    def _notify_llm_call(self, usage: TokenUsage) -> None:
+        if not self.observers:
+            return
+        model = getattr(self.llm_client, "model", "")
+        for obs in self.observers:
+            try:
+                obs.on_llm_call(usage.input_tokens, usage.output_tokens, model)
+            except Exception as e:  # noqa: BLE001
+                logger.debug("observer.on_llm_call error: %s", e)
 
     def reset(self) -> None:
         """重置对话历史（保留 system prompt）."""
