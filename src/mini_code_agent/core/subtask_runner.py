@@ -23,9 +23,12 @@ from ..artifacts import (
 )
 from ..artifacts.verification import CheckResult, SelfVerification
 from ..safety.git_checkpoint import GitCheckpoint
+from ..safety.path_filters import is_agent_internal_path
 from ..tools.git import _run_git
 from ..verify.verifier import IncrementalVerifier
+from ..verify.types import IncrementalVerificationResult
 from .agent import Agent, AgentObserver, AgentStuckError
+from .graph_executor import run_verification
 from .task_graph import TaskNode
 
 logger = logging.getLogger(__name__)
@@ -36,6 +39,7 @@ class GraphContext:
     """SubtaskRunner.run 需要的上下文（由 GraphExecutor 构造）."""
 
     original_goal: str
+    run_id: str
     completed_summaries: list[str] = field(default_factory=list)
     project_path: str = "."
     allowed_paths: list[str] = field(default_factory=list)
@@ -191,6 +195,12 @@ class SubtaskRunner:
             except Exception as e:  # noqa: BLE001
                 logger.warning("L2 验证失败（忽略）：%s", e)
 
+        verif_result = await self._attach_task_verification(
+            verif_result,
+            task_node,
+            graph_context,
+            files_changed,
+        )
         self_verif = _build_self_verification(verif_result)
         builder.attach_self_verification(self_verif)
 
@@ -207,7 +217,7 @@ class SubtaskRunner:
         # 步骤 6 — Finalize + 持久化
         artifact = builder.finalize()
         try:
-            self.artifact_store.save(artifact)
+            self.artifact_store.save(artifact, run_id=graph_context.run_id)
         except Exception as e:
             # 落盘失败属基础设施错误 — 抛出
             raise RuntimeError(f"Artifact 落盘失败: {e}") from e
@@ -308,7 +318,10 @@ class SubtaskRunner:
         """
         if not base_hash:
             # 不在 git 仓库或无 base 可比 — 退化：用 agent._files_changed
-            files = list(getattr(self.agent, "_files_changed", []) or [])
+            files = [
+                path for path in list(getattr(self.agent, "_files_changed", []) or [])
+                if not is_agent_internal_path(path)
+            ]
             return files
 
         # 获取 working tree 相对 base 的改动文件（已跟踪部分）
@@ -332,12 +345,23 @@ class SubtaskRunner:
                 if status.startswith("R") and len(parts) >= 3:
                     old_path = parts[1].strip()
                     path = parts[2].strip()
+                    if (
+                        is_agent_internal_path(path)
+                        or is_agent_internal_path(old_path)
+                    ):
+                        continue
                     diff_entries.append(("RENAME", path, old_path))
                 elif status == "A":
+                    if is_agent_internal_path(path):
+                        continue
                     diff_entries.append(("CREATE", path, None))
                 elif status == "D":
+                    if is_agent_internal_path(path):
+                        continue
                     diff_entries.append(("DELETE", path, None))
                 else:
+                    if is_agent_internal_path(path):
+                        continue
                     diff_entries.append(("MODIFY", path, None))
 
         # 加上未跟踪文件（git diff 看不到它们）
@@ -348,7 +372,7 @@ class SubtaskRunner:
             if code2 == 0:
                 for line in out2.strip().splitlines():
                     line = line.strip()
-                    if line:
+                    if line and not is_agent_internal_path(line):
                         diff_entries.append(("CREATE", line, None))
         except Exception as e:  # noqa: BLE001
             logger.debug("git ls-files failed: %s", e)
@@ -381,6 +405,57 @@ class SubtaskRunner:
 
         return files_changed
 
+    async def _attach_task_verification(
+        self,
+        verif_result: IncrementalVerificationResult | None,
+        task_node: TaskNode,
+        graph_context: GraphContext,
+        files_changed: list[str],
+    ) -> IncrementalVerificationResult | None:
+        """Run TaskNode.verification and merge it into incremental checks."""
+        if not task_node.verification.strip():
+            return verif_result
+
+        import time
+
+        start = time.monotonic()
+        passed, output = await run_verification(
+            task_node.verification,
+            cwd=graph_context.project_path,
+        )
+        check = CheckResult(
+            check_name="task_verification",
+            passed=passed,
+            skipped=False,
+            skip_reason=None,
+            duration_seconds=time.monotonic() - start,
+            details=output or ("ok" if passed else ""),
+            items_checked=1,
+            items_failed=0 if passed else 1,
+        )
+
+        if verif_result is None:
+            return IncrementalVerificationResult(
+                task_id=task_node.id,
+                level=1,
+                checks=[check],
+                overall_passed=passed,
+                files_verified=list(files_changed),
+                total_duration_seconds=check.duration_seconds,
+            )
+
+        checks = list(verif_result.checks) + [check]
+        return IncrementalVerificationResult(
+            task_id=verif_result.task_id,
+            level=verif_result.level,
+            checks=checks,
+            overall_passed=all(c.passed or c.skipped for c in checks),
+            files_verified=list(verif_result.files_verified),
+            total_duration_seconds=(
+                verif_result.total_duration_seconds + check.duration_seconds
+            ),
+        )
+
     async def _read_at_commit(
         self, path: str, commit: str, cwd: str,
     ) -> str | None:
@@ -406,9 +481,10 @@ class SubtaskRunner:
 
 
 def _summarize(text: str, max_length: int = 200) -> str:
+    text = text.strip()
     if not text:
         return "(无输出)"
-    line = text.strip().splitlines()[0]
+    line = text.splitlines()[0]
     if len(line) > max_length:
         line = line[:max_length] + "..."
     return line

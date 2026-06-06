@@ -691,6 +691,23 @@ class TestGraphExecutor:
         assert graph.nodes["A"].retry_count == 1
 
     @pytest.mark.asyncio
+    async def test_execute_handles_blank_agent_summary(self):
+        """Agent 只返回空白文本时，摘要不应该触发 IndexError."""
+        graph = TaskGraph()
+        graph.original_goal = "空白输出测试"
+        graph.add_task(TaskNode(id="A", description="返回空白"))
+
+        agent = MockAgent([
+            AgentResult(content="\n\n  ", usage=TokenUsage(5, 5), stop_reason="ok"),
+        ])
+        executor = GraphExecutor()
+
+        result = await executor.execute(graph, agent)
+
+        assert result.tasks_completed == 1
+        assert graph.nodes["A"].result == "(无输出)"
+
+    @pytest.mark.asyncio
     async def test_execute_passes_context_to_subtask(self):
         """子任务 prompt 应该包含目标和依赖信息."""
         graph = _make_linear_graph()

@@ -22,7 +22,7 @@ def parse_args() -> argparse.Namespace:
         "--provider",
         type=str,
         default="openai",
-        choices=["openai", "anthropic"],
+        choices=["openai", "openai-responses", "anthropic"],
         help="LLM 服务商 (默认: openai)",
     )
     parser.add_argument(

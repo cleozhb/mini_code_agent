@@ -321,6 +321,8 @@ class QuickVerifier:
             for candidate in src_dir.iterdir():
                 if candidate.is_dir() and not candidate.name.startswith("."):
                     local_top.add(candidate.name)
+                elif candidate.is_file() and candidate.suffix == ".py":
+                    local_top.add(candidate.stem)
 
         stdlib_names = _stdlib_module_names()
 
@@ -331,6 +333,12 @@ class QuickVerifier:
             if top in local_top:
                 return True
             if top_l in declared:
+                return True
+            # Script-style tests often import helpers from the same directory
+            # and run with that directory as cwd, e.g. `cd calc && python test_x.py`.
+            sibling_module = file_dir / f"{top}.py"
+            sibling_package = file_dir / top / "__init__.py"
+            if sibling_module.exists() or sibling_package.exists():
                 return True
             # 退一步：能在 sys.path 里找到？（避免误报）
             try:

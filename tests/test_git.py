@@ -44,6 +44,17 @@ async def git_repo(tmp_path: Path) -> Path:
 
 
 @pytest.fixture
+async def empty_git_repo(tmp_path: Path) -> Path:
+    """创建一个临时 git repo，但不创建初始 commit."""
+    repo = tmp_path / "empty_repo"
+    repo.mkdir()
+    await _run_git("init", cwd=str(repo))
+    await _run_git("config", "user.email", "test@test.com", cwd=str(repo))
+    await _run_git("config", "user.name", "Test", cwd=str(repo))
+    return repo
+
+
+@pytest.fixture
 def non_git_dir(tmp_path: Path) -> Path:
     """一个非 git 目录."""
     d = tmp_path / "not_git"
@@ -254,6 +265,42 @@ class TestGitCheckpoint:
         result = await cp.save_head()
         assert result is None
 
+    async def test_save_head_empty_git_repo(self, empty_git_repo: Path) -> None:
+        """刚 git init、尚无 commit 的仓库也应正常记录状态快照."""
+        (empty_git_repo / "existing.txt").write_text("preexisting\n")
+        cp = GitCheckpoint(cwd=str(empty_git_repo))
+
+        result = await cp.save_head()
+
+        assert result is None
+        assert cp._before_head is None
+        assert cp._before_status == {"?? existing.txt"}
+
+    async def test_create_checkpoint_empty_git_repo_preserves_existing_untracked(
+        self, empty_git_repo: Path
+    ) -> None:
+        """空仓库首次 checkpoint 只提交 save_head 后新增的改动."""
+        (empty_git_repo / "existing.txt").write_text("preexisting\n")
+        cp = GitCheckpoint(cwd=str(empty_git_repo))
+        await cp.save_head()
+
+        (empty_git_repo / "new_file.py").write_text("print('hello')\n")
+        commit_hash = await cp.create_checkpoint("initial agent checkpoint")
+
+        assert commit_hash is not None
+        code, tree = await _run_git(
+            "ls-tree", "--name-only", "HEAD", cwd=str(empty_git_repo)
+        )
+        assert code == 0
+        assert "new_file.py" in tree
+        assert "existing.txt" not in tree
+
+        code, status = await _run_git(
+            "status", "--porcelain", cwd=str(empty_git_repo)
+        )
+        assert code == 0
+        assert "?? existing.txt" in status
+
     async def test_create_checkpoint(
         self, checkpoint: GitCheckpoint, git_repo: Path
     ) -> None:
@@ -267,6 +314,43 @@ class TestGitCheckpoint:
         code, log = await _run_git("log", "--oneline", "-1", cwd=str(git_repo))
         assert CHECKPOINT_PREFIX in log
         assert "test checkpoint" in log
+
+    async def test_create_checkpoint_ignores_internal_paths(
+        self, checkpoint: GitCheckpoint, git_repo: Path
+    ) -> None:
+        """Checkpoint commits should not include agent state or cache files."""
+        await checkpoint.save_head()
+
+        (git_repo / "new_file.py").write_text("print('hello')\n")
+        (git_repo / ".agent" / "ledger").mkdir(parents=True)
+        (git_repo / ".agent" / "ledger" / "state.json").write_text("{}\n")
+        (git_repo / "__pycache__").mkdir()
+        (git_repo / "__pycache__" / "new_file.cpython-312.pyc").write_bytes(b"pyc")
+        (git_repo / ".agent_history").write_text("/exit\n")
+
+        commit_hash = await checkpoint.create_checkpoint("ignore internals")
+
+        assert commit_hash is not None
+        code, files = await _run_git(
+            "show", "--name-only", "--format=", commit_hash, cwd=str(git_repo)
+        )
+        assert code == 0
+        changed = set(files.strip().splitlines())
+        assert changed == {"new_file.py"}
+
+    async def test_create_checkpoint_only_internal_paths_returns_none(
+        self, checkpoint: GitCheckpoint, git_repo: Path
+    ) -> None:
+        await checkpoint.save_head()
+
+        (git_repo / ".agent" / "ledger").mkdir(parents=True)
+        (git_repo / ".agent" / "ledger" / "state.json").write_text("{}\n")
+        (git_repo / "__pycache__").mkdir()
+        (git_repo / "__pycache__" / "x.pyc").write_bytes(b"pyc")
+
+        result = await checkpoint.create_checkpoint("internal only")
+
+        assert result is None
 
     async def test_create_checkpoint_no_changes(
         self, checkpoint: GitCheckpoint

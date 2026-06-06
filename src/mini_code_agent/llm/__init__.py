@@ -3,6 +3,7 @@
 from .base import (
     LLMClient,
     LLMError,
+    LLMCapabilities,
     LLMAuthError,
     LLMRateLimitError,
     LLMResponse,
@@ -20,6 +21,7 @@ from .factory import create_client
 __all__ = [
     "LLMClient",
     "LLMError",
+    "LLMCapabilities",
     "LLMAuthError",
     "LLMRateLimitError",
     "LLMResponse",

@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import json
+from dataclasses import replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -943,11 +944,11 @@ class TestArtifactStore:
     def test_save_and_load(self, tmp_path: Path):
         store = ArtifactStore(storage_dir=str(tmp_path / "artifacts"))
         artifact = _make_artifact()
-        saved_path = store.save(artifact)
+        saved_path = store.save(artifact, run_id="ledger-001")
 
         assert Path(saved_path).exists()
 
-        loaded = store.load(artifact.artifact_id)
+        loaded = store.load(artifact.artifact_id, run_id="ledger-001")
         assert loaded.artifact_id == artifact.artifact_id
         assert loaded.task_id == artifact.task_id
 
@@ -955,24 +956,61 @@ class TestArtifactStore:
         """保存时同时生成 .patch 文件."""
         store = ArtifactStore(storage_dir=str(tmp_path / "artifacts"))
         artifact = _make_artifact()
-        store.save(artifact)
+        store.save(artifact, run_id="ledger-001")
 
-        patch_file = tmp_path / "artifacts" / artifact.task_id / f"{artifact.artifact_id}.patch"
+        patch_file = (
+            tmp_path
+            / "artifacts"
+            / "ledger-001"
+            / artifact.task_id
+            / f"{artifact.artifact_id}.patch"
+        )
         assert patch_file.exists()
+
+    def test_save_with_run_id_uses_namespaced_layout(self, tmp_path: Path):
+        store = ArtifactStore(storage_dir=str(tmp_path / "artifacts"))
+        artifact = _make_artifact()
+        store.save(artifact, run_id="ledger-001")
+
+        patch_file = (
+            tmp_path
+            / "artifacts"
+            / "ledger-001"
+            / artifact.task_id
+            / f"{artifact.artifact_id}.patch"
+        )
+        assert patch_file.exists()
+
+        loaded = store.load(artifact.artifact_id, run_id="ledger-001")
+        assert loaded.artifact_id == artifact.artifact_id
 
     def test_list_for_task(self, tmp_path: Path):
         store = ArtifactStore(storage_dir=str(tmp_path / "artifacts"))
         artifact = _make_artifact()
-        store.save(artifact)
+        store.save(artifact, run_id="ledger-001")
 
-        metas = store.list_for_task("task-001")
+        metas = store.list_for_task("task-001", run_id="ledger-001")
         assert len(metas) == 1
         assert metas[0].artifact_id == "artifact-001"
         assert metas[0].status == "DRAFT"
 
+    def test_list_for_task_can_scope_to_run_id(self, tmp_path: Path):
+        store = ArtifactStore(storage_dir=str(tmp_path / "artifacts"))
+        artifact = _make_artifact()
+        run_a = replace(artifact, artifact_id="artifact-a")
+        run_b = replace(artifact, artifact_id="artifact-b")
+        store.save(run_a, run_id="ledger-a")
+        store.save(run_b, run_id="ledger-b")
+
+        metas_a = store.list_for_task("task-001", run_id="ledger-a")
+        metas_b = store.list_for_task("task-001", run_id="ledger-b")
+
+        assert [m.artifact_id for m in metas_a] == ["artifact-a"]
+        assert [m.artifact_id for m in metas_b] == ["artifact-b"]
+
     def test_list_for_task_empty(self, tmp_path: Path):
         store = ArtifactStore(storage_dir=str(tmp_path / "artifacts"))
-        assert store.list_for_task("nonexistent") == []
+        assert store.list_for_task("nonexistent", run_id="ledger-001") == []
 
     def test_get_latest_for_task(self, tmp_path: Path):
         store = ArtifactStore(storage_dir=str(tmp_path / "artifacts"))
@@ -1013,25 +1051,25 @@ class TestArtifactStore:
             open_questions=[],
             status=ArtifactStatus.DRAFT,
         )
-        store.save(a1)
-        store.save(a2)
+        store.save(a1, run_id="ledger-001")
+        store.save(a2, run_id="ledger-001")
 
-        latest = store.get_latest_for_task("task-x")
+        latest = store.get_latest_for_task("task-x", run_id="ledger-001")
         assert latest is not None
         assert latest.artifact_id == "a-002"
         assert latest.self_summary == "second"
 
     def test_get_latest_for_empty_task(self, tmp_path: Path):
         store = ArtifactStore(storage_dir=str(tmp_path / "artifacts"))
-        assert store.get_latest_for_task("nope") is None
+        assert store.get_latest_for_task("nope", run_id="ledger-001") is None
 
     def test_load_nonexistent_raises(self, tmp_path: Path):
         store = ArtifactStore(storage_dir=str(tmp_path / "artifacts"))
         (tmp_path / "artifacts").mkdir(parents=True)
         with pytest.raises(FileNotFoundError):
-            store.load("no-such-id")
+            store.load("no-such-id", run_id="ledger-001")
 
     def test_load_storage_dir_missing_raises(self, tmp_path: Path):
         store = ArtifactStore(storage_dir=str(tmp_path / "nonexistent"))
         with pytest.raises(FileNotFoundError):
-            store.load("any-id")
+            store.load("any-id", run_id="ledger-001")

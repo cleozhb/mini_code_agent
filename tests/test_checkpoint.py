@@ -383,6 +383,44 @@ class TestCheckpointManagerSave:
         assert "dirty.txt" not in status
 
     @pytest.mark.asyncio
+    async def test_save_ignores_internal_dirty_workspace(
+        self,
+        checkpoint_manager: CheckpointManager,
+        ledger_manager: TaskLedgerManager,
+        config: LongRunConfig,
+        git_repo: Path,
+    ):
+        """只有 .agent 等内部路径变脏时，不应自动 commit 或标记 dirty."""
+        graph = _make_task_graph(3)
+        ledger = _make_ledger(total_tokens=5000, total_steps=10)
+        ledger_manager.save(ledger)
+
+        internal_file = git_repo / ".agent" / "runtime" / "state.json"
+        internal_file.parent.mkdir(parents=True, exist_ok=True)
+        internal_file.write_text("{}\n")
+
+        code, before_count = await _run_git(
+            "rev-list", "--count", "HEAD", cwd=str(git_repo)
+        )
+        assert code == 0
+
+        state = await checkpoint_manager.save_checkpoint(
+            ledger=ledger,
+            task_graph=graph,
+            trigger=CheckpointTrigger.USER_PAUSE,
+            config=config,
+            current_task_id=None,
+            recent_messages=[],
+        )
+
+        code, after_count = await _run_git(
+            "rev-list", "--count", "HEAD", cwd=str(git_repo)
+        )
+        assert code == 0
+        assert state.uncommitted_changes is False
+        assert after_count.strip() == before_count.strip()
+
+    @pytest.mark.asyncio
     async def test_multiple_checkpoints(
         self,
         checkpoint_manager: CheckpointManager,
@@ -801,6 +839,39 @@ class TestResumeManager:
             await resume_manager.prepare_resume(
                 ledger.task_id, state.checkpoint_id,
             )
+
+    @pytest.mark.asyncio
+    async def test_resume_allows_internal_dirty_changes(
+        self,
+        checkpoint_manager: CheckpointManager,
+        resume_manager: ResumeManager,
+        ledger_manager: TaskLedgerManager,
+        config: LongRunConfig,
+        git_repo: Path,
+    ):
+        """只有 .agent 等内部路径变脏时，prepare_resume 不应报错."""
+        graph = _make_task_graph(3)
+        ledger = _make_ledger(total_tokens=5000, total_steps=10)
+        ledger_manager.save(ledger)
+
+        state = await checkpoint_manager.save_checkpoint(
+            ledger=ledger,
+            task_graph=graph,
+            trigger=CheckpointTrigger.USER_PAUSE,
+            config=config,
+            current_task_id=None,
+            recent_messages=[],
+        )
+
+        internal_file = git_repo / ".agent" / "runtime" / "state.json"
+        internal_file.parent.mkdir(parents=True, exist_ok=True)
+        internal_file.write_text("{}\n")
+
+        context = await resume_manager.prepare_resume(
+            ledger.task_id, state.checkpoint_id,
+        )
+
+        assert context.session_state.checkpoint_id == state.checkpoint_id
 
     @pytest.mark.asyncio
     async def test_resume_branch_mismatch_error(

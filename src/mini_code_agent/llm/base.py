@@ -30,8 +30,12 @@ class ToolCall:
     id: str
     name: str
     arguments: dict  # 已解析的 JSON
+    raw_arguments: str = ""
+    parse_error: str | None = None
 
     def arguments_json(self) -> str:
+        if self.raw_arguments and self.parse_error:
+            return self.raw_arguments
         return json.dumps(self.arguments, ensure_ascii=False)
 
 
@@ -88,6 +92,7 @@ class ToolParam:
     name: str
     description: str
     parameters: dict  # JSON Schema
+    strict: bool = False
 
 
 # ---------------------------------------------------------------------------
@@ -101,10 +106,39 @@ class TokenUsage:
 
     input_tokens: int = 0
     output_tokens: int = 0
+    cached_input_tokens: int = 0
+    reasoning_tokens: int = 0
+    cache_creation_input_tokens: int = 0
+    cache_read_input_tokens: int = 0
 
     @property
     def total_tokens(self) -> int:
-        return self.input_tokens + self.output_tokens
+        return (
+            self.input_tokens
+            + self.output_tokens
+            + self.cache_creation_input_tokens
+            + self.cache_read_input_tokens
+        )
+
+    def add(self, other: TokenUsage) -> None:
+        """把另一份用量累加到当前对象."""
+        self.input_tokens += other.input_tokens
+        self.output_tokens += other.output_tokens
+        self.cached_input_tokens += other.cached_input_tokens
+        self.reasoning_tokens += other.reasoning_tokens
+        self.cache_creation_input_tokens += other.cache_creation_input_tokens
+        self.cache_read_input_tokens += other.cache_read_input_tokens
+
+
+@dataclass(frozen=True)
+class LLMCapabilities:
+    """LLM backend 能力声明."""
+
+    structured_outputs: bool = False
+    strict_tools: bool = False
+    streaming_tools: bool = False
+    prompt_cache: bool = False
+    reasoning_usage: bool = False
 
 
 @dataclass
@@ -171,11 +205,11 @@ class LLMClient(ABC):
         self.api_key = api_key
         self.base_url = base_url
         self.total_usage = TokenUsage()
+        self.capabilities = LLMCapabilities()
 
     def _accumulate_usage(self, usage: TokenUsage) -> None:
         """累计 token 用量."""
-        self.total_usage.input_tokens += usage.input_tokens
-        self.total_usage.output_tokens += usage.output_tokens
+        self.total_usage.add(usage)
 
     @abstractmethod
     async def chat(

@@ -138,3 +138,25 @@ def test_factory_creates_openai():
     """工厂函数: 创建 OpenAI 客户端."""
     client = create_client("openai", model="gpt-4o")
     assert client.model == "gpt-4o"
+
+
+def test_factory_creates_openai_responses():
+    """工厂函数: 创建 OpenAI Responses 客户端."""
+    from mini_code_agent.llm.openai_responses_client import OpenAIResponsesClient
+
+    client = create_client("openai-responses", model="gpt-4o")
+
+    assert isinstance(client, OpenAIResponsesClient)
+    assert client.model == "gpt-4o"
+
+
+def test_factory_openai_api_style_responses(monkeypatch):
+    """OPENAI_API_STYLE=responses 时 openai provider 走 Responses backend."""
+    from mini_code_agent.llm import factory
+    from mini_code_agent.llm.openai_responses_client import OpenAIResponsesClient
+
+    monkeypatch.setitem(factory._config, "OPENAI_API_STYLE", "responses")
+
+    client = create_client("openai", model="gpt-4o")
+
+    assert isinstance(client, OpenAIResponsesClient)

@@ -141,7 +141,7 @@ def add_eval_subparser(subparsers: argparse._SubParsersAction) -> argparse.Argum
                    help="结果落盘目录（默认 eval/results）")
     # provider / model
     p.add_argument("--provider", type=str, default="openai",
-                   choices=["openai", "anthropic"],
+                   choices=["openai", "openai-responses", "anthropic"],
                    help="LLM 服务商（默认 openai）")
     p.add_argument("--model", type=str, default=None,
                    help="模型名；不指定则读 .env")

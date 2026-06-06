@@ -9,6 +9,7 @@ import anthropic
 
 from .base import (
     LLMClient,
+    LLMCapabilities,
     LLMError,
     LLMAuthError,
     LLMRateLimitError,
@@ -28,12 +29,25 @@ class ClaudeClient(LLMClient):
 
     def __init__(
         self,
-        model: str = "claude-sonnet-4-20250514",
+        model: str = "claude-sonnet-4-6",
         api_key: str | None = None,
         base_url: str | None = None,
+        cache_ttl: str = "off",
     ) -> None:
         super().__init__(model, api_key=api_key, base_url=base_url)
         self.__client: anthropic.AsyncAnthropic | None = None
+        if cache_ttl not in {"off", "5m", "1h"}:
+            raise LLMError(
+                f"不支持的 ANTHROPIC_CACHE_TTL: {cache_ttl!r}，可选: off, 5m, 1h"
+            )
+        self.cache_ttl = cache_ttl
+        self.capabilities = LLMCapabilities(
+            structured_outputs=True,
+            strict_tools=True,
+            streaming_tools=True,
+            prompt_cache=cache_ttl != "off",
+            reasoning_usage=False,
+        )
 
     @property
     def _client(self) -> anthropic.AsyncAnthropic:
@@ -49,26 +63,53 @@ class ClaudeClient(LLMClient):
     # 格式转换：统一格式 -> Anthropic 格式
     # ------------------------------------------------------------------
 
+    def _cache_control(self) -> dict | None:
+        """构造 Anthropic cache_control 配置."""
+        if self.cache_ttl == "off":
+            return None
+        cache_control = {"type": "ephemeral"}
+        if self.cache_ttl in {"5m", "1h"}:
+            cache_control["ttl"] = self.cache_ttl
+        return cache_control
+
     def _convert_messages(
         self, messages: list[Message]
-    ) -> tuple[str | None, list[dict]]:
+    ) -> tuple[str | list[dict] | None, list[dict]]:
         """将统一消息列表转为 Anthropic 的 system + messages 格式.
 
         Returns:
             (system_prompt, messages_list)
         """
-        system: str | None = None
+        system_parts: list[str] = []
         api_messages: list[dict] = []
+        pending_tool_results: list[dict] = []
+
+        def flush_tool_results() -> None:
+            nonlocal pending_tool_results
+            if pending_tool_results:
+                api_messages.append(
+                    {"role": "user", "content": pending_tool_results}
+                )
+                pending_tool_results = []
 
         for msg in messages:
             if msg.role == Role.SYSTEM:
-                system = msg.content
+                if msg.content:
+                    system_parts.append(msg.content)
                 continue
 
             if msg.role == Role.USER:
-                api_messages.append({"role": "user", "content": msg.content})
+                if pending_tool_results:
+                    content = list(pending_tool_results)
+                    pending_tool_results = []
+                    if msg.content:
+                        content.append({"type": "text", "text": msg.content})
+                    api_messages.append({"role": "user", "content": content})
+                else:
+                    api_messages.append({"role": "user", "content": msg.content or ""})
 
             elif msg.role == Role.ASSISTANT:
+                flush_tool_results()
                 content: list[dict] = []
                 if msg.content:
                     content.append({"type": "text", "text": msg.content})
@@ -86,19 +127,31 @@ class ClaudeClient(LLMClient):
             elif msg.role == Role.TOOL:
                 assert msg.tool_result is not None
                 tr = msg.tool_result
-                api_messages.append(
+                pending_tool_results.append(
                     {
-                        "role": "user",
-                        "content": [
-                            {
-                                "type": "tool_result",
-                                "tool_use_id": tr.tool_call_id,
-                                "content": tr.content,
-                                "is_error": tr.is_error,
-                            }
-                        ],
+                        "type": "tool_result",
+                        "tool_use_id": tr.tool_call_id,
+                        "content": tr.content,
+                        "is_error": tr.is_error,
                     }
                 )
+
+        flush_tool_results()
+
+        system: str | list[dict] | None = None
+        if system_parts:
+            system_text = "\n\n".join(system_parts)
+            cache_control = self._cache_control()
+            if cache_control:
+                system = [
+                    {
+                        "type": "text",
+                        "text": system_text,
+                        "cache_control": cache_control,
+                    }
+                ]
+            else:
+                system = system_text
 
         return system, api_messages
 
@@ -106,17 +159,83 @@ class ClaudeClient(LLMClient):
         """统一 ToolParam -> Anthropic tools 格式."""
         if not tools:
             return None
-        return [
-            {
+        api_tools: list[dict] = []
+        for t in tools:
+            api_tool = {
                 "name": t.name,
                 "description": t.description,
                 "input_schema": t.parameters,
             }
-            for t in tools
-        ]
+            if t.strict:
+                api_tool["strict"] = True
+            api_tools.append(api_tool)
 
-    def _parse_response(self, resp: anthropic.types.Message) -> LLMResponse:
+        cache_control = self._cache_control()
+        if cache_control and api_tools:
+            api_tools[-1]["cache_control"] = cache_control
+        return api_tools
+
+    def _convert_response_format(self, response_format: dict | None) -> dict | None:
+        """OpenAI 风格 response_format -> Anthropic output_config."""
+        if not response_format:
+            return None
+        if (
+            response_format.get("type") == "json_schema"
+            and isinstance(response_format.get("json_schema"), dict)
+        ):
+            json_schema = response_format["json_schema"]
+            return {
+                "format": {
+                    "type": "json_schema",
+                    "schema": json_schema["schema"],
+                }
+            }
+        raise LLMError(
+            "Anthropic 当前只支持 json_schema response_format，"
+            f"收到: {response_format!r}"
+        )
+
+    def _usage_from_response(self, resp: object) -> TokenUsage:
+        """从 Anthropic usage 提取统一用量."""
+        usage = getattr(resp, "usage", None)
+        if usage is None:
+            return TokenUsage()
+        return TokenUsage(
+            input_tokens=getattr(usage, "input_tokens", 0) or 0,
+            output_tokens=getattr(usage, "output_tokens", 0) or 0,
+            cache_creation_input_tokens=getattr(
+                usage, "cache_creation_input_tokens", 0
+            )
+            or 0,
+            cache_read_input_tokens=getattr(usage, "cache_read_input_tokens", 0) or 0,
+        )
+
+    def _check_structured_output_stop(
+        self,
+        resp: object,
+        response_format: dict | None,
+    ) -> None:
+        """把 structured output 失败原因转为可读错误."""
+        if not response_format:
+            return
+        stop_reason = getattr(resp, "stop_reason", None)
+        if stop_reason == "refusal":
+            raise LLMError(
+                "Anthropic structured output 被安全策略拒答，响应可能不满足 schema"
+            )
+        if stop_reason == "max_tokens":
+            raise LLMError(
+                "Anthropic structured output 因 max_tokens 截断，"
+                "请提高 max_tokens 或重试生成"
+            )
+
+    def _parse_response(
+        self,
+        resp: anthropic.types.Message,
+        response_format: dict | None = None,
+    ) -> LLMResponse:
         """Anthropic 响应 -> 统一 LLMResponse."""
+        self._check_structured_output_stop(resp, response_format)
         text_parts: list[str] = []
         tool_calls: list[ToolCall] = []
 
@@ -132,10 +251,7 @@ class ClaudeClient(LLMClient):
                     )
                 )
 
-        usage = TokenUsage(
-            input_tokens=resp.usage.input_tokens,
-            output_tokens=resp.usage.output_tokens,
-        )
+        usage = self._usage_from_response(resp)
         self._accumulate_usage(usage)
 
         return LLMResponse(
@@ -153,9 +269,11 @@ class ClaudeClient(LLMClient):
         self,
         messages: list[Message],
         tools: list[ToolParam] | None = None,
+        response_format: dict | None = None,
     ) -> LLMResponse:
         system, api_messages = self._convert_messages(messages)
         api_tools = self._convert_tools(tools)
+        output_config = self._convert_response_format(response_format)
 
         kwargs: dict = {
             "model": self.model,
@@ -166,6 +284,8 @@ class ClaudeClient(LLMClient):
             kwargs["system"] = system
         if api_tools:
             kwargs["tools"] = api_tools
+        if output_config:
+            kwargs["output_config"] = output_config
 
         try:
             resp = await self._client.messages.create(**kwargs)
@@ -173,18 +293,27 @@ class ClaudeClient(LLMClient):
             raise LLMAuthError(f"Anthropic 认证失败: {e}") from e
         except anthropic.RateLimitError as e:
             raise LLMRateLimitError(f"Anthropic 速率限制: {e}") from e
+        except anthropic.BadRequestError as e:
+            if response_format and "schema" in str(e).lower():
+                raise LLMError(
+                    "Anthropic structured output schema 不兼容，"
+                    "请简化 JSON Schema 或关闭 strict/structured outputs"
+                ) from e
+            raise LLMError(f"Anthropic 请求错误: {e}") from e
         except anthropic.APIError as e:
             raise LLMError(f"Anthropic API 错误: {e}") from e
 
-        return self._parse_response(resp)
+        return self._parse_response(resp, response_format=response_format)
 
     async def chat_stream(
         self,
         messages: list[Message],
         tools: list[ToolParam] | None = None,
+        response_format: dict | None = None,
     ) -> AsyncIterator[StreamDelta]:
         system, api_messages = self._convert_messages(messages)
         api_tools = self._convert_tools(tools)
+        output_config = self._convert_response_format(response_format)
 
         kwargs: dict = {
             "model": self.model,
@@ -195,6 +324,8 @@ class ClaudeClient(LLMClient):
             kwargs["system"] = system
         if api_tools:
             kwargs["tools"] = api_tools
+        if output_config:
+            kwargs["output_config"] = output_config
 
         try:
             async with self._client.messages.stream(**kwargs) as stream:
@@ -248,10 +379,8 @@ class ClaudeClient(LLMClient):
 
                 # 从最终消息中提取用量
                 final = await stream.get_final_message()
-                usage = TokenUsage(
-                    input_tokens=final.usage.input_tokens,
-                    output_tokens=final.usage.output_tokens,
-                )
+                self._check_structured_output_stop(final, response_format)
+                usage = self._usage_from_response(final)
                 self._accumulate_usage(usage)
 
                 yield StreamDelta(
@@ -263,5 +392,12 @@ class ClaudeClient(LLMClient):
             raise LLMAuthError(f"Anthropic 认证失败: {e}") from e
         except anthropic.RateLimitError as e:
             raise LLMRateLimitError(f"Anthropic 速率限制: {e}") from e
+        except anthropic.BadRequestError as e:
+            if response_format and "schema" in str(e).lower():
+                raise LLMError(
+                    "Anthropic structured output schema 不兼容，"
+                    "请简化 JSON Schema 或关闭 strict/structured outputs"
+                ) from e
+            raise LLMError(f"Anthropic 请求错误: {e}") from e
         except anthropic.APIError as e:
             raise LLMError(f"Anthropic API 错误: {e}") from e

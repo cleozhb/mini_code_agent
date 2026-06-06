@@ -80,6 +80,22 @@ async def test_quick_unresolved_import_detected(tmp_path: Path):
 
 
 @pytest.mark.asyncio
+async def test_quick_allows_sibling_script_import(tmp_path: Path):
+    proj = _make_project(tmp_path)
+    module = proj / "calc" / "scratch_longrun_demo.py"
+    test_file = proj / "calc" / "test_scratch_longrun_demo.py"
+    _write(module, "def add(a: int, b: int) -> int:\n    return a + b\n")
+    _write(test_file, "from scratch_longrun_demo import add\nassert add(1, 2) == 3\n")
+
+    verifier = QuickVerifier()
+    result = await verifier.verify(["calc/test_scratch_longrun_demo.py"], str(proj))
+
+    imp = result.get_check("import")
+    assert imp is not None
+    assert imp.passed
+
+
+@pytest.mark.asyncio
 async def test_quick_clean_file_passes(tmp_path: Path):
     proj = _make_project(tmp_path)
     f = proj / "src" / "demo" / "ok.py"

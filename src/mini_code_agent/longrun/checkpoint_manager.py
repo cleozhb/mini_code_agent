@@ -12,6 +12,7 @@ from uuid import uuid4
 
 from ..core.task_graph import TaskGraph
 from ..safety.git_checkpoint import GitCheckpoint
+from ..safety.path_filters import is_agent_internal_path, path_from_git_status_entry
 from ..tools.git import _run_git
 from .config import LongRunConfig
 from .ledger_manager import TaskLedgerManager
@@ -117,20 +118,34 @@ class CheckpointManager:
         # 步骤 1 — 前置检查：检查是否有未提交的修改
         code, status_output = await _run_git("status", "--porcelain", cwd=self.cwd)
         if code == 0 and status_output.strip():
+            dirty_paths = [
+                path_from_git_status_entry(line)
+                for line in status_output.strip().splitlines()
+            ]
+            dirty_paths = [
+                path for path in dirty_paths
+                if path and not is_agent_internal_path(path)
+            ]
             # 有未提交的修改 — 这不应该发生
             # 选方案一：自动 commit 这些修改，标记 uncommitted_changes=True
-            logger.warning(
-                "Checkpoint 前发现未提交修改，自动 commit: %s",
-                status_output.strip()[:200],
-            )
-            had_uncommitted = True
-            await _run_git("add", "-A", cwd=self.cwd)
-            await _run_git(
-                "commit", "-m",
-                f"[agent-checkpoint] auto-commit dirty workspace: "
-                f"task={task_id} trigger={trigger.value}",
-                cwd=self.cwd,
-            )
+            if dirty_paths:
+                logger.warning(
+                    "Checkpoint 前发现未提交修改，自动 commit: %s",
+                    ", ".join(dirty_paths)[:200],
+                )
+                had_uncommitted = True
+                for path in dirty_paths:
+                    await _run_git("add", "--", path, cwd=self.cwd)
+                await _run_git(
+                    "commit", "-m",
+                    f"[agent-checkpoint] auto-commit dirty workspace: "
+                    f"task={task_id} trigger={trigger.value}",
+                    cwd=self.cwd,
+                )
+            else:
+                logger.debug(
+                    "Checkpoint 前仅发现内部路径改动，跳过 dirty auto-commit"
+                )
 
         # 步骤 2 — 创建 git checkpoint
         git_hash = ""

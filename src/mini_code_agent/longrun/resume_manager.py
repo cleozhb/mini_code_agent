@@ -8,6 +8,7 @@ from datetime import UTC, datetime
 from typing import Any, Callable
 
 from ..core.task_graph import TaskGraph
+from ..safety.path_filters import is_agent_internal_path, path_from_git_status_entry
 from ..tools.git import _run_git
 from .checkpoint_manager import CheckpointManager, CorruptedCheckpointError, _compute_sha256
 from .ledger_manager import TaskLedgerManager
@@ -111,10 +112,19 @@ class ResumeManager:
         # 检查是否有未提交的修改
         code, status_output = await _run_git("status", "--porcelain", cwd=self.cwd)
         if code == 0 and status_output.strip():
-            raise UncommittedChangesError(
-                "当前工作区有未提交的修改。恢复会丢失这些修改。\n"
-                "请先 git stash 或 commit，然后重试 /resume。"
-            )
+            dirty_paths = [
+                path_from_git_status_entry(line)
+                for line in status_output.strip().splitlines()
+            ]
+            dirty_paths = [
+                path for path in dirty_paths
+                if path and not is_agent_internal_path(path)
+            ]
+            if dirty_paths:
+                raise UncommittedChangesError(
+                    "当前工作区有未提交的修改。恢复会丢失这些修改。\n"
+                    "请先 git stash 或 commit，然后重试 /resume。"
+                )
 
         # 回滚到 checkpoint 时的 commit
         if state.git_checkpoint_hash:

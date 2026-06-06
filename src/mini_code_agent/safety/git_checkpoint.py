@@ -12,6 +12,7 @@ import logging
 from dataclasses import dataclass
 
 from ..tools.git import _run_git
+from .path_filters import is_agent_internal_path, path_from_git_status_entry
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,18 @@ class GitCheckpoint:
         self._enabled = code == 0
         return self._enabled
 
+    async def _save_status_snapshot(self) -> bool:
+        """记录当前工作区状态快照."""
+        code, status = await _run_git("status", "--porcelain", cwd=self.cwd)
+        if code != 0:
+            logger.error("获取 git status 失败: %s", status)
+            return False
+        if status.strip():
+            self._before_status = set(status.rstrip("\n").split("\n"))
+        else:
+            self._before_status = set()
+        return True
+
     async def save_head(self) -> str | None:
         """记录当前 HEAD hash 和工作区状态（"before" 阶段调用）.
 
@@ -58,25 +71,26 @@ class GitCheckpoint:
         哪些改动是 Agent 产生的、哪些是用户之前就有的。
 
         Returns:
-            HEAD commit hash，或 None（非 git 仓库）。
+            HEAD commit hash，或 None（非 git 仓库 / 尚无 commit）。
         """
         if not await self.is_git_repo():
             logger.warning("不在 git 仓库中，跳过 checkpoint")
             return None
 
-        code, out = await _run_git("rev-parse", "HEAD", cwd=self.cwd)
+        code, out = await _run_git("rev-parse", "--verify", "HEAD", cwd=self.cwd)
         if code != 0:
-            logger.error("获取 HEAD 失败: %s", out)
+            if await self._save_status_snapshot():
+                self._before_head = None
+                logger.info("Git 仓库尚无 commit，已记录工作区状态作为 checkpoint 锚点")
+            else:
+                logger.error("获取 HEAD 失败: %s", out)
             return None
 
         self._before_head = out.strip()
 
         # 记录当前工作区状态快照（每行是一个文件的变更条目）
-        code, status = await _run_git("status", "--porcelain", cwd=self.cwd)
-        if code == 0 and status.strip():
-            self._before_status = set(status.rstrip("\n").split("\n"))
-        else:
-            self._before_status = set()
+        if not await self._save_status_snapshot():
+            return None
 
         logger.info("记录 checkpoint 锚点: %s", self._before_head[:8])
         return self._before_head
@@ -109,12 +123,19 @@ class GitCheckpoint:
             return None
 
         # 只 stage 新增改动的文件（从 porcelain 输出中提取文件路径）
+        staged_any = False
         for entry in new_changes:
             # git status --porcelain 格式: "XY filename" 或 "XY orig -> filename"
-            raw = entry[3:]  # 跳过状态码和空格
-            if " -> " in raw:
-                raw = raw.split(" -> ", 1)[1]
+            raw = path_from_git_status_entry(entry)
+            if is_agent_internal_path(raw):
+                logger.debug("跳过内部路径 checkpoint: %s", raw)
+                continue
             await _run_git("add", "--", raw, cwd=self.cwd)
+            staged_any = True
+
+        if not staged_any:
+            logger.debug("没有可提交的非内部改动，跳过 checkpoint: %s", message)
+            return None
 
         # 确认有 staged 内容
         code, _ = await _run_git("diff", "--cached", "--quiet", cwd=self.cwd)

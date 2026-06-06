@@ -212,7 +212,19 @@ class GraphExecutor:
         start_time = time.monotonic()
         total_tokens = 0
         total_steps = 0
-
+        
+        # --------------------------------------------------------------------
+        # 每轮从 graph.get_ready_tasks() 拿所有依赖已完成的 PENDING 节点
+        # 对每个 ready task，它做这些事：
+        # 1. graph.mark_running(task.id)。
+        # 2. 用 _build_task_prompt (line 573) 构造子任务 prompt。
+        # 3. agent.reset()，让每个子任务用干净对话历史。
+        # 4. agent.run(task_prompt)。
+        # 5. 如果 task 有 verification，调用 run_verification()。
+        # 6. Agent 正常结束且验证通过：graph.mark_completed()。
+        # 7. 否则失败，没超过 max_retries 就把任务放回 PENDING；超过就 graph.mark_failed()。
+        # --------------------------------------------------------------------
+        
         while not graph.is_complete() and not graph.is_blocked():
             ready_tasks = graph.get_ready_tasks()
             if not ready_tasks:
@@ -419,6 +431,7 @@ class GraphExecutor:
                 ],
                 project_path=project_path,
                 allowed_paths=self.subtask_runner.derive_allowed_paths(task),
+                run_id=ledger.task_id,
             )
 
             # 执行子任务
@@ -616,10 +629,11 @@ class GraphExecutor:
 
     def _extract_summary(self, content: str, max_length: int = 200) -> str:
         """从 Agent 回复中提取摘要."""
+        content = content.strip()
         if not content:
             return "(无输出)"
         # 取前几行作为摘要
-        lines = content.strip().splitlines()
+        lines = content.splitlines()
         summary = lines[0]
         if len(summary) > max_length:
             summary = summary[:max_length] + "..."

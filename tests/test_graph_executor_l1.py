@@ -270,7 +270,7 @@ async def test_three_subtasks_each_produce_artifact(tmp_repo, stores):
     assert len(ledger.completed_tasks) == 3
     # 每个任务都对应一个 artifact
     for ct in ledger.completed_tasks:
-        metas = artifact_store.list_for_task(ct.task_id)
+        metas = artifact_store.list_for_task(ct.task_id, run_id=ledger.task_id)
         assert len(metas) >= 1
 
 
@@ -453,10 +453,116 @@ async def test_scope_check_records_out_of_scope_paths(tmp_repo, stores):
     # L1 不拦截越界 — 任务仍然完成
     assert result.tasks_completed == 1
     # 但 Artifact 应该记录越界
-    metas = artifact_store.list_for_task("solo")
+    metas = artifact_store.list_for_task("solo", run_id=ledger.task_id)
     assert len(metas) >= 1
     artifact = SubtaskArtifact.load(metas[0].path)
     assert artifact.scope_check.is_clean is False
     assert any(
         p.startswith("forbidden/") for p in artifact.scope_check.out_of_scope_paths
     )
+
+
+@pytest.mark.asyncio
+async def test_internal_agent_files_are_not_recorded_in_artifact(tmp_repo, stores):
+    """Agent/runtime side effects should not inflate Artifact patches."""
+    artifact_store, ledger_manager, checkpoint_manager = stores
+
+    graph = TaskGraph()
+    graph.add_task(TaskNode(
+        id="solo",
+        description="write x.py",
+        files_involved=["x.py"],
+    ))
+
+    def _write_with_internal_noise():
+        (tmp_repo / "x.py").write_text("x = 1\n", encoding="utf-8")
+        (tmp_repo / ".agent" / "ledger").mkdir(parents=True, exist_ok=True)
+        (tmp_repo / ".agent" / "ledger" / "noise.json").write_text(
+            "{}\n", encoding="utf-8",
+        )
+        (tmp_repo / "__pycache__").mkdir(parents=True, exist_ok=True)
+        (tmp_repo / "__pycache__" / "x.cpython-312.pyc").write_bytes(b"pyc")
+        return AgentResult(
+            content="ok",
+            usage=TokenUsage(input_tokens=10, output_tokens=5),
+        )
+
+    agent = _ScriptedAgent([_write_with_internal_noise])
+    runner = SubtaskRunner(
+        agent=agent,
+        artifact_store=artifact_store,
+        verifier=FakeVerifier(passed=True),
+        git_checkpoint=GitCheckpoint(cwd=str(tmp_repo)),
+    )
+    executor = GraphExecutor(
+        project_path=str(tmp_repo),
+        max_retries=2,
+        subtask_runner=runner,
+        ledger_manager=ledger_manager,
+        checkpoint_manager=checkpoint_manager,
+        longrun_config=LongRunConfig(token_budget=10_000),
+    )
+    ledger = ledger_manager.create("g", graph, budget=10_000)
+
+    result = await executor.execute_with_ledger(graph, ledger, str(tmp_repo))
+
+    assert result.tasks_completed == 1
+    metas = artifact_store.list_for_task("solo", run_id=ledger.task_id)
+    artifact = SubtaskArtifact.load(metas[0].path)
+    changed_paths = [edit.path for edit in artifact.patch.edits]
+    assert changed_paths == ["x.py"]
+
+
+@pytest.mark.asyncio
+async def test_task_verification_command_runs_with_project_cwd(tmp_repo, stores):
+    artifact_store, ledger_manager, checkpoint_manager = stores
+
+    graph = TaskGraph()
+    graph.add_task(TaskNode(
+        id="solo",
+        description="write script-style calc test",
+        files_involved=["calc/test_scratch_longrun_demo.py"],
+        verification="cd calc && python test_scratch_longrun_demo.py",
+    ))
+
+    def _write_calc_files():
+        calc = tmp_repo / "calc"
+        calc.mkdir(parents=True, exist_ok=True)
+        (calc / "scratch_longrun_demo.py").write_text(
+            "def add(a: int, b: int) -> int:\n    return a + b\n",
+            encoding="utf-8",
+        )
+        (calc / "test_scratch_longrun_demo.py").write_text(
+            "from scratch_longrun_demo import add\n"
+            "assert add(1, 2) == 3\n",
+            encoding="utf-8",
+        )
+        return AgentResult(
+            content="ok",
+            usage=TokenUsage(input_tokens=10, output_tokens=5),
+        )
+
+    agent = _ScriptedAgent([_write_calc_files])
+    runner = SubtaskRunner(
+        agent=agent,
+        artifact_store=artifact_store,
+        verifier=FakeVerifier(passed=True),
+        git_checkpoint=GitCheckpoint(cwd=str(tmp_repo)),
+    )
+    executor = GraphExecutor(
+        project_path=str(tmp_repo),
+        max_retries=2,
+        subtask_runner=runner,
+        ledger_manager=ledger_manager,
+        checkpoint_manager=checkpoint_manager,
+        longrun_config=LongRunConfig(token_budget=10_000),
+    )
+    ledger = ledger_manager.create("g", graph, budget=10_000)
+
+    result = await executor.execute_with_ledger(graph, ledger, str(tmp_repo))
+
+    assert result.tasks_completed == 1
+    assert ledger.completed_tasks[0].confidence == Confidence.DONE.value
+    metas = artifact_store.list_for_task("solo", run_id=ledger.task_id)
+    artifact = SubtaskArtifact.load(metas[0].path)
+    assert artifact.self_verification.overall_passed is True

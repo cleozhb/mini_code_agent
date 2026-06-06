@@ -9,6 +9,7 @@ import openai
 
 from .base import (
     LLMClient,
+    LLMCapabilities,
     LLMError,
     LLMAuthError,
     LLMRateLimitError,
@@ -34,6 +35,13 @@ class OpenAIClient(LLMClient):
     ) -> None:
         super().__init__(model, api_key=api_key, base_url=base_url)
         self.__client: openai.AsyncOpenAI | None = None
+        self.capabilities = LLMCapabilities(
+            structured_outputs=True,
+            strict_tools=True,
+            streaming_tools=True,
+            prompt_cache=True,
+            reasoning_usage=True,
+        )
 
     @property
     def _client(self) -> openai.AsyncOpenAI:
@@ -95,46 +103,91 @@ class OpenAIClient(LLMClient):
         """统一 ToolParam -> OpenAI function tools 格式."""
         if not tools:
             return None
-        return [
-            {
-                "type": "function",
-                "function": {
-                    "name": t.name,
-                    "description": t.description,
-                    "parameters": t.parameters,
-                },
+        api_tools: list[dict] = []
+        for t in tools:
+            function: dict = {
+                "name": t.name,
+                "description": t.description,
+                "parameters": t.parameters,
             }
-            for t in tools
-        ]
+            if t.strict:
+                function["strict"] = True
+            api_tools.append(
+                {
+                    "type": "function",
+                    "function": function,
+                }
+            )
+        return api_tools
+
+    def _usage_from_response(self, resp: object) -> TokenUsage:
+        """从 OpenAI Chat usage 提取统一用量."""
+        raw_usage = getattr(resp, "usage", None)
+        if raw_usage is None:
+            return TokenUsage()
+
+        prompt_details = getattr(raw_usage, "prompt_tokens_details", None)
+        completion_details = getattr(raw_usage, "completion_tokens_details", None)
+        return TokenUsage(
+            input_tokens=getattr(raw_usage, "prompt_tokens", 0) or 0,
+            output_tokens=getattr(raw_usage, "completion_tokens", 0) or 0,
+            cached_input_tokens=getattr(prompt_details, "cached_tokens", 0) or 0,
+            reasoning_tokens=getattr(completion_details, "reasoning_tokens", 0) or 0,
+        )
+
+    def _parse_tool_call_arguments(self, raw_arguments: str) -> tuple[dict, str | None]:
+        """解析工具参数 JSON，失败时保留错误给上层观察."""
+        raw_arguments = raw_arguments or ""
+        if not raw_arguments:
+            return {}, None
+        try:
+            parsed = json.loads(raw_arguments)
+        except json.JSONDecodeError as e:
+            return {}, str(e)
+        if not isinstance(parsed, dict):
+            return {}, f"tool arguments must be a JSON object, got {type(parsed).__name__}"
+        return parsed, None
+
+    def _tool_call_from_parts(
+        self,
+        *,
+        tool_call_id: str,
+        name: str,
+        raw_arguments: str,
+    ) -> ToolCall:
+        arguments, parse_error = self._parse_tool_call_arguments(raw_arguments)
+        return ToolCall(
+            id=tool_call_id,
+            name=name,
+            arguments=arguments,
+            raw_arguments=raw_arguments,
+            parse_error=parse_error,
+        )
 
     def _parse_response(
         self, resp: openai.types.chat.ChatCompletion
     ) -> LLMResponse:
         """OpenAI 响应 -> 统一 LLMResponse."""
-        choice = resp.choices[0]
+        usage = self._usage_from_response(resp)
+        choices = getattr(resp, "choices", None) or []
+        if not choices:
+            self._accumulate_usage(usage)
+            raise LLMError("OpenAI 响应缺少 choices，无法解析模型输出")
+
+        choice = choices[0]
         message = choice.message
 
         tool_calls: list[ToolCall] = []
         if message.tool_calls:
             for tc in message.tool_calls:
-                try:
-                    args = json.loads(tc.function.arguments)
-                except json.JSONDecodeError:
-                    args = {}
                 tool_calls.append(
-                    ToolCall(
-                        id=tc.id,
+                    self._tool_call_from_parts(
+                        tool_call_id=tc.id,
                         name=tc.function.name,
-                        arguments=args,
+                        raw_arguments=tc.function.arguments,
                     )
                 )
 
-        usage = TokenUsage()
-        if resp.usage:
-            usage = TokenUsage(
-                input_tokens=resp.usage.prompt_tokens,
-                output_tokens=resp.usage.completion_tokens,
-            )
         self._accumulate_usage(usage)
 
         return LLMResponse(
@@ -212,10 +265,7 @@ class OpenAIClient(LLMClient):
         async for chunk in stream:
             # 最终 chunk 携带用量信息（无 choices）
             if chunk.usage:
-                usage = TokenUsage(
-                    input_tokens=chunk.usage.prompt_tokens,
-                    output_tokens=chunk.usage.completion_tokens,
-                )
+                usage = self._usage_from_response(chunk)
                 self._accumulate_usage(usage)
                 yield StreamDelta(type=StreamDeltaType.FINISH, usage=usage)
                 continue
@@ -249,6 +299,11 @@ class OpenAIClient(LLMClient):
                             tool_call_id=tool_calls_in_progress[idx]["id"],
                             tool_name=tool_calls_in_progress[idx]["name"],
                         )
+
+                    if tc_delta.id:
+                        tool_calls_in_progress[idx]["id"] = tc_delta.id
+                    if tc_delta.function and tc_delta.function.name:
+                        tool_calls_in_progress[idx]["name"] = tc_delta.function.name
 
                     # 累积参数
                     if tc_delta.function and tc_delta.function.arguments:

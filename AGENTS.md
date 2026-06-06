@@ -3,7 +3,7 @@
 一个用 Python 从零构建的编程 Agent，学习项目。
 
 ## 技术栈
-- Python 3.11+
+- Python 3.12+
 - uv 管理依赖和虚拟环境
 - anthropic SDK + openai SDK（双模型支持）
 - Rich（终端 UI）

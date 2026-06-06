@@ -20,6 +20,7 @@ from rich.text import Text
 
 from ..core.agent import Agent, AgentEvent, AgentEventType
 from ..llm.base import LLMClient, TokenUsage, ToolCall
+from ..llm.pricing import estimate_cost
 from ..tools.base import ToolRegistry
 from .confirm import confirm_tool_call
 
@@ -31,38 +32,6 @@ if TYPE_CHECKING:
     from ..longrun.config import LongRunConfig
     from ..longrun.ledger_manager import TaskLedgerManager
     from ..longrun.resume_manager import ResumeManager
-
-# ---------------------------------------------------------------------------
-# Token 费用估算（每百万 token 美元价格, 可按模型调整）
-# ---------------------------------------------------------------------------
-
-_PRICE_TABLE: dict[str, tuple[float, float]] = {
-    # (input_price_per_1m, output_price_per_1m)
-    "gpt-4o": (2.5, 10.0),
-    "gpt-4o-mini": (0.15, 0.6),
-    "gpt-4-turbo": (10.0, 30.0),
-    "claude-sonnet-4-20250514": (3.0, 15.0),
-    "claude-opus-4-20250514": (15.0, 75.0),
-    "deepseek-chat": (0.27, 1.10),
-    "deepseek-reasoner": (0.55, 2.19),
-}
-
-
-def _estimate_cost(model: str, usage: TokenUsage) -> float | None:
-    """估算费用（美元），模型不在表中返回 None."""
-    prices = _PRICE_TABLE.get(model)
-    if not prices:
-        # 尝试前缀匹配
-        for key, val in _PRICE_TABLE.items():
-            if model.startswith(key):
-                prices = val
-                break
-    if not prices:
-        return None
-    input_cost = usage.input_tokens / 1_000_000 * prices[0]
-    output_cost = usage.output_tokens / 1_000_000 * prices[1]
-    return input_cost + output_cost
-
 
 # ---------------------------------------------------------------------------
 # REPL
@@ -527,7 +496,7 @@ class REPL:
         """显示 token 消耗和费用估算."""
         usage = self.agent.total_usage
         model = self.agent.llm_client.model
-        cost = _estimate_cost(model, usage)
+        cost = estimate_cost(model, usage)
 
         lines = [
             f"模型: {model}",
@@ -535,8 +504,26 @@ class REPL:
             f"输出 tokens: {usage.output_tokens:,}",
             f"总计 tokens: {usage.total_tokens:,}",
         ]
+        if usage.cached_input_tokens:
+            lines.append(f"OpenAI cached input tokens: {usage.cached_input_tokens:,}")
+        if usage.reasoning_tokens:
+            lines.append(f"OpenAI reasoning tokens: {usage.reasoning_tokens:,}")
+        if usage.cache_creation_input_tokens:
+            lines.append(
+                "Anthropic cache creation tokens: "
+                f"{usage.cache_creation_input_tokens:,}"
+            )
+        if usage.cache_read_input_tokens:
+            lines.append(
+                f"Anthropic cache read tokens: {usage.cache_read_input_tokens:,}"
+            )
         if cost is not None:
-            lines.append(f"估算费用: ${cost:.4f}")
+            suffix = "" if cost.is_complete else "（部分估算）"
+            lines.append(f"估算费用: ${cost.total_cost:.4f}{suffix}")
+            if cost.missing_price_items:
+                lines.append(
+                    "缺失价格项: " + ", ".join(cost.missing_price_items)
+                )
         else:
             lines.append("估算费用: (该模型暂无价格数据)")
 
@@ -851,7 +838,7 @@ class REPL:
         if parts and parts[0] == "show" and len(parts) > 1:
             artifact_id = parts[1].strip()
             try:
-                art = self._artifact_store.load(artifact_id)
+                art = self._artifact_store.load(artifact_id, run_id=ledger.task_id)
             except FileNotFoundError:
                 self.console.print(f"[red]找不到 Artifact: {artifact_id}[/red]")
                 return
@@ -874,7 +861,7 @@ class REPL:
             return
 
         for tid in task_ids:
-            metas = self._artifact_store.list_for_task(tid)
+            metas = self._artifact_store.list_for_task(tid, run_id=ledger.task_id)
             if not metas:
                 continue
             self.console.print(f"[bold]{tid}[/bold]")

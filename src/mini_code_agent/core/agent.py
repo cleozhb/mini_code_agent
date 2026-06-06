@@ -315,8 +315,7 @@ class Agent:
 
         while True:
             single = await self._run_once(current_user_msg)
-            total_usage.input_tokens += single.usage.input_tokens
-            total_usage.output_tokens += single.usage.output_tokens
+            total_usage.add(single.usage)
             total_tool_calls += single.tool_calls_count
             total_tool_errors += single.tool_calls_errors
             last_content = single.content
@@ -476,8 +475,7 @@ class Agent:
             step_prompt = "\n".join(step_prompt_lines)
 
             single = await self._run_once(step_prompt)
-            total_usage.input_tokens += single.usage.input_tokens
-            total_usage.output_tokens += single.usage.output_tokens
+            total_usage.add(single.usage)
             total_tool_calls += single.tool_calls_count
             last_content = single.content
 
@@ -584,8 +582,7 @@ class Agent:
             )
 
             # 累计 token 用量
-            round_usage.input_tokens += response.usage.input_tokens
-            round_usage.output_tokens += response.usage.output_tokens
+            round_usage.add(response.usage)
             self._notify_llm_call(response.usage)
 
             # LoopGuard token 预算检查
@@ -644,7 +641,6 @@ class Agent:
                     total_tool_errors += 1
 
         # 超过最大轮数，做一次不带 tools 的收尾调用
-        self._accumulate_usage(round_usage)
         logger.warning("达到最大工具调用轮数，强制收尾")
         result = await self._force_final_response(
             round_usage, total_tool_calls, total_tool_errors
@@ -738,10 +734,22 @@ class Agent:
 
                     if tc is not None:
                         import json
+                        tc.raw_arguments = delta.content
                         try:
-                            tc.arguments = json.loads(delta.content) if delta.content else {}
+                            parsed_args = json.loads(delta.content) if delta.content else {}
                         except json.JSONDecodeError:
                             tc.arguments = {}
+                            tc.parse_error = "工具参数不是合法 JSON"
+                        else:
+                            if isinstance(parsed_args, dict):
+                                tc.arguments = parsed_args
+                                tc.parse_error = None
+                            else:
+                                tc.arguments = {}
+                                tc.parse_error = (
+                                    "工具参数必须是 JSON object，"
+                                    f"实际是 {type(parsed_args).__name__}"
+                                )
                         tool_calls.append(tc)
                         yield AgentEvent(
                             type=AgentEventType.TOOL_CALL_END,
@@ -750,8 +758,7 @@ class Agent:
 
                 elif delta.type == StreamDeltaType.FINISH:
                     if delta.usage:
-                        round_usage.input_tokens += delta.usage.input_tokens
-                        round_usage.output_tokens += delta.usage.output_tokens
+                        round_usage.add(delta.usage)
                         # LoopGuard token 预算检查
                         if self.loop_guard:
                             token_msg = self.loop_guard.add_tokens(
@@ -791,7 +798,6 @@ class Agent:
                 )
 
         # 超出最大轮数 → 收尾
-        self._accumulate_usage(round_usage)
         logger.warning("达到最大工具调用轮数，强制收尾")
 
         # 强制收尾也用流式
@@ -811,8 +817,7 @@ class Agent:
                     content=delta.content,
                 )
             elif delta.type == StreamDeltaType.FINISH and delta.usage:
-                round_usage.input_tokens += delta.usage.input_tokens
-                round_usage.output_tokens += delta.usage.output_tokens
+                round_usage.add(delta.usage)
 
         self.conversation.append(Message.assistant(full_content))
         self._accumulate_usage(round_usage)
@@ -882,6 +887,19 @@ class Agent:
 
     async def _execute_tool_call(self, tool_call: ToolCall) -> Message:
         """执行单个工具调用，返回 tool result 消息."""
+        if tool_call.parse_error:
+            return Message.tool(
+                LLMToolResult(
+                    tool_call_id=tool_call.id,
+                    content=(
+                        "错误：工具参数 JSON 解析失败，请重新调用工具并传入合法参数。"
+                        f"\nparse_error: {tool_call.parse_error}"
+                        f"\nraw_arguments: {tool_call.raw_arguments}"
+                    ),
+                    is_error=True,
+                )
+            )
+
         tool = self.tool_registry.get(tool_call.name)
 
         if tool is None:
@@ -973,6 +991,22 @@ class Agent:
         self, tool_call: ToolCall
     ) -> tuple[Message, ExecToolResult]:
         """执行工具调用，同时返回 Message 和原始 ExecToolResult（供 CLI 展示）."""
+        if tool_call.parse_error:
+            content = (
+                "错误：工具参数 JSON 解析失败，请重新调用工具并传入合法参数。"
+                f"\nparse_error: {tool_call.parse_error}"
+                f"\nraw_arguments: {tool_call.raw_arguments}"
+            )
+            dummy = ExecToolResult(output="", error=content)
+            msg = Message.tool(
+                LLMToolResult(
+                    tool_call_id=tool_call.id,
+                    content=content,
+                    is_error=True,
+                )
+            )
+            return msg, dummy
+
         tool = self.tool_registry.get(tool_call.name)
 
         if tool is None:
@@ -1151,8 +1185,7 @@ class Agent:
             )
         )
         response = await self.llm_client.chat(messages=self.messages, tools=None)
-        accumulated_usage.input_tokens += response.usage.input_tokens
-        accumulated_usage.output_tokens += response.usage.output_tokens
+        accumulated_usage.add(response.usage)
         self.conversation.append(Message.assistant(response.content))
         self._accumulate_usage(accumulated_usage)
         return AgentResult(
@@ -1165,8 +1198,7 @@ class Agent:
 
     def _accumulate_usage(self, usage: TokenUsage) -> None:
         """累计本轮 token 用量到全局."""
-        self.total_usage.input_tokens += usage.input_tokens
-        self.total_usage.output_tokens += usage.output_tokens
+        self.total_usage.add(usage)
 
     def add_observer(self, obs: AgentObserver) -> None:
         """挂载一个 observer."""

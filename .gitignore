@@ -11,6 +11,7 @@ wheels/
 
 # Environment variables
 .env
+.gitignore
 
 .agent_history
 .claude/
@@ -18,3 +19,4 @@ wheels/
 .agent-backups/
 .agent/
 examples/
+docs/agent-interview-guide.md

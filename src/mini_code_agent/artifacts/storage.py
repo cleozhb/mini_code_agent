@@ -24,6 +24,7 @@ class ArtifactMeta:
     producer: str
     files_changed: int
     path: str  # 磁盘路径
+    run_id: str
 
 
 class ArtifactStore:
@@ -31,17 +32,18 @@ class ArtifactStore:
 
     文件布局：
       {storage_dir}/
-        {task_id}/
-          {artifact_id}.json        # Artifact 本体
-          {artifact_id}.patch       # 原始 patch，独立存储便于 diff 查看
+        {run_id}/                   # 长程任务使用 Ledger.task_id
+          {task_id}/
+            {artifact_id}.json      # Artifact 本体
+            {artifact_id}.patch     # 原始 patch，独立存储便于 diff 查看
     """
 
     def __init__(self, storage_dir: str = ".agent/artifacts/") -> None:
         self.storage_dir = storage_dir
 
-    def save(self, artifact: SubtaskArtifact) -> str:
+    def save(self, artifact: SubtaskArtifact, run_id: str) -> str:
         """保存 Artifact 到磁盘，返回存储路径."""
-        base = Path(self.storage_dir) / artifact.task_id
+        base = self._task_dir(artifact.task_id, run_id)
         base.mkdir(parents=True, exist_ok=True)
 
         # 保存 JSON
@@ -56,24 +58,28 @@ class ArtifactStore:
         logger.info("Artifact 已保存: %s", json_path)
         return str(json_path)
 
-    def load(self, artifact_id: str) -> SubtaskArtifact:
-        """按 artifact_id 加载 Artifact（需要搜索所有 task 目录）."""
+    def load(
+        self,
+        artifact_id: str,
+        run_id: str,
+    ) -> SubtaskArtifact:
+        """在指定长程任务命名空间内按 artifact_id 加载 Artifact."""
         root = Path(self.storage_dir)
         if not root.exists():
             raise FileNotFoundError(f"存储目录不存在: {self.storage_dir}")
 
-        for task_dir in root.iterdir():
-            if not task_dir.is_dir():
-                continue
-            json_path = task_dir / f"{artifact_id}.json"
-            if json_path.exists():
-                return SubtaskArtifact.load(str(json_path))
+        for json_path in sorted((root / run_id).glob(f"*/{artifact_id}.json")):
+            return SubtaskArtifact.load(str(json_path))
 
         raise FileNotFoundError(f"Artifact 不存在: {artifact_id}")
 
-    def list_for_task(self, task_id: str) -> list[ArtifactMeta]:
+    def list_for_task(
+        self,
+        task_id: str,
+        run_id: str,
+    ) -> list[ArtifactMeta]:
         """列出某个 task 的所有 artifact（含被 reject 的历史版本）."""
-        task_dir = Path(self.storage_dir) / task_id
+        task_dir = self._task_dir(task_id, run_id)
         if not task_dir.exists():
             return []
 
@@ -91,6 +97,7 @@ class ArtifactStore:
                         producer=data["producer"],
                         files_changed=data["patch"]["total_files_changed"],
                         path=str(json_file),
+                        run_id=run_id,
                     )
                 )
             except (json.JSONDecodeError, KeyError) as e:
@@ -99,12 +106,20 @@ class ArtifactStore:
 
         return metas
 
-    def get_latest_for_task(self, task_id: str) -> SubtaskArtifact | None:
+    def get_latest_for_task(
+        self,
+        task_id: str,
+        run_id: str,
+    ) -> SubtaskArtifact | None:
         """获取某个 task 最新的 artifact."""
-        metas = self.list_for_task(task_id)
+        metas = self.list_for_task(task_id, run_id=run_id)
         if not metas:
             return None
 
         # 按 created_at 排序取最新
         metas.sort(key=lambda m: m.created_at, reverse=True)
         return SubtaskArtifact.load(metas[0].path)
+
+    def _task_dir(self, task_id: str, run_id: str) -> Path:
+        root = Path(self.storage_dir)
+        return root / run_id / task_id

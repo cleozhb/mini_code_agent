@@ -24,7 +24,7 @@ def create_client(
     优先级: 显式参数 > .env 文件配置 > 硬编码默认值
 
     Args:
-        provider: "anthropic" | "openai"
+        provider: "anthropic" | "openai" | "openai-responses"
         model: 模型名称，为 None 时从 .env 读取
         api_key: API Key，为 None 时从 .env 读取
         base_url: API Base URL，为 None 时从 .env 读取
@@ -41,12 +41,28 @@ def create_client(
         from .claude_client import ClaudeClient
 
         return ClaudeClient(
-            model=model or _config.get("ANTHROPIC_MODEL", "claude-sonnet-4-20250514"),
+            model=model or _config.get("ANTHROPIC_MODEL", "claude-sonnet-4-6"),
             api_key=api_key or _config.get("ANTHROPIC_API_KEY"),
             base_url=base_url or _config.get("ANTHROPIC_BASE_URL"),
+            cache_ttl=_config.get("ANTHROPIC_CACHE_TTL", "off") or "off",
         )
 
     if provider == "openai":
+        api_style = (_config.get("OPENAI_API_STYLE", "chat") or "chat").lower()
+        if api_style == "responses":
+            from .openai_responses_client import OpenAIResponsesClient
+
+            return OpenAIResponsesClient(
+                model=model or _config.get("OPENAI_MODEL", "gpt-4o"),
+                api_key=api_key or _config.get("OPENAI_API_KEY"),
+                base_url=base_url or _config.get("OPENAI_BASE_URL"),
+            )
+        if api_style != "chat":
+            raise LLMError(
+                "不支持的 OPENAI_API_STYLE: "
+                f"{api_style!r}，可选: chat, responses"
+            )
+
         from .openai_client import OpenAIClient
 
         return OpenAIClient(
@@ -55,4 +71,15 @@ def create_client(
             base_url=base_url or _config.get("OPENAI_BASE_URL"),
         )
 
-    raise LLMError(f"不支持的 provider: {provider!r}，可选: anthropic, openai")
+    if provider == "openai-responses":
+        from .openai_responses_client import OpenAIResponsesClient
+
+        return OpenAIResponsesClient(
+            model=model or _config.get("OPENAI_MODEL", "gpt-4o"),
+            api_key=api_key or _config.get("OPENAI_API_KEY"),
+            base_url=base_url or _config.get("OPENAI_BASE_URL"),
+        )
+
+    raise LLMError(
+        f"不支持的 provider: {provider!r}，可选: anthropic, openai, openai-responses"
+    )
