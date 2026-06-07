@@ -1,6 +1,6 @@
 # Evaluation 系统设计文档
 
-本文档是 mini_code_agent Evaluation 系统的完整设计说明与施工蓝图。每次新会话接手这个工作时，先读本文档 + 根目录 `CLAUDE.md` 即可接着干。
+本文档是 mini_code_agent Evaluation 系统的完整设计说明与施工蓝图。每次新会话接手这个工作时，先读本文档 + 根目录 `AGENTS.md` / `CLAUDE.md` 即可接着干。
 
 ## 目的
 

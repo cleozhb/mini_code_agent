@@ -32,6 +32,7 @@ PROTECTED_ROOT_PATTERNS: list[str] = [
     "Makefile",
     "Dockerfile",
     ".gitignore",
+    "AGENTS.md",
     "CLAUDE.md",
 ]
 

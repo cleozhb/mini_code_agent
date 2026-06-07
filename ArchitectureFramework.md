@@ -55,7 +55,7 @@
 │  短期记忆           长期记忆          Context      │
 │  当前会话            项目规则          Window       │
 │  对话历史            偏好/约定         管理器       │
-│  (消息列表)          (AGENT.md)       (截断/压缩)  │
+│  (消息列表)          (AGENTS/CLAUDE)  (截断/压缩)  │
 └─────────────────────────────────────────────────┘
 
   ═══════════════════════════════════════════════
@@ -138,7 +138,7 @@ Coding Agent 最核心的能力，直接决定 Agent 的能力上限。
 | Repo Map | 项目的"地图"——文件列表 + 每个文件的简要描述（类/函数签名） |
 | Context Window 管理 | 监控 token 用量，接近上限时触发压缩策略 |
 | 对话摘要压缩 | 早期对话压缩成摘要，保留关键决策和结果 |
-| 项目级指令文件 | 类似 CLAUDE.md / AGENT.md，用户提供的项目约定和偏好 |
+| 项目级指令文件 | AGENTS.md / CLAUDE.md，用户提供的项目约定和偏好；内容相同时只加载一次 |
 
 **分层上下文策略：**
 
@@ -146,7 +146,7 @@ Coding Agent 最核心的能力，直接决定 Agent 的能力上限。
 层级 1 — 静态全局（session 开始加载一次）
   ├─ 项目类型（package.json / pyproject.toml 推断）
   ├─ 目录树（top 2-3 levels, 忽略 node_modules）
-  ├─ AGENT.md 项目指令
+  ├─ AGENTS.md / CLAUDE.md 项目指令（内容去重）
   └─ 关键配置摘要
 
 层级 2 — 动态按需（Agent 决定读什么）
@@ -240,7 +240,7 @@ search_code   — ripgrep 搜索代码
   └─ 实现：内存中的数组
 
 长期记忆 — 跨会话的项目知识
-  ├─ 存储：项目根目录下的 AGENT.md 或 .agent/memory.json
+  ├─ 存储：项目根目录下的 AGENTS.md / CLAUDE.md 或 .agent/memory.json
   ├─ 内容：项目约定、用户偏好、常见错误的解法
   └─ 更新：任务结束时 Agent 提议写入，用户确认
 

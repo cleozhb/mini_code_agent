@@ -130,7 +130,7 @@ class ContextBuilder:
 
         拼接顺序（按稳定性从高到低排列）：
           1. 基础指令（角色定义 + 工具使用规范）     — 永远不变
-          2. AGENT.md / CLAUDE.md 项目指令文件       — 几乎不变
+          2. AGENTS.md / CLAUDE.md 项目指令文件      — 几乎不变
           3. 项目元信息（类型、语言、框架、包管理器）  — 几乎不变
           4. 目录树（top 2-3 levels）                — 偶尔变化
           5. Repo Map（文件列表 + 签名摘要）          — 偶尔变化
@@ -156,7 +156,7 @@ class ContextBuilder:
         # 基础指令是最稳定的部分，记为 cache-friendly 前缀
         cache_prefix_end = used_tokens
 
-        # --- Section 2: 项目指令文件 AGENT.md / CLAUDE.md（必须包含）---
+        # --- Section 2: 项目指令文件 AGENTS.md / CLAUDE.md（必须包含）---
         project_instructions = self._read_project_instructions()
         if project_instructions:
             section = f"\n<project-instructions>\n{project_instructions}\n</project-instructions>"
@@ -316,16 +316,24 @@ class ContextBuilder:
     # ------------------------------------------------------------------
 
     def _read_project_instructions(self) -> str:
-        """读取项目指令文件 CLAUDE.md / AGENT.md."""
-        candidates = ["CLAUDE.md", "AGENT.md"]
+        """读取项目指令文件 AGENTS.md / CLAUDE.md，并对相同内容去重."""
+        candidates = ["AGENTS.md", "CLAUDE.md"]
+        sections: list[str] = []
+        seen_contents: set[str] = set()
+
         for name in candidates:
             p = self.project_path / name
             if p.exists() and p.is_file():
                 try:
-                    return p.read_text(encoding="utf-8").strip()
+                    content = p.read_text(encoding="utf-8").strip()
                 except (UnicodeDecodeError, PermissionError):
                     continue
-        return ""
+                if not content or content in seen_contents:
+                    continue
+                seen_contents.add(content)
+                sections.append(f"## {name}\n{content}")
+
+        return "\n\n".join(sections)
 
     def _format_project_meta(self, info: ProjectInfo) -> str:
         """格式化项目元信息."""

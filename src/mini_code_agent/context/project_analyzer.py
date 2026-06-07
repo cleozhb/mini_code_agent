@@ -313,7 +313,7 @@ def get_key_files(path: str | Path) -> list[str]:
     # 优先级从高到低
     candidates = [
         # 项目指令文件
-        "CLAUDE.md", "AGENT.md", ".cursorrules",
+        "AGENTS.md", "CLAUDE.md", ".cursorrules",
         # 文档
         "README.md", "README.rst", "README.txt", "README",
         # Python 配置

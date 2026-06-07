@@ -56,7 +56,9 @@ def small_python_project(tmp_path: Path) -> Path:
     # uv.lock (触发 uv 检测)
     (root / "uv.lock").write_text("# lock file")
 
-    # CLAUDE.md
+    # AGENTS.md
+    (root / "AGENTS.md").write_text("# Project Instructions\n\nUse uv for deps.\n")
+    # CLAUDE.md often mirrors AGENTS.md for Claude Code.
     (root / "CLAUDE.md").write_text("# Project Instructions\n\nUse uv for deps.\n")
 
     # README.md
@@ -368,6 +370,7 @@ class TestGetKeyFiles:
 
     def test_python_project_key_files(self, small_python_project: Path) -> None:
         key_files = get_key_files(small_python_project)
+        assert "AGENTS.md" in key_files
         assert "CLAUDE.md" in key_files
         assert "README.md" in key_files
         assert "pyproject.toml" in key_files
@@ -571,6 +574,35 @@ class TestContextBuilder:
         assert "repo-map" in context
         # 小项目的 repo map 应包含签名
         assert "App" in context
+
+    def test_project_instructions_deduplicate_same_content(
+        self,
+        small_python_project: Path,
+    ) -> None:
+        """AGENTS.md 和 CLAUDE.md 内容相同时只加载一次."""
+        builder = ContextBuilder(project_path=small_python_project)
+        context = builder.build_initial_context("Base.")
+
+        assert context.count("# Project Instructions") == 1
+        assert "## AGENTS.md" in context
+        assert "## CLAUDE.md" not in context
+
+    def test_project_instructions_include_distinct_content(
+        self,
+        small_python_project: Path,
+    ) -> None:
+        """AGENTS.md 和 CLAUDE.md 内容不同时都加载."""
+        (small_python_project / "CLAUDE.md").write_text(
+            "# Claude Code Instructions\n\nUse Claude-specific workflow.\n"
+        )
+
+        builder = ContextBuilder(project_path=small_python_project)
+        context = builder.build_initial_context("Base.")
+
+        assert "## AGENTS.md" in context
+        assert "## CLAUDE.md" in context
+        assert "# Project Instructions" in context
+        assert "# Claude Code Instructions" in context
 
     def test_build_initial_context_large_project(self, large_project: Path) -> None:
         """大项目 (>500 文件) 的 repo map 应被降级或截断."""
