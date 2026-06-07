@@ -36,6 +36,7 @@ if TYPE_CHECKING:
     from ..longrun.ledger_manager import TaskLedgerManager
     from ..longrun.session_state import SessionState
     from ..longrun.task_ledger import TaskLedger
+    from ..trace import TraceRecorder
     from ..verify.verifier import IncrementalVerifier
     from .task_graph import TaskGraph
 
@@ -184,6 +185,7 @@ class Agent:
         longrun_config: LongRunConfig | None = None,
         task_graph: TaskGraph | None = None,
         incremental_verifier: IncrementalVerifier | None = None,
+        trace_recorder: TraceRecorder | None = None,
     ) -> None:
         self.llm_client = llm_client
         self.tool_registry = tool_registry
@@ -226,6 +228,9 @@ class Agent:
 
         # Incremental Verifier（可选）—— 每次 Edit 后做层级 1 快速验证
         self.incremental_verifier = incremental_verifier
+        self.trace_recorder = trace_recorder or getattr(
+            llm_client, "trace_recorder", None
+        )
 
         # Observer 列表（可选）— SubtaskRunner 用来追踪 tool / LLM 调用
         self.observers: list[AgentObserver] = []
@@ -258,20 +263,29 @@ class Agent:
         超时后返回 stop_reason="timeout" 的 AgentResult，
         注意：正在运行的 Bash 子进程可能残留（尽力而为）。
         """
+        trace_run_id = self._trace_agent_run_start(user_message)
         if self.max_wall_time_seconds is None:
-            return await self._run_impl(user_message)
+            try:
+                result = await self._run_impl(user_message)
+            except Exception as e:
+                self._trace_agent_run_finish(trace_run_id, error=e)
+                raise
+            self._trace_agent_run_finish(trace_run_id, result=result)
+            return result
 
         try:
-            return await asyncio.wait_for(
+            result = await asyncio.wait_for(
                 self._run_impl(user_message),
                 timeout=self.max_wall_time_seconds,
             )
+            self._trace_agent_run_finish(trace_run_id, result=result)
+            return result
         except asyncio.TimeoutError:
             logger.warning(
                 "Agent 运行超时（%.1fs），返回部分结果",
                 self.max_wall_time_seconds,
             )
-            return AgentResult(
+            result = AgentResult(
                 content=(
                     f"[超时] Agent 超过 {self.max_wall_time_seconds:.0f}s "
                     f"墙钟上限，已中止。"
@@ -280,6 +294,12 @@ class Agent:
                 tool_calls_count=0,
                 stop_reason="timeout",
             )
+            self._trace_agent_run_finish(
+                trace_run_id,
+                result=result,
+                stop_reason="timeout",
+            )
+            return result
 
     async def _run_impl(self, user_message: str) -> AgentResult:
         """核心循环：发送消息 → 处理工具调用 → 返回最终文本.
@@ -654,6 +674,7 @@ class Agent:
         yields:
             AgentEvent 事件流：TEXT_DELTA / TOOL_CALL_* / TOOL_RESULT / FINISH
         """
+        trace_run_id = self._trace_agent_run_start(user_message)
         # 自动 checkpoint：记录任务开始前的 HEAD（不创建 commit）
         task_desc = user_message[:80]
         self._files_changed = []
@@ -775,6 +796,14 @@ class Agent:
                 # 自动 checkpoint：任务完成后
                 if self.git_checkpoint is not None:
                     await self.git_checkpoint.create_checkpoint(f"after: {task_desc}")
+                self._trace_agent_run_finish(
+                    trace_run_id,
+                    result=AgentResult(
+                        content=full_content,
+                        usage=round_usage,
+                        tool_calls_count=total_tool_calls,
+                    ),
+                )
                 yield AgentEvent(
                     type=AgentEventType.FINISH,
                     usage=round_usage,
@@ -825,6 +854,15 @@ class Agent:
         # 自动 checkpoint：超轮数收尾后
         if self.git_checkpoint is not None:
             await self.git_checkpoint.create_checkpoint(f"after: {task_desc}")
+        self._trace_agent_run_finish(
+            trace_run_id,
+            result=AgentResult(
+                content=full_content,
+                usage=round_usage,
+                tool_calls_count=total_tool_calls,
+                stop_reason="max_rounds",
+            ),
+        )
         yield AgentEvent(type=AgentEventType.FINISH, usage=round_usage)
 
     async def _maybe_compress(self) -> None:
@@ -887,15 +925,23 @@ class Agent:
 
     async def _execute_tool_call(self, tool_call: ToolCall) -> Message:
         """执行单个工具调用，返回 tool result 消息."""
+        trace_llm_call_id = self._trace_tool_call_start(tool_call)
         if tool_call.parse_error:
+            content = (
+                "错误：工具参数 JSON 解析失败，请重新调用工具并传入合法参数。"
+                f"\nparse_error: {tool_call.parse_error}"
+                f"\nraw_arguments: {tool_call.raw_arguments}"
+            )
+            self._trace_tool_call_result(
+                tool_call,
+                ExecToolResult(output="", error=content),
+                llm_call_id=trace_llm_call_id,
+                metadata={"parse_error": True},
+            )
             return Message.tool(
                 LLMToolResult(
                     tool_call_id=tool_call.id,
-                    content=(
-                        "错误：工具参数 JSON 解析失败，请重新调用工具并传入合法参数。"
-                        f"\nparse_error: {tool_call.parse_error}"
-                        f"\nraw_arguments: {tool_call.raw_arguments}"
-                    ),
+                    content=content,
                     is_error=True,
                 )
             )
@@ -903,6 +949,13 @@ class Agent:
         tool = self.tool_registry.get(tool_call.name)
 
         if tool is None:
+            result = ExecToolResult(output="", error=f"未找到工具 '{tool_call.name}'")
+            self._trace_tool_call_result(
+                tool_call,
+                result,
+                llm_call_id=trace_llm_call_id,
+                metadata={"tool_missing": True},
+            )
             return Message.tool(
                 LLMToolResult(
                     tool_call_id=tool_call.id,
@@ -914,6 +967,16 @@ class Agent:
         # 安全检查
         safety_level, block_reason = self._check_safety(tool.name, tool_call)
         if safety_level == SafetyLevel.BLOCKED:
+            result = ExecToolResult(output="", error=f"[安全拦截] {block_reason}")
+            self._trace_tool_call_result(
+                tool_call,
+                result,
+                llm_call_id=trace_llm_call_id,
+                metadata={
+                    "safety_level": safety_level,
+                    "block_reason": block_reason,
+                },
+            )
             return Message.tool(
                 LLMToolResult(
                     tool_call_id=tool_call.id,
@@ -924,6 +987,16 @@ class Agent:
 
         # 检查权限
         if tool.permission_level == PermissionLevel.DENY:
+            result = ExecToolResult(
+                output="",
+                error=f"工具 '{tool_call.name}' 被禁止执行",
+            )
+            self._trace_tool_call_result(
+                tool_call,
+                result,
+                llm_call_id=trace_llm_call_id,
+                metadata={"permission_level": tool.permission_level},
+            )
             return Message.tool(
                 LLMToolResult(
                     tool_call_id=tool_call.id,
@@ -949,11 +1022,24 @@ class Agent:
         # 执行工具
         try:
             result: ExecToolResult = await tool.run(tool_call.arguments)
-        except AgentStuckError:
+        except AgentStuckError as e:
+            self._trace_tool_call_result(
+                tool_call,
+                ExecToolResult(output="", error=str(e)),
+                llm_call_id=trace_llm_call_id,
+                metadata={"agent_stuck": True},
+            )
             # Agent 主动宣告卡住 — 让上层捕获，不要包成 tool error
             raise
         except Exception as e:
             logger.exception("工具 '%s' 执行异常", tool_call.name)
+            result = ExecToolResult(output="", error=f"{type(e).__name__}: {e}")
+            self._trace_tool_call_result(
+                tool_call,
+                result,
+                llm_call_id=trace_llm_call_id,
+                metadata={"exception": True},
+            )
             return Message.tool(
                 LLMToolResult(
                     tool_call_id=tool_call.id,
@@ -978,6 +1064,18 @@ class Agent:
         warning = await self._maybe_quick_verify(tool.name, tool_call.arguments, result)
         if warning:
             content = (content or "") + warning
+            result = ExecToolResult(
+                output=(result.output or "") + warning,
+                error=result.error,
+                exit_code=result.exit_code,
+            )
+
+        self._trace_tool_call_result(
+            tool_call,
+            result,
+            llm_call_id=trace_llm_call_id,
+            metadata={"safety_level": safety_level},
+        )
 
         return Message.tool(
             LLMToolResult(
@@ -991,6 +1089,7 @@ class Agent:
         self, tool_call: ToolCall
     ) -> tuple[Message, ExecToolResult]:
         """执行工具调用，同时返回 Message 和原始 ExecToolResult（供 CLI 展示）."""
+        trace_llm_call_id = self._trace_tool_call_start(tool_call)
         if tool_call.parse_error:
             content = (
                 "错误：工具参数 JSON 解析失败，请重新调用工具并传入合法参数。"
@@ -998,6 +1097,12 @@ class Agent:
                 f"\nraw_arguments: {tool_call.raw_arguments}"
             )
             dummy = ExecToolResult(output="", error=content)
+            self._trace_tool_call_result(
+                tool_call,
+                dummy,
+                llm_call_id=trace_llm_call_id,
+                metadata={"parse_error": True},
+            )
             msg = Message.tool(
                 LLMToolResult(
                     tool_call_id=tool_call.id,
@@ -1011,6 +1116,12 @@ class Agent:
 
         if tool is None:
             dummy = ExecToolResult(output="", error=f"未找到工具 '{tool_call.name}'")
+            self._trace_tool_call_result(
+                tool_call,
+                dummy,
+                llm_call_id=trace_llm_call_id,
+                metadata={"tool_missing": True},
+            )
             msg = Message.tool(
                 LLMToolResult(
                     tool_call_id=tool_call.id,
@@ -1024,6 +1135,15 @@ class Agent:
         safety_level, block_reason = self._check_safety(tool.name, tool_call)
         if safety_level == SafetyLevel.BLOCKED:
             dummy = ExecToolResult(output="", error=block_reason or "危险操作被拦截")
+            self._trace_tool_call_result(
+                tool_call,
+                dummy,
+                llm_call_id=trace_llm_call_id,
+                metadata={
+                    "safety_level": safety_level,
+                    "block_reason": block_reason,
+                },
+            )
             msg = Message.tool(
                 LLMToolResult(
                     tool_call_id=tool_call.id,
@@ -1036,6 +1156,12 @@ class Agent:
         # 权限检查
         if tool.permission_level == PermissionLevel.DENY:
             dummy = ExecToolResult(output="", error=f"工具 '{tool_call.name}' 被禁止执行")
+            self._trace_tool_call_result(
+                tool_call,
+                dummy,
+                llm_call_id=trace_llm_call_id,
+                metadata={"permission_level": tool.permission_level},
+            )
             msg = Message.tool(
                 LLMToolResult(
                     tool_call_id=tool_call.id,
@@ -1056,6 +1182,15 @@ class Agent:
             )
             if not approved:
                 dummy = ExecToolResult(output="", error="用户拒绝了此操作")
+                self._trace_tool_call_result(
+                    tool_call,
+                    dummy,
+                    llm_call_id=trace_llm_call_id,
+                    metadata={
+                        "safety_level": safety_level,
+                        "user_approved": False,
+                    },
+                )
                 msg = Message.tool(
                     LLMToolResult(
                         tool_call_id=tool_call.id,
@@ -1076,12 +1211,24 @@ class Agent:
         # 执行工具
         try:
             result: ExecToolResult = await tool.run(tool_call.arguments)
-        except AgentStuckError:
+        except AgentStuckError as e:
+            self._trace_tool_call_result(
+                tool_call,
+                ExecToolResult(output="", error=str(e)),
+                llm_call_id=trace_llm_call_id,
+                metadata={"agent_stuck": True},
+            )
             raise
         except Exception as e:
             logger.exception("工具 '%s' 执行异常", tool_call.name)
             err_result = ExecToolResult(
                 output="", error=f"{type(e).__name__}: {e}"
+            )
+            self._trace_tool_call_result(
+                tool_call,
+                err_result,
+                llm_call_id=trace_llm_call_id,
+                metadata={"exception": True},
             )
             msg = Message.tool(
                 LLMToolResult(
@@ -1109,6 +1256,13 @@ class Agent:
         if warning:
             content = (content or "") + warning
             result.output = (result.output or "") + warning
+
+        self._trace_tool_call_result(
+            tool_call,
+            result,
+            llm_call_id=trace_llm_call_id,
+            metadata={"safety_level": safety_level},
+        )
 
         msg = Message.tool(
             LLMToolResult(
@@ -1199,6 +1353,72 @@ class Agent:
     def _accumulate_usage(self, usage: TokenUsage) -> None:
         """累计本轮 token 用量到全局."""
         self.total_usage.add(usage)
+
+    def _current_llm_call_id(self) -> str | None:
+        """最近一次 LLM 调用 id，用于关联 tool 事件."""
+        return getattr(self.llm_client, "last_llm_call_id", None)
+
+    def _trace_agent_run_start(self, user_message: str) -> str | None:
+        if self.trace_recorder is None:
+            return None
+        try:
+            return self.trace_recorder.start_agent_run(user_message)
+        except Exception as e:  # noqa: BLE001
+            logger.debug("trace agent_run_start failed: %s", e)
+            return None
+
+    def _trace_agent_run_finish(
+        self,
+        run_id: str | None,
+        *,
+        result: AgentResult | None = None,
+        error: BaseException | None = None,
+        stop_reason: str | None = None,
+    ) -> None:
+        if self.trace_recorder is None:
+            return
+        try:
+            self.trace_recorder.finish_agent_run(
+                run_id,
+                result=result,
+                error=error,
+                stop_reason=stop_reason,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug("trace agent_run_finish failed: %s", e)
+
+    def _trace_tool_call_start(self, tool_call: ToolCall) -> str | None:
+        llm_call_id = self._current_llm_call_id()
+        if self.trace_recorder is None:
+            return llm_call_id
+        try:
+            self.trace_recorder.record_tool_call_start(
+                llm_call_id=llm_call_id,
+                tool_call=tool_call,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug("trace tool_call_start failed: %s", e)
+        return llm_call_id
+
+    def _trace_tool_call_result(
+        self,
+        tool_call: ToolCall,
+        result: ExecToolResult,
+        *,
+        llm_call_id: str | None,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        if self.trace_recorder is None:
+            return
+        try:
+            self.trace_recorder.record_tool_call_result(
+                llm_call_id=llm_call_id,
+                tool_call=tool_call,
+                result=result,
+                metadata=metadata,
+            )
+        except Exception as e:  # noqa: BLE001
+            logger.debug("trace tool_call_result failed: %s", e)
 
     def add_observer(self, obs: AgentObserver) -> None:
         """挂载一个 observer."""

@@ -207,6 +207,12 @@ class OpenAIClient(LLMClient):
         tools: list[ToolParam] | None = None,
         response_format: dict | None = None,
     ) -> LLMResponse:
+        trace_id = self._trace_start_llm_call(
+            mode="chat",
+            messages=messages,
+            tools=tools,
+            response_format=response_format,
+        )
         api_messages = self._convert_messages(messages)
         api_tools = self._convert_tools(tools)
 
@@ -219,16 +225,28 @@ class OpenAIClient(LLMClient):
         if response_format:
             kwargs["response_format"] = response_format
 
+        self._trace_provider_request(trace_id, kwargs)
         try:
             resp = await self._client.chat.completions.create(**kwargs)
         except openai.AuthenticationError as e:
+            self._trace_finish_llm_call(trace_id, error=e)
             raise LLMAuthError(f"OpenAI 认证失败: {e}") from e
         except openai.RateLimitError as e:
+            self._trace_finish_llm_call(trace_id, error=e)
             raise LLMRateLimitError(f"OpenAI 速率限制: {e}") from e
         except openai.APIError as e:
+            self._trace_finish_llm_call(trace_id, error=e)
             raise LLMError(f"OpenAI API 错误: {e}") from e
 
-        return self._parse_response(resp)
+        self._trace_raw_response(trace_id, resp)
+        try:
+            parsed = self._parse_response(resp)
+        except Exception as e:
+            self._trace_finish_llm_call(trace_id, error=e)
+            raise
+        self._trace_parsed_response(trace_id, parsed)
+        self._trace_finish_llm_call(trace_id, response=parsed)
+        return parsed
 
     async def chat_stream(
         self,
@@ -236,6 +254,12 @@ class OpenAIClient(LLMClient):
         tools: list[ToolParam] | None = None,
         response_format: dict | None = None,
     ) -> AsyncIterator[StreamDelta]:
+        trace_id = self._trace_start_llm_call(
+            mode="stream",
+            messages=messages,
+            tools=tools,
+            response_format=response_format,
+        )
         api_messages = self._convert_messages(messages)
         api_tools = self._convert_tools(tools)
 
@@ -250,78 +274,114 @@ class OpenAIClient(LLMClient):
         if response_format:
             kwargs["response_format"] = response_format
 
+        self._trace_provider_request(trace_id, kwargs)
         try:
             stream = await self._client.chat.completions.create(**kwargs)
         except openai.AuthenticationError as e:
+            self._trace_finish_llm_call(trace_id, error=e)
             raise LLMAuthError(f"OpenAI 认证失败: {e}") from e
         except openai.RateLimitError as e:
+            self._trace_finish_llm_call(trace_id, error=e)
             raise LLMRateLimitError(f"OpenAI 速率限制: {e}") from e
         except openai.APIError as e:
+            self._trace_finish_llm_call(trace_id, error=e)
             raise LLMError(f"OpenAI API 错误: {e}") from e
 
         # 跟踪进行中的 tool call
         tool_calls_in_progress: dict[int, dict] = {}  # index -> {id, name, args}
+        full_content = ""
+        completed_tool_calls: list[ToolCall] = []
+        final_usage = TokenUsage()
 
-        async for chunk in stream:
-            # 最终 chunk 携带用量信息（无 choices）
-            if chunk.usage:
-                usage = self._usage_from_response(chunk)
-                self._accumulate_usage(usage)
-                yield StreamDelta(type=StreamDeltaType.FINISH, usage=usage)
-                continue
+        try:
+            async for chunk in stream:
+                self._trace_stream_event(trace_id, chunk)
+                # 最终 chunk 携带用量信息（无 choices）
+                if chunk.usage:
+                    usage = self._usage_from_response(chunk)
+                    final_usage = usage
+                    self._accumulate_usage(usage)
+                    yield StreamDelta(type=StreamDeltaType.FINISH, usage=usage)
+                    continue
 
-            if not chunk.choices:
-                continue
+                if not chunk.choices:
+                    continue
 
-            delta = chunk.choices[0].delta
+                delta = chunk.choices[0].delta
 
-            # --- 文本增量 ---
-            if delta.content:
-                yield StreamDelta(
-                    type=StreamDeltaType.TEXT,
-                    content=delta.content,
-                )
+                # --- 文本增量 ---
+                if delta.content:
+                    full_content += delta.content
+                    yield StreamDelta(
+                        type=StreamDeltaType.TEXT,
+                        content=delta.content,
+                    )
 
-            # --- 工具调用增量 ---
-            if delta.tool_calls:
-                for tc_delta in delta.tool_calls:
-                    idx = tc_delta.index
+                # --- 工具调用增量 ---
+                if delta.tool_calls:
+                    for tc_delta in delta.tool_calls:
+                        idx = tc_delta.index
 
-                    # 新工具调用开始
-                    if idx not in tool_calls_in_progress:
-                        tool_calls_in_progress[idx] = {
-                            "id": tc_delta.id or "",
-                            "name": tc_delta.function.name if tc_delta.function else "",
-                            "args": "",
-                        }
+                        # 新工具调用开始
+                        if idx not in tool_calls_in_progress:
+                            tool_calls_in_progress[idx] = {
+                                "id": tc_delta.id or "",
+                                "name": tc_delta.function.name if tc_delta.function else "",
+                                "args": "",
+                            }
+                            yield StreamDelta(
+                                type=StreamDeltaType.TOOL_CALL_START,
+                                tool_call_id=tool_calls_in_progress[idx]["id"],
+                                tool_name=tool_calls_in_progress[idx]["name"],
+                            )
+
+                        if tc_delta.id:
+                            tool_calls_in_progress[idx]["id"] = tc_delta.id
+                        if tc_delta.function and tc_delta.function.name:
+                            tool_calls_in_progress[idx]["name"] = tc_delta.function.name
+
+                        # 累积参数
+                        if tc_delta.function and tc_delta.function.arguments:
+                            tool_calls_in_progress[idx]["args"] += (
+                                tc_delta.function.arguments
+                            )
+                            yield StreamDelta(
+                                type=StreamDeltaType.TOOL_CALL_DELTA,
+                                content=tc_delta.function.arguments,
+                                tool_call_id=tool_calls_in_progress[idx]["id"],
+                                tool_name=tool_calls_in_progress[idx]["name"],
+                            )
+
+                # --- finish_reason 处理 ---
+                # 兼容 OpenAI ("tool_calls") 和 DeepSeek 等 ("stop") 的差异
+                finish_reason = chunk.choices[0].finish_reason
+                if finish_reason is not None and tool_calls_in_progress:
+                    for info in tool_calls_in_progress.values():
+                        completed_tool_calls.append(
+                            self._tool_call_from_parts(
+                                tool_call_id=info["id"],
+                                name=info["name"],
+                                raw_arguments=info["args"],
+                            )
+                        )
                         yield StreamDelta(
-                            type=StreamDeltaType.TOOL_CALL_START,
-                            tool_call_id=tool_calls_in_progress[idx]["id"],
-                            tool_name=tool_calls_in_progress[idx]["name"],
+                            type=StreamDeltaType.TOOL_CALL_END,
+                            content=info["args"],
+                            tool_call_id=info["id"],
+                            tool_name=info["name"],
                         )
+                    tool_calls_in_progress.clear()
 
-                    if tc_delta.id:
-                        tool_calls_in_progress[idx]["id"] = tc_delta.id
-                    if tc_delta.function and tc_delta.function.name:
-                        tool_calls_in_progress[idx]["name"] = tc_delta.function.name
-
-                    # 累积参数
-                    if tc_delta.function and tc_delta.function.arguments:
-                        tool_calls_in_progress[idx]["args"] += (
-                            tc_delta.function.arguments
-                        )
-                        yield StreamDelta(
-                            type=StreamDeltaType.TOOL_CALL_DELTA,
-                            content=tc_delta.function.arguments,
-                            tool_call_id=tool_calls_in_progress[idx]["id"],
-                            tool_name=tool_calls_in_progress[idx]["name"],
-                        )
-
-            # --- finish_reason 处理 ---
-            # 兼容 OpenAI ("tool_calls") 和 DeepSeek 等 ("stop") 的差异
-            finish_reason = chunk.choices[0].finish_reason
-            if finish_reason is not None and tool_calls_in_progress:
+            # 流结束后，如果还有未关闭的 tool calls（某些 API 不发 finish_reason）
+            if tool_calls_in_progress:
                 for info in tool_calls_in_progress.values():
+                    completed_tool_calls.append(
+                        self._tool_call_from_parts(
+                            tool_call_id=info["id"],
+                            name=info["name"],
+                            raw_arguments=info["args"],
+                        )
+                    )
                     yield StreamDelta(
                         type=StreamDeltaType.TOOL_CALL_END,
                         content=info["args"],
@@ -330,13 +390,14 @@ class OpenAIClient(LLMClient):
                     )
                 tool_calls_in_progress.clear()
 
-        # 流结束后，如果还有未关闭的 tool calls（某些 API 不发 finish_reason）
-        if tool_calls_in_progress:
-            for info in tool_calls_in_progress.values():
-                yield StreamDelta(
-                    type=StreamDeltaType.TOOL_CALL_END,
-                    content=info["args"],
-                    tool_call_id=info["id"],
-                    tool_name=info["name"],
-                )
-            tool_calls_in_progress.clear()
+            parsed = LLMResponse(
+                content=full_content,
+                tool_calls=completed_tool_calls,
+                usage=final_usage,
+                raw={"stream": True},
+            )
+            self._trace_parsed_response(trace_id, parsed)
+            self._trace_finish_llm_call(trace_id, response=parsed)
+        except Exception as e:
+            self._trace_finish_llm_call(trace_id, error=e)
+            raise

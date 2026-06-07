@@ -249,6 +249,12 @@ class OpenAIResponsesClient(LLMClient):
         tools: list[ToolParam] | None = None,
         response_format: dict | None = None,
     ) -> LLMResponse:
+        trace_id = self._trace_start_llm_call(
+            mode="chat",
+            messages=messages,
+            tools=tools,
+            response_format=response_format,
+        )
         kwargs: dict = {
             "model": self.model,
             "input": self._convert_messages(messages),
@@ -261,16 +267,28 @@ class OpenAIResponsesClient(LLMClient):
         if text_config:
             kwargs["text"] = text_config
 
+        self._trace_provider_request(trace_id, kwargs)
         try:
             resp = await self._client.responses.create(**kwargs)
         except openai.AuthenticationError as e:
+            self._trace_finish_llm_call(trace_id, error=e)
             raise LLMAuthError(f"OpenAI 认证失败: {e}") from e
         except openai.RateLimitError as e:
+            self._trace_finish_llm_call(trace_id, error=e)
             raise LLMRateLimitError(f"OpenAI 速率限制: {e}") from e
         except openai.APIError as e:
+            self._trace_finish_llm_call(trace_id, error=e)
             raise LLMError(f"OpenAI API 错误: {e}") from e
 
-        return self._parse_response(resp)
+        self._trace_raw_response(trace_id, resp)
+        try:
+            parsed = self._parse_response(resp)
+        except Exception as e:
+            self._trace_finish_llm_call(trace_id, error=e)
+            raise
+        self._trace_parsed_response(trace_id, parsed)
+        self._trace_finish_llm_call(trace_id, response=parsed)
+        return parsed
 
     async def chat_stream(
         self,
@@ -278,6 +296,12 @@ class OpenAIResponsesClient(LLMClient):
         tools: list[ToolParam] | None = None,
         response_format: dict | None = None,
     ) -> AsyncIterator[StreamDelta]:
+        trace_id = self._trace_start_llm_call(
+            mode="stream",
+            messages=messages,
+            tools=tools,
+            response_format=response_format,
+        )
         kwargs: dict = {
             "model": self.model,
             "input": self._convert_messages(messages),
@@ -291,128 +315,166 @@ class OpenAIResponsesClient(LLMClient):
         if text_config:
             kwargs["text"] = text_config
 
+        self._trace_provider_request(trace_id, kwargs)
         try:
             stream = await self._client.responses.create(**kwargs)
         except openai.AuthenticationError as e:
+            self._trace_finish_llm_call(trace_id, error=e)
             raise LLMAuthError(f"OpenAI 认证失败: {e}") from e
         except openai.RateLimitError as e:
+            self._trace_finish_llm_call(trace_id, error=e)
             raise LLMRateLimitError(f"OpenAI 速率限制: {e}") from e
         except openai.APIError as e:
+            self._trace_finish_llm_call(trace_id, error=e)
             raise LLMError(f"OpenAI API 错误: {e}") from e
 
         tool_calls_in_progress: dict[int, dict] = {}
+        full_content = ""
+        completed_tool_calls: list[ToolCall] = []
+        final_usage = TokenUsage()
 
-        async for event in stream:
-            event_type = self._get(event, "type")
+        try:
+            async for event in stream:
+                self._trace_stream_event(trace_id, event)
+                event_type = self._get(event, "type")
 
-            if event_type == "response.output_text.delta":
-                yield StreamDelta(
-                    type=StreamDeltaType.TEXT,
-                    content=str(self._get(event, "delta", "") or ""),
-                )
-
-            elif event_type == "response.output_item.added":
-                item = self._get(event, "item")
-                if self._get(item, "type") != "function_call":
-                    continue
-                output_index = int(self._get(event, "output_index", 0) or 0)
-                if output_index in tool_calls_in_progress:
-                    info = tool_calls_in_progress[output_index]
-                    info["id"] = str(
-                        self._get(item, "call_id", None)
-                        or self._get(item, "id", "")
-                        or info["id"]
+                if event_type == "response.output_text.delta":
+                    delta = str(self._get(event, "delta", "") or "")
+                    full_content += delta
+                    yield StreamDelta(
+                        type=StreamDeltaType.TEXT,
+                        content=delta,
                     )
-                    info["item_id"] = str(self._get(item, "id", "") or info["item_id"])
-                    info["name"] = str(self._get(item, "name", "") or info["name"])
-                    info["args"] = str(self._get(item, "arguments", "") or info["args"])
-                else:
-                    info = {
-                        "id": str(
+
+                elif event_type == "response.output_item.added":
+                    item = self._get(event, "item")
+                    if self._get(item, "type") != "function_call":
+                        continue
+                    output_index = int(self._get(event, "output_index", 0) or 0)
+                    if output_index in tool_calls_in_progress:
+                        info = tool_calls_in_progress[output_index]
+                        info["id"] = str(
                             self._get(item, "call_id", None)
                             or self._get(item, "id", "")
-                        ),
-                        "item_id": str(self._get(item, "id", "") or ""),
-                        "name": str(self._get(item, "name", "") or ""),
-                        "args": str(self._get(item, "arguments", "") or ""),
-                        "ended": False,
-                    }
-                    tool_calls_in_progress[output_index] = info
+                            or info["id"]
+                        )
+                        info["item_id"] = str(self._get(item, "id", "") or info["item_id"])
+                        info["name"] = str(self._get(item, "name", "") or info["name"])
+                        info["args"] = str(self._get(item, "arguments", "") or info["args"])
+                    else:
+                        info = {
+                            "id": str(
+                                self._get(item, "call_id", None)
+                                or self._get(item, "id", "")
+                            ),
+                            "item_id": str(self._get(item, "id", "") or ""),
+                            "name": str(self._get(item, "name", "") or ""),
+                            "args": str(self._get(item, "arguments", "") or ""),
+                            "ended": False,
+                        }
+                        tool_calls_in_progress[output_index] = info
+                        yield StreamDelta(
+                            type=StreamDeltaType.TOOL_CALL_START,
+                            tool_call_id=info["id"],
+                            tool_name=info["name"],
+                        )
+
+                elif event_type == "response.function_call_arguments.delta":
+                    output_index = int(self._get(event, "output_index", 0) or 0)
+                    delta = str(self._get(event, "delta", "") or "")
+                    if output_index not in tool_calls_in_progress:
+                        tool_calls_in_progress[output_index] = {
+                            "id": "",
+                            "item_id": "",
+                            "name": "",
+                            "args": "",
+                            "ended": False,
+                        }
+                        yield StreamDelta(type=StreamDeltaType.TOOL_CALL_START)
+                    info = tool_calls_in_progress[output_index]
+                    info["args"] += delta
                     yield StreamDelta(
-                        type=StreamDeltaType.TOOL_CALL_START,
+                        type=StreamDeltaType.TOOL_CALL_DELTA,
+                        content=delta,
                         tool_call_id=info["id"],
                         tool_name=info["name"],
                     )
 
-            elif event_type == "response.function_call_arguments.delta":
-                output_index = int(self._get(event, "output_index", 0) or 0)
-                delta = str(self._get(event, "delta", "") or "")
-                if output_index not in tool_calls_in_progress:
-                    tool_calls_in_progress[output_index] = {
-                        "id": "",
-                        "item_id": "",
-                        "name": "",
-                        "args": "",
-                        "ended": False,
-                    }
-                    yield StreamDelta(type=StreamDeltaType.TOOL_CALL_START)
-                info = tool_calls_in_progress[output_index]
-                info["args"] += delta
-                yield StreamDelta(
-                    type=StreamDeltaType.TOOL_CALL_DELTA,
-                    content=delta,
-                    tool_call_id=info["id"],
-                    tool_name=info["name"],
-                )
+                elif event_type == "response.function_call_arguments.done":
+                    output_index = int(self._get(event, "output_index", 0) or 0)
+                    if output_index not in tool_calls_in_progress:
+                        tool_calls_in_progress[output_index] = {
+                            "id": "",
+                            "item_id": "",
+                            "name": "",
+                            "args": "",
+                            "ended": False,
+                        }
+                        yield StreamDelta(type=StreamDeltaType.TOOL_CALL_START)
+                    info = tool_calls_in_progress[output_index]
+                    info["args"] = str(self._get(event, "arguments", "") or info["args"])
+                    info["name"] = str(self._get(event, "name", "") or info["name"])
+                    if not info["ended"]:
+                        completed_tool_calls.append(
+                            self._tool_call_from_parts(
+                                tool_call_id=info["id"],
+                                name=info["name"],
+                                raw_arguments=info["args"],
+                            )
+                        )
+                        yield StreamDelta(
+                            type=StreamDeltaType.TOOL_CALL_END,
+                            content=info["args"],
+                            tool_call_id=info["id"],
+                            tool_name=info["name"],
+                        )
+                        info["ended"] = True
 
-            elif event_type == "response.function_call_arguments.done":
-                output_index = int(self._get(event, "output_index", 0) or 0)
-                if output_index not in tool_calls_in_progress:
-                    tool_calls_in_progress[output_index] = {
-                        "id": "",
-                        "item_id": "",
-                        "name": "",
-                        "args": "",
-                        "ended": False,
-                    }
-                    yield StreamDelta(type=StreamDeltaType.TOOL_CALL_START)
-                info = tool_calls_in_progress[output_index]
-                info["args"] = str(self._get(event, "arguments", "") or info["args"])
-                info["name"] = str(self._get(event, "name", "") or info["name"])
-                if not info["ended"]:
-                    yield StreamDelta(
-                        type=StreamDeltaType.TOOL_CALL_END,
-                        content=info["args"],
-                        tool_call_id=info["id"],
-                        tool_name=info["name"],
+                elif event_type == "response.output_item.done":
+                    item = self._get(event, "item")
+                    if self._get(item, "type") != "function_call":
+                        continue
+                    output_index = int(self._get(event, "output_index", 0) or 0)
+                    info = tool_calls_in_progress.setdefault(
+                        output_index,
+                        {"id": "", "item_id": "", "name": "", "args": "", "ended": False},
                     )
-                    info["ended"] = True
+                    info["id"] = str(self._get(item, "call_id", None) or info["id"])
+                    info["name"] = str(self._get(item, "name", "") or info["name"])
+                    info["args"] = str(self._get(item, "arguments", "") or info["args"])
+                    if not info["ended"]:
+                        completed_tool_calls.append(
+                            self._tool_call_from_parts(
+                                tool_call_id=info["id"],
+                                name=info["name"],
+                                raw_arguments=info["args"],
+                            )
+                        )
+                        yield StreamDelta(
+                            type=StreamDeltaType.TOOL_CALL_END,
+                            content=info["args"],
+                            tool_call_id=info["id"],
+                            tool_name=info["name"],
+                        )
+                        info["ended"] = True
 
-            elif event_type == "response.output_item.done":
-                item = self._get(event, "item")
-                if self._get(item, "type") != "function_call":
-                    continue
-                output_index = int(self._get(event, "output_index", 0) or 0)
-                info = tool_calls_in_progress.setdefault(
-                    output_index,
-                    {"id": "", "item_id": "", "name": "", "args": "", "ended": False},
-                )
-                info["id"] = str(self._get(item, "call_id", None) or info["id"])
-                info["name"] = str(self._get(item, "name", "") or info["name"])
-                info["args"] = str(self._get(item, "arguments", "") or info["args"])
-                if not info["ended"]:
-                    yield StreamDelta(
-                        type=StreamDeltaType.TOOL_CALL_END,
-                        content=info["args"],
-                        tool_call_id=info["id"],
-                        tool_name=info["name"],
-                    )
-                    info["ended"] = True
+                elif event_type == "response.completed":
+                    usage = self._usage_from_response(self._get(event, "response"))
+                    final_usage = usage
+                    self._accumulate_usage(usage)
+                    yield StreamDelta(type=StreamDeltaType.FINISH, usage=usage)
 
-            elif event_type == "response.completed":
-                usage = self._usage_from_response(self._get(event, "response"))
-                self._accumulate_usage(usage)
-                yield StreamDelta(type=StreamDeltaType.FINISH, usage=usage)
+                elif event_type in {"response.failed", "response.incomplete"}:
+                    raise LLMError(f"OpenAI Responses streaming 失败: {event}")
 
-            elif event_type in {"response.failed", "response.incomplete"}:
-                raise LLMError(f"OpenAI Responses streaming 失败: {event}")
+            parsed = LLMResponse(
+                content=full_content,
+                tool_calls=completed_tool_calls,
+                usage=final_usage,
+                raw={"stream": True},
+            )
+            self._trace_parsed_response(trace_id, parsed)
+            self._trace_finish_llm_call(trace_id, response=parsed)
+        except Exception as e:
+            self._trace_finish_llm_call(trace_id, error=e)
+            raise

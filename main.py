@@ -111,6 +111,28 @@ async def async_main() -> None:
         console.print("[dim]请检查 .env 文件中的 API Key 配置[/dim]")
         sys.exit(1)
 
+    trace_recorder = None
+    try:
+        from mini_code_agent.trace import TraceRecorder
+
+        trace_recorder = TraceRecorder(
+            project_dir=project_dir,
+            provider=args.provider,
+            model=llm_client.model,
+            on_error=lambda e: console.print(
+                f"[yellow]trace 写入失败，主流程继续: {type(e).__name__}: {e}[/yellow]"
+            ),
+        )
+        llm_client.set_trace_recorder(trace_recorder)
+        console.print(
+            f"[dim]trace: {trace_recorder.session_dir} "
+            "(raw prompt / response / tool output)[/dim]"
+        )
+    except Exception as e:
+        console.print(
+            f"[yellow]trace 初始化失败，主流程继续: {type(e).__name__}: {e}[/yellow]"
+        )
+
     # 2. 注册工具
     from mini_code_agent.tools import (
         AddMemoryTool,
@@ -392,6 +414,7 @@ async def async_main() -> None:
         longrun_config=longrun_config,
         task_graph=long_run_graph,
         incremental_verifier=incremental_verifier,
+        trace_recorder=trace_recorder,
     )
 
     subtask_runner = SubtaskRunner(
@@ -431,6 +454,8 @@ async def async_main() -> None:
     try:
         await repl.run()
     finally:
+        if trace_recorder is not None:
+            trace_recorder.finish_session()
         # 清理 LSP 服务器
         await lsp_manager.stop_server()
 

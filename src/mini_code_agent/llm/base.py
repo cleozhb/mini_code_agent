@@ -6,7 +6,10 @@ import json
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import AsyncIterator
+from typing import TYPE_CHECKING, AsyncIterator
+
+if TYPE_CHECKING:
+    from ..trace import TraceRecorder
 
 
 # ---------------------------------------------------------------------------
@@ -206,10 +209,78 @@ class LLMClient(ABC):
         self.base_url = base_url
         self.total_usage = TokenUsage()
         self.capabilities = LLMCapabilities()
+        self.trace_recorder: TraceRecorder | None = None
+        self.last_llm_call_id: str | None = None
 
     def _accumulate_usage(self, usage: TokenUsage) -> None:
         """累计 token 用量."""
         self.total_usage.add(usage)
+
+    def set_trace_recorder(self, recorder: TraceRecorder | None) -> None:
+        """挂载 trace recorder."""
+        self.trace_recorder = recorder
+
+    def _trace_start_llm_call(
+        self,
+        *,
+        mode: str,
+        messages: list[Message],
+        tools: list[ToolParam] | None,
+        response_format: dict | None,
+    ) -> str | None:
+        """记录一次 LLM 调用开始."""
+        if self.trace_recorder is None:
+            return None
+        call_id = self.trace_recorder.start_llm_call(
+            model=self.model,
+            backend=type(self).__name__,
+            mode=mode,
+            messages=messages,
+            tools=tools,
+            response_format=response_format,
+        )
+        self.last_llm_call_id = call_id
+        return call_id
+
+    def _trace_provider_request(self, call_id: str | None, payload: object) -> None:
+        if self.trace_recorder is not None:
+            self.trace_recorder.record_llm_provider_request(call_id, payload)
+
+    def _trace_raw_response(
+        self,
+        call_id: str | None,
+        response: object,
+        *,
+        label: str = "response.raw",
+    ) -> None:
+        if self.trace_recorder is not None:
+            self.trace_recorder.record_llm_raw_response(call_id, response, label=label)
+
+    def _trace_stream_event(self, call_id: str | None, event: object) -> None:
+        if self.trace_recorder is not None:
+            self.trace_recorder.record_llm_stream_event(call_id, event)
+
+    def _trace_parsed_response(
+        self,
+        call_id: str | None,
+        response: LLMResponse,
+    ) -> None:
+        if self.trace_recorder is not None:
+            self.trace_recorder.record_llm_parsed_response(call_id, response)
+
+    def _trace_finish_llm_call(
+        self,
+        call_id: str | None,
+        *,
+        response: LLMResponse | None = None,
+        error: BaseException | None = None,
+    ) -> None:
+        if self.trace_recorder is not None:
+            self.trace_recorder.finish_llm_call(
+                call_id,
+                response=response,
+                error=error,
+            )
 
     @abstractmethod
     async def chat(

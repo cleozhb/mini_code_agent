@@ -229,6 +229,35 @@ class ClaudeClient(LLMClient):
                 "请提高 max_tokens 或重试生成"
             )
 
+    def _parse_tool_call_arguments(self, raw_arguments: str) -> tuple[dict, str | None]:
+        """解析 streaming tool 参数 JSON."""
+        raw_arguments = raw_arguments or ""
+        if not raw_arguments:
+            return {}, None
+        try:
+            parsed = json.loads(raw_arguments)
+        except json.JSONDecodeError as e:
+            return {}, str(e)
+        if not isinstance(parsed, dict):
+            return {}, f"tool arguments must be a JSON object, got {type(parsed).__name__}"
+        return parsed, None
+
+    def _tool_call_from_parts(
+        self,
+        *,
+        tool_call_id: str,
+        name: str,
+        raw_arguments: str,
+    ) -> ToolCall:
+        arguments, parse_error = self._parse_tool_call_arguments(raw_arguments)
+        return ToolCall(
+            id=tool_call_id,
+            name=name,
+            arguments=arguments,
+            raw_arguments=raw_arguments,
+            parse_error=parse_error,
+        )
+
     def _parse_response(
         self,
         resp: anthropic.types.Message,
@@ -271,6 +300,12 @@ class ClaudeClient(LLMClient):
         tools: list[ToolParam] | None = None,
         response_format: dict | None = None,
     ) -> LLMResponse:
+        trace_id = self._trace_start_llm_call(
+            mode="chat",
+            messages=messages,
+            tools=tools,
+            response_format=response_format,
+        )
         system, api_messages = self._convert_messages(messages)
         api_tools = self._convert_tools(tools)
         output_config = self._convert_response_format(response_format)
@@ -287,13 +322,17 @@ class ClaudeClient(LLMClient):
         if output_config:
             kwargs["output_config"] = output_config
 
+        self._trace_provider_request(trace_id, kwargs)
         try:
             resp = await self._client.messages.create(**kwargs)
         except anthropic.AuthenticationError as e:
+            self._trace_finish_llm_call(trace_id, error=e)
             raise LLMAuthError(f"Anthropic 认证失败: {e}") from e
         except anthropic.RateLimitError as e:
+            self._trace_finish_llm_call(trace_id, error=e)
             raise LLMRateLimitError(f"Anthropic 速率限制: {e}") from e
         except anthropic.BadRequestError as e:
+            self._trace_finish_llm_call(trace_id, error=e)
             if response_format and "schema" in str(e).lower():
                 raise LLMError(
                     "Anthropic structured output schema 不兼容，"
@@ -301,9 +340,18 @@ class ClaudeClient(LLMClient):
                 ) from e
             raise LLMError(f"Anthropic 请求错误: {e}") from e
         except anthropic.APIError as e:
+            self._trace_finish_llm_call(trace_id, error=e)
             raise LLMError(f"Anthropic API 错误: {e}") from e
 
-        return self._parse_response(resp, response_format=response_format)
+        self._trace_raw_response(trace_id, resp)
+        try:
+            parsed = self._parse_response(resp, response_format=response_format)
+        except Exception as e:
+            self._trace_finish_llm_call(trace_id, error=e)
+            raise
+        self._trace_parsed_response(trace_id, parsed)
+        self._trace_finish_llm_call(trace_id, response=parsed)
+        return parsed
 
     async def chat_stream(
         self,
@@ -311,6 +359,12 @@ class ClaudeClient(LLMClient):
         tools: list[ToolParam] | None = None,
         response_format: dict | None = None,
     ) -> AsyncIterator[StreamDelta]:
+        trace_id = self._trace_start_llm_call(
+            mode="stream",
+            messages=messages,
+            tools=tools,
+            response_format=response_format,
+        )
         system, api_messages = self._convert_messages(messages)
         api_tools = self._convert_tools(tools)
         output_config = self._convert_response_format(response_format)
@@ -327,17 +381,22 @@ class ClaudeClient(LLMClient):
         if output_config:
             kwargs["output_config"] = output_config
 
+        self._trace_provider_request(trace_id, kwargs)
         try:
             async with self._client.messages.stream(**kwargs) as stream:
                 current_tool_id = ""
                 current_tool_name = ""
                 tool_args_buffer = ""
+                full_content = ""
+                completed_tool_calls: list[ToolCall] = []
 
                 async for event in stream:
+                    self._trace_stream_event(trace_id, event)
                     # --- 文本增量 ---
                     if event.type == "content_block_delta":
                         delta = event.delta
                         if delta.type == "text_delta":
+                            full_content += delta.text
                             yield StreamDelta(
                                 type=StreamDeltaType.TEXT,
                                 content=delta.text,
@@ -367,6 +426,13 @@ class ClaudeClient(LLMClient):
                     # --- content block 结束 ---
                     elif event.type == "content_block_stop":
                         if current_tool_id:
+                            completed_tool_calls.append(
+                                self._tool_call_from_parts(
+                                    tool_call_id=current_tool_id,
+                                    name=current_tool_name,
+                                    raw_arguments=tool_args_buffer,
+                                )
+                            )
                             yield StreamDelta(
                                 type=StreamDeltaType.TOOL_CALL_END,
                                 content=tool_args_buffer,
@@ -380,8 +446,21 @@ class ClaudeClient(LLMClient):
                 # 从最终消息中提取用量
                 final = await stream.get_final_message()
                 self._check_structured_output_stop(final, response_format)
+                self._trace_raw_response(
+                    trace_id,
+                    final,
+                    label="response.final.raw",
+                )
                 usage = self._usage_from_response(final)
                 self._accumulate_usage(usage)
+                parsed = LLMResponse(
+                    content=full_content,
+                    tool_calls=completed_tool_calls,
+                    usage=usage,
+                    raw={"stream": True},
+                )
+                self._trace_parsed_response(trace_id, parsed)
+                self._trace_finish_llm_call(trace_id, response=parsed)
 
                 yield StreamDelta(
                     type=StreamDeltaType.FINISH,
@@ -389,10 +468,13 @@ class ClaudeClient(LLMClient):
                 )
 
         except anthropic.AuthenticationError as e:
+            self._trace_finish_llm_call(trace_id, error=e)
             raise LLMAuthError(f"Anthropic 认证失败: {e}") from e
         except anthropic.RateLimitError as e:
+            self._trace_finish_llm_call(trace_id, error=e)
             raise LLMRateLimitError(f"Anthropic 速率限制: {e}") from e
         except anthropic.BadRequestError as e:
+            self._trace_finish_llm_call(trace_id, error=e)
             if response_format and "schema" in str(e).lower():
                 raise LLMError(
                     "Anthropic structured output schema 不兼容，"
@@ -400,4 +482,5 @@ class ClaudeClient(LLMClient):
                 ) from e
             raise LLMError(f"Anthropic 请求错误: {e}") from e
         except anthropic.APIError as e:
+            self._trace_finish_llm_call(trace_id, error=e)
             raise LLMError(f"Anthropic API 错误: {e}") from e

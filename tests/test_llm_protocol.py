@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from types import SimpleNamespace
 
 import pytest
@@ -18,6 +19,7 @@ from mini_code_agent.llm.base import StreamDeltaType
 from mini_code_agent.llm.claude_client import ClaudeClient
 from mini_code_agent.llm.openai_client import OpenAIClient
 from mini_code_agent.llm.openai_responses_client import OpenAIResponsesClient
+from mini_code_agent.trace import TraceRecorder
 
 
 def _ns(**kwargs):
@@ -53,6 +55,19 @@ def _sample_response_format() -> dict:
             },
         },
     }
+
+
+def _load_trace_json(recorder: TraceRecorder, name: str) -> dict:
+    path = recorder.session_dir / "llm" / name
+    assert path.is_file()
+    return json.loads(path.read_text())
+
+
+def _load_trace_events(recorder: TraceRecorder) -> list[dict]:
+    return [
+        json.loads(line)
+        for line in (recorder.session_dir / "events.jsonl").read_text().splitlines()
+    ]
 
 
 def test_openai_chat_converts_messages_and_tools():
@@ -148,7 +163,43 @@ def test_openai_chat_empty_choices_raises_llm_error():
 
 
 @pytest.mark.asyncio
-async def test_openai_chat_streaming_parallel_tool_calls():
+async def test_openai_chat_trace_files(tmp_path):
+    class _Completions:
+        async def create(self, **kwargs):
+            assert kwargs["model"] == "gpt-test"
+            return _ns(
+                choices=[_ns(message=_ns(content="hello", tool_calls=[]))],
+                usage=_ns(
+                    prompt_tokens=10,
+                    completion_tokens=3,
+                    prompt_tokens_details=None,
+                    completion_tokens_details=None,
+                ),
+            )
+
+    recorder = TraceRecorder(
+        project_dir=tmp_path,
+        provider="openai",
+        model="gpt-test",
+    )
+    client = OpenAIClient(model="gpt-test")
+    client.set_trace_recorder(recorder)
+    client._OpenAIClient__client = _ns(  # type: ignore[attr-defined]
+        chat=_ns(completions=_Completions())
+    )
+
+    resp = await client.chat([Message.user("hi")])
+
+    assert resp.content == "hello"
+    assert _load_trace_json(recorder, "0001-request.normalized.json")["messages"][0]["content"] == "hi"
+    assert _load_trace_json(recorder, "0001-request.provider.json")["messages"][0]["content"] == "hi"
+    assert _load_trace_json(recorder, "0001-response.raw.json")["choices"][0]["message"]["content"] == "hello"
+    assert _load_trace_json(recorder, "0001-response.parsed.json")["content"] == "hello"
+    assert _load_trace_events(recorder)[-1]["type"] == "llm_call_finish"
+
+
+@pytest.mark.asyncio
+async def test_openai_chat_streaming_parallel_tool_calls(tmp_path):
     class _Completions:
         async def create(self, **_kwargs):
             return _AsyncStream(
@@ -212,6 +263,12 @@ async def test_openai_chat_streaming_parallel_tool_calls():
             )
 
     client = OpenAIClient(model="gpt-test")
+    recorder = TraceRecorder(
+        project_dir=tmp_path,
+        provider="openai",
+        model="gpt-test",
+    )
+    client.set_trace_recorder(recorder)
     client._OpenAIClient__client = _ns(  # type: ignore[attr-defined]
         chat=_ns(completions=_Completions())
     )
@@ -225,6 +282,8 @@ async def test_openai_chat_streaming_parallel_tool_calls():
     ]
     assert deltas[-1].type == StreamDeltaType.FINISH
     assert deltas[-1].usage == TokenUsage(input_tokens=10, output_tokens=5)
+    assert (recorder.session_dir / "llm" / "0001-stream.events.jsonl").is_file()
+    assert _load_trace_json(recorder, "0001-response.parsed.json")["tool_calls"][0]["name"] == "A"
 
 
 def test_openai_responses_converts_messages_tools_and_response_format():
@@ -314,7 +373,40 @@ def test_openai_responses_parse_response_and_usage():
 
 
 @pytest.mark.asyncio
-async def test_openai_responses_streaming_function_arguments():
+async def test_openai_responses_trace_files(tmp_path):
+    class _Responses:
+        async def create(self, **kwargs):
+            assert kwargs["model"] == "gpt-test"
+            return {
+                "output": [
+                    {
+                        "type": "message",
+                        "content": [{"type": "output_text", "text": "hello"}],
+                    }
+                ],
+                "usage": {"input_tokens": 5, "output_tokens": 2},
+            }
+
+    recorder = TraceRecorder(
+        project_dir=tmp_path,
+        provider="openai-responses",
+        model="gpt-test",
+    )
+    client = OpenAIResponsesClient(model="gpt-test")
+    client.set_trace_recorder(recorder)
+    client._OpenAIResponsesClient__client = _ns(responses=_Responses())  # type: ignore[attr-defined]
+
+    resp = await client.chat([Message.user("hi")])
+
+    assert resp.content == "hello"
+    assert _load_trace_json(recorder, "0001-request.normalized.json")["messages"][0]["content"] == "hi"
+    assert _load_trace_json(recorder, "0001-request.provider.json")["input"][0]["content"] == "hi"
+    assert _load_trace_json(recorder, "0001-response.raw.json")["output"][0]["content"][0]["text"] == "hello"
+    assert _load_trace_json(recorder, "0001-response.parsed.json")["content"] == "hello"
+
+
+@pytest.mark.asyncio
+async def test_openai_responses_streaming_function_arguments(tmp_path):
     class _Responses:
         async def create(self, **kwargs):
             assert kwargs["text"] == {
@@ -364,6 +456,12 @@ async def test_openai_responses_streaming_function_arguments():
             )
 
     client = OpenAIResponsesClient(model="gpt-test")
+    recorder = TraceRecorder(
+        project_dir=tmp_path,
+        provider="openai-responses",
+        model="gpt-test",
+    )
+    client.set_trace_recorder(recorder)
     client._OpenAIResponsesClient__client = _ns(responses=_Responses())  # type: ignore[attr-defined]
 
     deltas = [
@@ -383,6 +481,8 @@ async def test_openai_responses_streaming_function_arguments():
     assert deltas[2].tool_call_id == "call_1"
     assert deltas[2].tool_name == "ReadFile"
     assert deltas[2].content == '{"path": "a.py"}'
+    assert (recorder.session_dir / "llm" / "0001-stream.events.jsonl").is_file()
+    assert _load_trace_json(recorder, "0001-response.parsed.json")["tool_calls"][0]["name"] == "ReadFile"
 
 
 def test_claude_converts_system_tools_results_and_response_format():
@@ -450,7 +550,41 @@ def test_claude_parse_cache_usage():
 
 
 @pytest.mark.asyncio
-async def test_claude_streaming_input_json_delta():
+async def test_claude_trace_files(tmp_path):
+    class _Messages:
+        async def create(self, **kwargs):
+            assert kwargs["model"] == "claude-test"
+            return _ns(
+                stop_reason="end_turn",
+                content=[_ns(type="text", text="hello")],
+                usage=_ns(
+                    input_tokens=7,
+                    output_tokens=3,
+                    cache_creation_input_tokens=0,
+                    cache_read_input_tokens=0,
+                ),
+            )
+
+    recorder = TraceRecorder(
+        project_dir=tmp_path,
+        provider="anthropic",
+        model="claude-test",
+    )
+    client = ClaudeClient(model="claude-test")
+    client.set_trace_recorder(recorder)
+    client._ClaudeClient__client = _ns(messages=_Messages())  # type: ignore[attr-defined]
+
+    resp = await client.chat([Message.user("hi")])
+
+    assert resp.content == "hello"
+    assert _load_trace_json(recorder, "0001-request.normalized.json")["messages"][0]["content"] == "hi"
+    assert _load_trace_json(recorder, "0001-request.provider.json")["messages"][0]["content"] == "hi"
+    assert _load_trace_json(recorder, "0001-response.raw.json")["content"][0]["text"] == "hello"
+    assert _load_trace_json(recorder, "0001-response.parsed.json")["content"] == "hello"
+
+
+@pytest.mark.asyncio
+async def test_claude_streaming_input_json_delta(tmp_path):
     class _ClaudeStream:
         def __init__(self) -> None:
             self._stream = _AsyncStream(
@@ -505,6 +639,12 @@ async def test_claude_streaming_input_json_delta():
             return _ClaudeStream()
 
     client = ClaudeClient(model="claude-test")
+    recorder = TraceRecorder(
+        project_dir=tmp_path,
+        provider="anthropic",
+        model="claude-test",
+    )
+    client.set_trace_recorder(recorder)
     client._ClaudeClient__client = _ns(messages=_Messages())  # type: ignore[attr-defined]
 
     deltas = [
@@ -523,3 +663,6 @@ async def test_claude_streaming_input_json_delta():
     ]
     assert deltas[2].content == '{"path": "a.py"}'
     assert deltas[-1].usage == TokenUsage(input_tokens=3, output_tokens=4)
+    assert (recorder.session_dir / "llm" / "0001-stream.events.jsonl").is_file()
+    assert (recorder.session_dir / "llm" / "0001-response.final.raw.json").is_file()
+    assert _load_trace_json(recorder, "0001-response.parsed.json")["tool_calls"][0]["name"] == "ReadFile"
