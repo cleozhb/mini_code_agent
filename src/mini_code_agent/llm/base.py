@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
+import logging
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import TYPE_CHECKING, AsyncIterator
+from typing import TYPE_CHECKING, AsyncIterator, Callable, TypeVar
+
+T = TypeVar("T")
 
 if TYPE_CHECKING:
     from ..trace import TraceRecorder
@@ -215,6 +219,24 @@ class LLMClient(ABC):
     def _accumulate_usage(self, usage: TokenUsage) -> None:
         """累计 token 用量."""
         self.total_usage.add(usage)
+
+    async def _call_with_retry(self, coro_factory: Callable[[], T]) -> T:
+        """对 LLMRateLimitError 做指数退避重试."""
+        _logger = logging.getLogger(__name__)
+        delay = 5.0
+        for attempt in range(5):
+            try:
+                return await coro_factory()
+            except LLMRateLimitError:
+                if attempt == 4:
+                    raise
+                _logger.warning(
+                    "Rate limited, retrying in %.1fs (attempt %d/5)",
+                    delay, attempt + 1,
+                )
+                await asyncio.sleep(delay)
+                delay = min(delay * 2, 60.0)
+        raise RuntimeError("unreachable")
 
     def set_trace_recorder(self, recorder: TraceRecorder | None) -> None:
         """挂载 trace recorder."""

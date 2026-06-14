@@ -239,6 +239,75 @@ async def test_agent_tool_execution_error():
     assert result.content == "文件不存在。"
 
 
+@pytest.mark.asyncio
+async def test_agent_validates_tool_args_before_safety_filter():
+    """坏类型参数应先变成 tool error，不能让安全检查抛异常."""
+    from mini_code_agent.safety import CommandFilter
+
+    mock_client = MockLLMClient([
+        LLMResponse(
+            content="",
+            tool_calls=[
+                ToolCall(
+                    id="c1",
+                    name="Bash",
+                    arguments={"command": True, "string": True},
+                ),
+            ],
+            usage=TokenUsage(100, 20),
+        ),
+        LLMResponse(content="已收到参数错误。", usage=TokenUsage(100, 20)),
+    ])
+    registry = ToolRegistry()
+    registry.register(BashTool())
+    agent = Agent(
+        mock_client,
+        registry,
+        "你是助手",
+        command_filter=CommandFilter(),
+    )
+
+    result = await agent.run("运行测试")
+
+    assert result.content == "已收到参数错误。"
+    assert result.tool_calls_count == 1
+    assert result.tool_calls_errors == 1
+    tool_results = [m.tool_result for m in agent.messages if m.tool_result]
+    assert tool_results
+    assert "参数校验失败" in tool_results[-1].content
+    assert "command" in tool_results[-1].content
+
+
+@pytest.mark.asyncio
+async def test_stream_tool_execution_validates_args_before_safety_filter():
+    """CLI streaming 使用的工具入口也要先校验参数."""
+    from mini_code_agent.safety import CommandFilter
+
+    registry = ToolRegistry()
+    registry.register(BashTool())
+    agent = Agent(
+        MockLLMClient([]),
+        registry,
+        "你是助手",
+        command_filter=CommandFilter(),
+    )
+
+    msg, exec_result = await agent._execute_tool_call_with_result(
+        ToolCall(
+            id="c1",
+            name="Bash",
+            arguments={"command": True, "string": True},
+        )
+    )
+
+    assert exec_result.is_error
+    assert exec_result.error is not None
+    assert "参数校验失败" in exec_result.error
+    assert "command" in exec_result.error
+    assert msg.tool_result is not None
+    assert msg.tool_result.is_error
+
+
 # ==================================================================
 # 单元测试：循环保护（最多 25 轮）
 # ==================================================================

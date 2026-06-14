@@ -8,6 +8,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import TYPE_CHECKING, Any, AsyncIterator, Callable, Awaitable, Literal
 
+from pydantic import ValidationError
+
 from ..llm.base import (
     LLMClient,
     LLMResponse,
@@ -24,7 +26,7 @@ from ..safety.command_filter import CommandFilter, SafetyLevel
 from ..safety.file_guard import FileGuard
 from ..safety.git_checkpoint import GitCheckpoint
 from ..safety.loop_guard import LoopGuard
-from ..tools.base import PermissionLevel, ToolRegistry
+from ..tools.base import PermissionLevel, Tool, ToolRegistry
 from ..tools.base import ToolResult as ExecToolResult
 from .planner import Plan, Planner, PlannerError
 from .retry import RetryController
@@ -780,6 +782,7 @@ class Agent:
                 elif delta.type == StreamDeltaType.FINISH:
                     if delta.usage:
                         round_usage.add(delta.usage)
+                        self._notify_llm_call(delta.usage)
                         # LoopGuard token 预算检查
                         if self.loop_guard:
                             token_msg = self.loop_guard.add_tokens(
@@ -806,6 +809,7 @@ class Agent:
                 )
                 yield AgentEvent(
                     type=AgentEventType.FINISH,
+                    content="ok",
                     usage=round_usage,
                 )
                 return
@@ -847,6 +851,7 @@ class Agent:
                 )
             elif delta.type == StreamDeltaType.FINISH and delta.usage:
                 round_usage.add(delta.usage)
+                self._notify_llm_call(delta.usage)
 
         self.conversation.append(Message.assistant(full_content))
         self._accumulate_usage(round_usage)
@@ -863,7 +868,11 @@ class Agent:
                 stop_reason="max_rounds",
             ),
         )
-        yield AgentEvent(type=AgentEventType.FINISH, usage=round_usage)
+        yield AgentEvent(
+            type=AgentEventType.FINISH,
+            content="max_rounds",
+            usage=round_usage,
+        )
 
     async def _maybe_compress(self) -> None:
         """检查是否需要压缩对话历史，需要则执行."""
@@ -923,6 +932,39 @@ class Agent:
         # 默认保持工具原有权限级别
         return SafetyLevel.NEEDS_CONFIRM, None
 
+    def _validate_tool_call_arguments(
+        self,
+        tool: Tool,
+        tool_call: ToolCall,
+    ) -> ExecToolResult | None:
+        """先校验工具参数，再进入安全检查 / 审批 / 执行.
+
+        安全检查会读取 Bash command、文件 path 等字段；如果模型给了
+        bool/list 之类的坏类型，必须先作为 tool error 返给模型自修正，
+        不能让安全层或工具实现直接抛 Python 异常。
+        """
+        if not isinstance(tool_call.arguments, dict):
+            return ExecToolResult(
+                output="",
+                error=(
+                    "参数校验失败:\n"
+                    "工具参数必须是 JSON object，"
+                    f"实际是 {type(tool_call.arguments).__name__}: "
+                    f"{tool_call.arguments!r}"
+                ),
+            )
+
+        if tool.InputModel is None:
+            return None
+
+        try:
+            validated = tool.InputModel.model_validate(tool_call.arguments)
+        except ValidationError as e:
+            return ExecToolResult(output="", error=f"参数校验失败:\n{e}")
+
+        tool_call.arguments = validated.model_dump()
+        return None
+
     async def _execute_tool_call(self, tool_call: ToolCall) -> Message:
         """执行单个工具调用，返回 tool result 消息."""
         trace_llm_call_id = self._trace_tool_call_start(tool_call)
@@ -960,6 +1002,22 @@ class Agent:
                 LLMToolResult(
                     tool_call_id=tool_call.id,
                     content=f"错误：未找到工具 '{tool_call.name}'",
+                    is_error=True,
+                )
+            )
+
+        validation_error = self._validate_tool_call_arguments(tool, tool_call)
+        if validation_error is not None:
+            self._trace_tool_call_result(
+                tool_call,
+                validation_error,
+                llm_call_id=trace_llm_call_id,
+                metadata={"validation_error": True},
+            )
+            return Message.tool(
+                LLMToolResult(
+                    tool_call_id=tool_call.id,
+                    content=validation_error.error or "参数校验失败",
                     is_error=True,
                 )
             )
@@ -1005,10 +1063,38 @@ class Agent:
                 )
             )
 
-        # CONFIRM 级别的工具暂时先自动执行，后续加确认逻辑
-        if tool.permission_level == PermissionLevel.CONFIRM and safety_level != SafetyLevel.SAFE:
+        # CONFIRM 级别 — 白名单命令跳过确认，其他通过回调让 CLI 确认
+        needs_confirm = (
+            tool.permission_level == PermissionLevel.CONFIRM
+            and safety_level != SafetyLevel.SAFE
+        )
+        if needs_confirm and self.confirm_callback:
+            approved, edited_args = await self.confirm_callback(
+                tool.name, tool_call, safety_level,
+            )
+            if not approved:
+                result = ExecToolResult(output="", error="用户拒绝了此操作")
+                self._trace_tool_call_result(
+                    tool_call,
+                    result,
+                    llm_call_id=trace_llm_call_id,
+                    metadata={
+                        "safety_level": safety_level,
+                        "user_approved": False,
+                    },
+                )
+                return Message.tool(
+                    LLMToolResult(
+                        tool_call_id=tool_call.id,
+                        content="用户拒绝了此操作",
+                        is_error=True,
+                    )
+                )
+            if edited_args is not None:
+                tool_call.arguments = edited_args
+        elif needs_confirm:
             logger.info(
-                "工具 '%s' 需要确认（当前自动放行）: %s",
+                "工具 '%s' 需要确认但没有 confirm_callback，当前自动放行: %s",
                 tool_call.name,
                 tool_call.arguments,
             )
@@ -1130,6 +1216,23 @@ class Agent:
                 )
             )
             return msg, dummy
+
+        validation_error = self._validate_tool_call_arguments(tool, tool_call)
+        if validation_error is not None:
+            self._trace_tool_call_result(
+                tool_call,
+                validation_error,
+                llm_call_id=trace_llm_call_id,
+                metadata={"validation_error": True},
+            )
+            msg = Message.tool(
+                LLMToolResult(
+                    tool_call_id=tool_call.id,
+                    content=validation_error.error or "参数校验失败",
+                    is_error=True,
+                )
+            )
+            return msg, validation_error
 
         # 安全检查
         safety_level, block_reason = self._check_safety(tool.name, tool_call)

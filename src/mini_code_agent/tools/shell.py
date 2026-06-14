@@ -38,7 +38,15 @@ class BashTool(Tool):
     cwd: str | None = None
 
     async def execute(self, **kwargs: Any) -> ToolResult:
-        command: str = kwargs["command"]
+        command = kwargs["command"]
+        if not isinstance(command, str):
+            return ToolResult(
+                output="",
+                error=(
+                    "command 必须是字符串，"
+                    f"实际是 {type(command).__name__}: {command!r}"
+                ),
+            )
 
         try:
             proc = await asyncio.create_subprocess_shell(

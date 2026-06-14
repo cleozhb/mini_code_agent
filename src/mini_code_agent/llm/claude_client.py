@@ -323,25 +323,32 @@ class ClaudeClient(LLMClient):
             kwargs["output_config"] = output_config
 
         self._trace_provider_request(trace_id, kwargs)
+
+        async def _do_call():
+            try:
+                return await self._client.messages.create(**kwargs)
+            except anthropic.AuthenticationError as e:
+                self._trace_finish_llm_call(trace_id, error=e)
+                raise LLMAuthError(f"Anthropic 认证失败: {e}") from e
+            except anthropic.RateLimitError as e:
+                raise LLMRateLimitError(f"Anthropic 速率限制: {e}") from e
+            except anthropic.BadRequestError as e:
+                self._trace_finish_llm_call(trace_id, error=e)
+                if response_format and "schema" in str(e).lower():
+                    raise LLMError(
+                        "Anthropic structured output schema 不兼容，"
+                        "请简化 JSON Schema 或关闭 strict/structured outputs"
+                    ) from e
+                raise LLMError(f"Anthropic 请求错误: {e}") from e
+            except anthropic.APIError as e:
+                self._trace_finish_llm_call(trace_id, error=e)
+                raise LLMError(f"Anthropic API 错误: {e}") from e
+
         try:
-            resp = await self._client.messages.create(**kwargs)
-        except anthropic.AuthenticationError as e:
+            resp = await self._call_with_retry(_do_call)
+        except LLMRateLimitError as e:
             self._trace_finish_llm_call(trace_id, error=e)
-            raise LLMAuthError(f"Anthropic 认证失败: {e}") from e
-        except anthropic.RateLimitError as e:
-            self._trace_finish_llm_call(trace_id, error=e)
-            raise LLMRateLimitError(f"Anthropic 速率限制: {e}") from e
-        except anthropic.BadRequestError as e:
-            self._trace_finish_llm_call(trace_id, error=e)
-            if response_format and "schema" in str(e).lower():
-                raise LLMError(
-                    "Anthropic structured output schema 不兼容，"
-                    "请简化 JSON Schema 或关闭 strict/structured outputs"
-                ) from e
-            raise LLMError(f"Anthropic 请求错误: {e}") from e
-        except anthropic.APIError as e:
-            self._trace_finish_llm_call(trace_id, error=e)
-            raise LLMError(f"Anthropic API 错误: {e}") from e
+            raise
 
         self._trace_raw_response(trace_id, resp)
         try:

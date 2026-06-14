@@ -342,6 +342,11 @@ class TestBashTool:
         # stderr 合并到 stdout
         assert "err" in result.output
 
+    async def test_rejects_non_string_command(self, tool: BashTool) -> None:
+        result = await tool.execute(command=True)
+        assert result.is_error
+        assert "command 必须是字符串" in (result.error or "")
+
     async def test_timeout(self) -> None:
         tool = BashTool(timeout=1)
         result = await tool.execute(command="sleep 10")

@@ -14,6 +14,7 @@ from .lsp import (
 from .memory import AddMemoryTool, RecallMemoryTool
 from .search import GrepTool, ListDirTool
 from .shell import BashTool
+from .subagent import SubAgentTool
 
 __all__ = [
     "PermissionLevel",
@@ -33,6 +34,7 @@ __all__ = [
     "LSPManager",
     "ReadFileTool",
     "RecallMemoryTool",
+    "SubAgentTool",
     "WriteFileTool",
     "BashTool",
     "GrepTool",

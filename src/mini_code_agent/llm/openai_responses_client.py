@@ -268,17 +268,24 @@ class OpenAIResponsesClient(LLMClient):
             kwargs["text"] = text_config
 
         self._trace_provider_request(trace_id, kwargs)
+
+        async def _do_call():
+            try:
+                return await self._client.responses.create(**kwargs)
+            except openai.AuthenticationError as e:
+                self._trace_finish_llm_call(trace_id, error=e)
+                raise LLMAuthError(f"OpenAI 认证失败: {e}") from e
+            except openai.RateLimitError as e:
+                raise LLMRateLimitError(f"OpenAI 速率限制: {e}") from e
+            except openai.APIError as e:
+                self._trace_finish_llm_call(trace_id, error=e)
+                raise LLMError(f"OpenAI API 错误: {e}") from e
+
         try:
-            resp = await self._client.responses.create(**kwargs)
-        except openai.AuthenticationError as e:
+            resp = await self._call_with_retry(_do_call)
+        except LLMRateLimitError as e:
             self._trace_finish_llm_call(trace_id, error=e)
-            raise LLMAuthError(f"OpenAI 认证失败: {e}") from e
-        except openai.RateLimitError as e:
-            self._trace_finish_llm_call(trace_id, error=e)
-            raise LLMRateLimitError(f"OpenAI 速率限制: {e}") from e
-        except openai.APIError as e:
-            self._trace_finish_llm_call(trace_id, error=e)
-            raise LLMError(f"OpenAI API 错误: {e}") from e
+            raise
 
         self._trace_raw_response(trace_id, resp)
         try:

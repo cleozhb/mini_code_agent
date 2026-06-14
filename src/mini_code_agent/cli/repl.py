@@ -33,6 +33,28 @@ if TYPE_CHECKING:
     from ..longrun.ledger_manager import TaskLedgerManager
     from ..longrun.resume_manager import ResumeManager
 
+
+_WRITE_TOOL_NAMES = {"WriteFile", "EditFile", "write_file", "edit_file"}
+
+
+def _changed_path_from_subagent_event(event: AgentEvent) -> str | None:
+    """从 SubAgent 内部工具结果事件中提取成功写入的文件路径."""
+    if event.type != AgentEventType.TOOL_RESULT:
+        return None
+    if event.tool_call is None or event.tool_result is None:
+        return None
+    if event.tool_call.name not in _WRITE_TOOL_NAMES:
+        return None
+    if event.tool_result.is_error:
+        return None
+
+    args = event.tool_call.arguments
+    path = args.get("path") or args.get("file_path")
+    if not isinstance(path, str) or not path:
+        return None
+    return path
+
+
 # ---------------------------------------------------------------------------
 # REPL
 # ---------------------------------------------------------------------------
@@ -81,6 +103,7 @@ class REPL:
                 "/longrun",
                 "/pause", "/resume",
                 "/artifacts",
+                "/goal",
             ],
             sentence=True,  # 整条匹配，不拆词
         )
@@ -235,11 +258,16 @@ class REPL:
             await self._handle_artifacts_command(arg)
             return True
 
+        if command == "/goal":
+            goal_arg = parts[1].strip() if len(parts) > 1 else ""
+            await self._handle_goal_command(goal_arg)
+            return True
+
         self.console.print(f"[red]未知命令: {command}[/red]")
         self.console.print(
             "[dim]可用命令: /quit  /clear  /cost  /model  /memory  /save  /plan"
             "  /undo  /checkpoints  /diff  /graph  /graph-export"
-            "  /status  /ledger  /longrun  /pause  /resume[/dim]"
+            "  /status  /ledger  /longrun  /goal  /pause  /resume[/dim]"
         )
         return True
 
@@ -872,6 +900,305 @@ class REPL:
                     f"{m.created_at[:19]}"
                 )
 
+    async def _handle_goal_command(self, arg: str) -> None:
+        """/goal [目标] — 启动 Goal-Driven 编排模式."""
+        from ..core.agent import AgentObserver
+        from ..core.goal_prompt import build_goal_driven_prompt
+        from ..tools.subagent import SubAgentTool
+
+        # 收集 goal
+        goal = arg.strip()
+        if not goal:
+            self.console.print("[bold]Goal-Driven 模式[/bold] — 请输入目标：")
+            try:
+                goal = await self._prompt_session.prompt_async(
+                    HTML("<b><ansigreen>目标: </ansigreen></b>"),
+                )
+            except (EOFError, KeyboardInterrupt):
+                self.console.print("[yellow]已取消[/yellow]")
+                return
+            goal = goal.strip()
+            if not goal:
+                self.console.print("[yellow]目标为空，已取消[/yellow]")
+                return
+
+        # 收集 criteria
+        self.console.print("[dim]请输入成功标准（如何判定目标已达成）：[/dim]")
+        try:
+            criteria = await self._prompt_session.prompt_async(
+                HTML("<b><ansicyan>标准: </ansicyan></b>"),
+            )
+        except (EOFError, KeyboardInterrupt):
+            self.console.print("[yellow]已取消[/yellow]")
+            return
+        criteria = criteria.strip()
+        if not criteria:
+            self.console.print("[yellow]标准为空，已取消[/yellow]")
+            return
+
+        # 构建 master Agent
+        from pathlib import Path
+
+        from ..core.agent import Agent
+        from ..safety.loop_guard import LoopGuard
+        from ..tools.base import ToolRegistry
+        from ..tools.file_ops import ReadFileTool
+        from ..tools.git import GitLogTool, GitStatusTool
+        from ..tools.search import GrepTool, ListDirTool
+        from ..tools.shell import BashTool
+
+        project_path = str(Path(".").resolve())
+        llm_client = self.agent.llm_client
+        subagent_files_changed: list[str] = []
+
+        async def _relay_subagent_event(event: AgentEvent) -> None:
+            changed_path = _changed_path_from_subagent_event(event)
+            if changed_path and changed_path not in subagent_files_changed:
+                subagent_files_changed.append(changed_path)
+            self._render_subagent_event(event)
+
+        sub_agent_tool = SubAgentTool(
+            llm_client=llm_client,
+            project_path=project_path,
+            system_prompt="你是一个编程助手，按指令完成任务。完成后简要说明做了什么。",
+            confirm_callback=self.agent.confirm_callback,
+            event_callback=_relay_subagent_event,
+        )
+
+        registry = ToolRegistry()
+        registry.register(sub_agent_tool)
+        registry.register(BashTool(cwd=project_path))
+        registry.register(ReadFileTool())
+        registry.register(GrepTool())
+        registry.register(ListDirTool())
+        registry.register(GitStatusTool())
+        registry.register(GitLogTool())
+
+        system_prompt = build_goal_driven_prompt(goal, criteria, project_path)
+        loop_guard = LoopGuard(max_rounds=200)
+
+        master_agent = Agent(
+            llm_client=llm_client,
+            tool_registry=registry,
+            system_prompt=system_prompt,
+            confirm_callback=self.agent.confirm_callback,
+            loop_guard=loop_guard,
+            project_path=project_path,
+        )
+
+        # 创建 Ledger（如果有 manager）
+        manager = self.agent.ledger_manager
+        ledger = None
+        if manager is not None:
+            from ..core.task_graph import TaskGraph, TaskNode
+            from ..longrun.ledger_types import TaskRunStatus
+
+            dummy_graph = TaskGraph()
+            dummy_graph.original_goal = goal
+            dummy_graph.add_task(TaskNode(id="goal", description=goal))
+            ledger = manager.create(
+                goal=goal, task_graph=dummy_graph, budget=self._token_budget
+            )
+            ledger.status = TaskRunStatus.RUNNING
+            ledger.current_phase = "execution"
+            ledger.current_task_id = "goal"
+            nodes = ledger.task_graph_snapshot.get("nodes", {})
+            if "goal" in nodes:
+                nodes["goal"]["status"] = "running"
+            ledger.token_budget_remaining = max(
+                0, ledger.token_budget - ledger.total_tokens_used
+            )
+            manager.save(ledger)
+            master_agent.ledger = ledger
+            master_agent.ledger_manager = manager
+            self.console.print(
+                f"[green]Ledger 已创建: {ledger.task_id[:8]}[/green]"
+            )
+
+        # 挂 Observer：监听 SubAgent tool 调用结果，即时写入 Ledger
+        if ledger is not None and manager is not None:
+            from datetime import datetime, UTC
+            from ..longrun.ledger_types import CompletedTaskRecord, FailedAttemptRecord
+
+            class GoalLedgerObserver(AgentObserver):
+                def __init__(self, ledger, manager, files_changed_buffer: list[str]):
+                    self._ledger = ledger
+                    self._manager = manager
+                    self._files_changed_buffer = files_changed_buffer
+                    self._sub_count = 0
+
+                def on_tool_call(self, name: str, args: dict, result) -> None:
+                    if name != "SubAgent":
+                        return
+                    from ..tools.base import ToolResult as TR
+                    if not isinstance(result, TR):
+                        return
+                    self._sub_count += 1
+                    task_id = f"sub-{self._sub_count}"
+                    goal_desc = args.get("goal", "")[:200]
+                    output = result.output or ""
+                    stop_reason = "unknown"
+                    first_line = output.splitlines()[0] if output else ""
+                    if first_line.startswith("[stop_reason:") and first_line.endswith("]"):
+                        stop_reason = first_line[len("[stop_reason:"):-1].strip()
+                    token_count = 0
+                    for line in output.splitlines()[:3]:
+                        if line.startswith("[usage:") and line.endswith("]"):
+                            for part in line[len("[usage:"):-1].strip().split():
+                                if part.startswith("total_tokens="):
+                                    try:
+                                        token_count = int(part.split("=", 1)[1])
+                                    except ValueError:
+                                        token_count = 0
+                                    break
+                    step_start = self._ledger.total_steps
+                    step_end = step_start + 1
+                    sub_failed = result.is_error or stop_reason not in {"ok", "unknown"}
+                    files_changed = list(self._files_changed_buffer)
+                    self._files_changed_buffer.clear()
+
+                    if sub_failed:
+                        reason = result.error or f"stop_reason={stop_reason}"
+                        self._ledger.failed_attempts.append(FailedAttemptRecord(
+                            task_id=task_id,
+                            artifact_id="",
+                            approach_description=goal_desc,
+                            failure_reason=reason,
+                            step_number=step_end,
+                        ))
+                    else:
+                        self._ledger.completed_tasks.append(CompletedTaskRecord(
+                            task_id=task_id,
+                            artifact_id="",
+                            description=goal_desc,
+                            self_summary=output[:300],
+                            files_changed=files_changed,
+                            verification_passed=False,
+                            confidence="DONE",
+                            step_number_start=step_start,
+                            step_number_end=step_end,
+                            token_count=token_count,
+                            timestamp=datetime.now(UTC),
+                        ))
+                    self._ledger.total_steps = step_end
+                    self._ledger.total_tokens_used += token_count
+                    self._ledger.token_budget_remaining = max(
+                        0, self._ledger.token_budget - self._ledger.total_tokens_used
+                    )
+                    self._manager.save(self._ledger)
+
+                def on_llm_call(self, tokens_in: int, tokens_out: int, model: str) -> None:
+                    self._ledger.total_tokens_used += tokens_in + tokens_out
+                    self._ledger.token_budget_remaining = max(
+                        0, self._ledger.token_budget - self._ledger.total_tokens_used
+                    )
+                    self._manager.save(self._ledger)
+
+            master_agent.observers.append(
+                GoalLedgerObserver(ledger, manager, subagent_files_changed)
+            )
+
+        self.console.print(
+            f"\n[bold]Goal-Driven 模式启动[/bold]\n"
+            f"[dim]目标: {goal}[/dim]\n"
+            f"[dim]标准: {criteria}[/dim]\n"
+        )
+
+        def _set_goal_node_status(status: str) -> None:
+            if ledger is None:
+                return
+            nodes = ledger.task_graph_snapshot.get("nodes", {})
+            if "goal" in nodes:
+                nodes["goal"]["status"] = status
+
+        def _mark_goal_milestones_reached() -> None:
+            if ledger is None:
+                return
+            for milestone in ledger.milestones:
+                if "goal" in milestone.associated_task_ids:
+                    milestone.status = "REACHED"
+                    milestone.actual_step = ledger.total_steps
+
+        def _refresh_budget() -> None:
+            if ledger is None:
+                return
+            ledger.token_budget_remaining = max(
+                0, ledger.token_budget - ledger.total_tokens_used
+            )
+
+        # 流式执行 master agent
+        import sys
+        from time import monotonic
+
+        from ..core.agent import AgentEventType
+
+        started_at = monotonic()
+        run_finished = False
+        finish_stop_reason = ""
+        run_interrupted = False
+        run_error: Exception | None = None
+        try:
+            async for event in master_agent.run_stream(
+                f"开始执行。当前项目根目录是 {project_path}。"
+                "先用相对路径检查当前项目状态，然后决定第一步。"
+            ):
+                if event.type == AgentEventType.TEXT_DELTA:
+                    sys.stdout.write(event.content)
+                    sys.stdout.flush()
+                elif event.type == AgentEventType.TOOL_CALL_START:
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+                    self._render_tool_call_start(event.tool_call)
+                elif event.type == AgentEventType.TOOL_CALL_END:
+                    self._render_tool_call_args(event.tool_call)
+                elif event.type == AgentEventType.TOOL_RESULT:
+                    self._render_tool_result(event.tool_call, event.tool_result)
+                elif event.type == AgentEventType.FINISH:
+                    run_finished = True
+                    finish_stop_reason = event.content or "ok"
+                    sys.stdout.write("\n")
+                    sys.stdout.flush()
+                    if event.usage:
+                        self._render_usage_brief(event.usage)
+        except KeyboardInterrupt:
+            run_interrupted = True
+            self.console.print("\n[yellow]已中断[/yellow]")
+        except Exception as e:
+            run_error = e
+            self.console.print(f"\n[red]错误: {type(e).__name__}: {e}[/red]")
+
+        # 更新 Ledger 状态
+        if manager is not None and ledger is not None:
+            from ..longrun.ledger_types import TaskRunStatus
+            ledger.total_wall_time_seconds += monotonic() - started_at
+            if run_interrupted:
+                ledger.status = TaskRunStatus.PAUSED
+                ledger.current_phase = "paused"
+                ledger.current_task_id = "goal"
+                _set_goal_node_status("running")
+            elif run_error is not None:
+                ledger.status = TaskRunStatus.FAILED
+                ledger.current_phase = "failed"
+                ledger.current_task_id = None
+                _set_goal_node_status("failed")
+            elif run_finished and finish_stop_reason == "ok":
+                ledger.status = TaskRunStatus.COMPLETED
+                ledger.current_phase = "done"
+                ledger.current_task_id = None
+                _set_goal_node_status("completed")
+                _mark_goal_milestones_reached()
+                for record in ledger.completed_tasks:
+                    record.verification_passed = True
+            else:
+                ledger.status = TaskRunStatus.FAILED
+                ledger.current_phase = "failed"
+                ledger.current_task_id = None
+                _set_goal_node_status("failed")
+            _refresh_budget()
+            manager.save(ledger)
+
+        self.console.print("\n[dim]Goal-Driven 模式结束[/dim]")
+
     async def _handle_pause(self) -> None:
         """触发 USER_PAUSE checkpoint，暂停当前长程任务."""
         if self._checkpoint_manager is None:
@@ -1207,58 +1534,86 @@ class REPL:
                 sys.stdout.flush()
             self.console.print(f"\n[red]错误: {type(e).__name__}: {e}[/red]")
 
-    def _render_tool_call_start(self, tool_call: ToolCall | None) -> None:
+    def _render_subagent_event(self, event: AgentEvent) -> None:
+        """渲染 SubAgent 内部事件，让 Goal 模式下的执行过程可见."""
+        if event.type == AgentEventType.TOOL_CALL_START:
+            self._render_tool_call_start(event.tool_call, prefix="    ↳ ")
+        elif event.type == AgentEventType.TOOL_CALL_END:
+            self._render_tool_call_args(event.tool_call, prefix="      ")
+        elif event.type == AgentEventType.TOOL_RESULT:
+            self._render_tool_result(event.tool_call, event.tool_result, prefix="      ")
+        elif event.type == AgentEventType.FINISH and event.usage:
+            self.console.print(
+                f"      [dim]SubAgent tokens: "
+                f"{event.usage.input_tokens:,} in / "
+                f"{event.usage.output_tokens:,} out[/dim]"
+            )
+
+    def _render_tool_call_start(
+        self,
+        tool_call: ToolCall | None,
+        prefix: str = "  ",
+    ) -> None:
         """渲染工具调用开始."""
         if not tool_call:
             return
         self.console.print(
-            f"  [bold yellow]⚡ {tool_call.name}[/bold yellow]",
+            f"{prefix}[bold yellow]⚡ {tool_call.name}[/bold yellow]",
             highlight=False,
         )
 
-    def _render_tool_call_args(self, tool_call: ToolCall | None) -> None:
+    def _render_tool_call_args(
+        self,
+        tool_call: ToolCall | None,
+        prefix: str = "    ",
+    ) -> None:
         """渲染工具调用的参数."""
         if not tool_call:
             return
         args = tool_call.arguments
         # 为常见工具做特殊展示
         if tool_call.name == "Bash" and "command" in args:
-            self.console.print(f"    [dim]$ {args['command']}[/dim]")
+            self.console.print(f"{prefix}[dim]$ {args['command']}[/dim]")
         elif tool_call.name == "ReadFile" and "path" in args:
             extra = ""
             if "start_line" in args:
                 extra = f" (行 {args['start_line']}-{args.get('end_line', '末尾')})"
-            self.console.print(f"    [dim]📄 {args['path']}{extra}[/dim]")
+            self.console.print(f"{prefix}[dim]📄 {args['path']}{extra}[/dim]")
         elif tool_call.name == "WriteFile" and "path" in args:
             content = args.get("content", "")
             lines_count = len(content.splitlines())
-            self.console.print(f"    [dim]✏️  {args['path']} ({lines_count} 行)[/dim]")
+            self.console.print(f"{prefix}[dim]✏️  {args['path']} ({lines_count} 行)[/dim]")
         elif tool_call.name == "Grep" and "pattern" in args:
             path = args.get("path", ".")
-            self.console.print(f"    [dim]🔍 '{args['pattern']}' in {path}[/dim]")
+            self.console.print(f"{prefix}[dim]🔍 '{args['pattern']}' in {path}[/dim]")
         elif tool_call.name == "ListDir":
             path = args.get("path", ".")
-            self.console.print(f"    [dim]📁 {path}[/dim]")
+            self.console.print(f"{prefix}[dim]📁 {path}[/dim]")
         elif tool_call.name == "GitStatus":
             path = args.get("path", ".")
-            self.console.print(f"    [dim]📋 git status ({path})[/dim]")
+            self.console.print(f"{prefix}[dim]📋 git status ({path})[/dim]")
         elif tool_call.name == "GitDiff":
             staged = args.get("staged", False)
             label = "staged" if staged else "unstaged"
-            self.console.print(f"    [dim]📋 git diff ({label})[/dim]")
+            self.console.print(f"{prefix}[dim]📋 git diff ({label})[/dim]")
         elif tool_call.name == "GitCommit":
             msg = args.get("message", "")
-            self.console.print(f"    [dim]📝 git commit -m \"{msg}\"[/dim]")
+            self.console.print(f"{prefix}[dim]📝 git commit -m \"{msg}\"[/dim]")
         elif tool_call.name == "GitLog":
             count = args.get("count", 10)
-            self.console.print(f"    [dim]📋 git log -{count}[/dim]")
+            self.console.print(f"{prefix}[dim]📋 git log -{count}[/dim]")
         else:
             compact = json.dumps(args, ensure_ascii=False)
             if len(compact) > 120:
                 compact = compact[:117] + "..."
-            self.console.print(f"    [dim]{compact}[/dim]")
+            self.console.print(f"{prefix}[dim]{compact}[/dim]")
 
-    def _render_tool_result(self, tool_call: ToolCall | None, result: Any) -> None:
+    def _render_tool_result(
+        self,
+        tool_call: ToolCall | None,
+        result: Any,
+        prefix: str = "    ",
+    ) -> None:
         """渲染工具执行结果（简要）."""
         if result is None:
             return
@@ -1272,20 +1627,20 @@ class REPL:
             error_text = result.error or "未知错误"
             if len(error_text) > 200:
                 error_text = error_text[:197] + "..."
-            self.console.print(f"    [red]✗ {error_text}[/red]")
+            self.console.print(f"{prefix}[red]✗ {error_text}[/red]")
         else:
             output = result.output
             lines = output.splitlines()
             if len(lines) > 5:
                 preview = "\n".join(lines[:3])
-                self.console.print(f"    [green]✓[/green] [dim]({len(lines)} 行输出)[/dim]")
+                self.console.print(f"{prefix}[green]✓[/green] [dim]({len(lines)} 行输出)[/dim]")
             elif output:
                 # 短输出直接显示
                 if len(output) > 200:
                     output = output[:197] + "..."
-                self.console.print(f"    [green]✓[/green] [dim]{output}[/dim]")
+                self.console.print(f"{prefix}[green]✓[/green] [dim]{output}[/dim]")
             else:
-                self.console.print(f"    [green]✓[/green] [dim](空输出)[/dim]")
+                self.console.print(f"{prefix}[green]✓[/green] [dim](空输出)[/dim]")
 
     def _render_usage_brief(self, usage: TokenUsage) -> None:
         """在回复末尾简要显示 token 用量."""
