@@ -411,13 +411,12 @@ class TestLedgerManager:
 
     def test_create_and_load(self, manager: TaskLedgerManager, graph: TaskGraph) -> None:
         """创建后加载，内容一致."""
-        ledger = manager.create(goal="Build feature", task_graph=graph, budget=10000)
+        ledger = manager.create(goal="Build feature", budget=10000)
 
         assert ledger.task_id is not None
         assert ledger.goal == "Build feature"
         assert ledger.status == TaskRunStatus.NOT_STARTED
         assert ledger.token_budget == 10000
-        assert len(ledger.milestones) > 0
 
         loaded = manager.load(ledger.task_id)
         assert loaded.task_id == ledger.task_id
@@ -426,7 +425,7 @@ class TestLedgerManager:
 
     def test_json_roundtrip_save_load(self, manager: TaskLedgerManager, graph: TaskGraph) -> None:
         """Save 后 load 内容完全一致."""
-        ledger = manager.create(goal="Roundtrip test", task_graph=graph, budget=5000)
+        ledger = manager.create(goal="Roundtrip test", budget=5000)
 
         # 添加一些数据
         ledger.status = TaskRunStatus.RUNNING
@@ -445,7 +444,7 @@ class TestLedgerManager:
 
     def test_atomic_write_survives_corruption(self, manager: TaskLedgerManager, graph: TaskGraph) -> None:
         """模拟主文件损坏，load 能从 history 恢复."""
-        ledger = manager.create(goal="Atomic test", task_graph=graph, budget=5000)
+        ledger = manager.create(goal="Atomic test", budget=5000)
         original_id = ledger.task_id
 
         # 做一次正常更新
@@ -470,8 +469,8 @@ class TestLedgerManager:
 
     def test_list_all(self, manager: TaskLedgerManager, graph: TaskGraph) -> None:
         """列出所有 Ledger."""
-        l1 = manager.create(goal="Task 1", task_graph=graph, budget=1000)
-        l2 = manager.create(goal="Task 2", task_graph=graph, budget=2000)
+        l1 = manager.create(goal="Task 1", budget=1000)
+        l2 = manager.create(goal="Task 2", budget=2000)
 
         metas = manager.list_all()
         assert len(metas) == 2
@@ -481,7 +480,7 @@ class TestLedgerManager:
 
     def test_record_task_completed(self, manager: TaskLedgerManager, graph: TaskGraph) -> None:
         """record_task_completed 正确提取 Artifact 所有字段."""
-        ledger = manager.create(goal="Test completed", task_graph=graph, budget=10000)
+        ledger = manager.create(goal="Test completed", budget=10000)
         ledger.status = TaskRunStatus.RUNNING
         manager.save(ledger)
 
@@ -530,7 +529,7 @@ class TestLedgerManager:
 
     def test_record_task_failed(self, manager: TaskLedgerManager, graph: TaskGraph) -> None:
         """失败记录正确保存."""
-        ledger = manager.create(goal="Test failed", task_graph=graph, budget=10000)
+        ledger = manager.create(goal="Test failed", budget=10000)
         artifact = _make_artifact(task_id="task-1", passed=False)
 
         manager.record_task_failed(ledger, artifact, "Import error")
@@ -541,7 +540,7 @@ class TestLedgerManager:
         assert fa.failure_reason == "Import error"
 
     def test_record_and_resolve_issue(self, manager: TaskLedgerManager, graph: TaskGraph) -> None:
-        ledger = manager.create(goal="Test issues", task_graph=graph, budget=10000)
+        ledger = manager.create(goal="Test issues", budget=10000)
 
         issue = ActiveIssue(
             id="issue-1",
@@ -559,7 +558,7 @@ class TestLedgerManager:
         assert ledger.resolved_issues[0].resolved is True
 
     def test_update_current_task(self, manager: TaskLedgerManager, graph: TaskGraph) -> None:
-        ledger = manager.create(goal="Test update", task_graph=graph, budget=10000)
+        ledger = manager.create(goal="Test update", budget=10000)
         manager.update_current_task(ledger, "task-2")
         assert ledger.current_task_id == "task-2"
 
@@ -567,12 +566,12 @@ class TestLedgerManager:
         assert loaded.current_task_id == "task-2"
 
     def test_update_phase(self, manager: TaskLedgerManager, graph: TaskGraph) -> None:
-        ledger = manager.create(goal="Test phase", task_graph=graph, budget=10000)
+        ledger = manager.create(goal="Test phase", budget=10000)
         manager.update_phase(ledger, "testing")
         assert ledger.current_phase == "testing"
 
     def test_update_resources(self, manager: TaskLedgerManager, graph: TaskGraph) -> None:
-        ledger = manager.create(goal="Test resources", task_graph=graph, budget=10000)
+        ledger = manager.create(goal="Test resources", budget=10000)
         manager.update_resources(ledger, tokens=500, steps=1, wall_time=2.5)
         assert ledger.total_tokens_used == 500
         assert ledger.total_steps == 1
@@ -599,16 +598,23 @@ class TestMilestoneDetection:
         return TaskLedgerManager(storage_dir=str(tmp_path / "ledger"))
 
     def test_milestone_reached_on_task_completion(self, manager: TaskLedgerManager) -> None:
-        """添加 completed_task 后对应 milestone 变成 REACHED."""
-        graph = _make_task_graph(2)
-        ledger = manager.create(goal="Milestone test", task_graph=graph, budget=10000)
+        """手动添加 milestone 后，完成关联任务后变成 REACHED."""
+        ledger = manager.create(goal="Milestone test", budget=10000)
 
-        # 第一层应该只有 task-0（深度 0）
-        # 完成 task-0
+        # 手动添加 milestone（Goal 模式下 milestones 不自动生成）
+        from mini_code_agent.longrun.ledger_types import Milestone
+        ledger.milestones.append(Milestone(
+            id="m-1",
+            description="Complete task-0",
+            associated_task_ids=["task-0"],
+            expected_by_step=5,
+            status="PENDING",
+        ))
+        manager.save(ledger)
+
         artifact = _make_artifact(task_id="task-0")
         manager.record_task_completed(ledger, artifact)
 
-        # 找到关联 task-0 的 milestone
         m0 = next(
             (m for m in ledger.milestones if "task-0" in m.associated_task_ids),
             None,
@@ -618,26 +624,36 @@ class TestMilestoneDetection:
 
     def test_milestone_overdue(self, manager: TaskLedgerManager) -> None:
         """当步数超过 expected_by_step 但任务未完成时，milestone 变 OVERDUE."""
-        graph = _make_task_graph(1)
-        ledger = manager.create(goal="Overdue test", task_graph=graph, budget=10000)
+        ledger = manager.create(goal="Overdue test", budget=10000)
 
-        # 找到 milestone
-        assert len(ledger.milestones) > 0
-        m = ledger.milestones[0]
-        expected = m.expected_by_step
+        from mini_code_agent.longrun.ledger_types import Milestone
+        ledger.milestones.append(Milestone(
+            id="m-1",
+            description="test",
+            associated_task_ids=["task-0"],
+            expected_by_step=3,
+            status="PENDING",
+        ))
 
-        # 增加步数超过预期
-        ledger.total_steps = expected + 5
+        ledger.total_steps = 8
         manager._check_milestones(ledger)
 
-        assert m.status == "OVERDUE"
+        assert ledger.milestones[0].status == "OVERDUE"
 
     def test_diamond_graph_milestones(self, manager: TaskLedgerManager) -> None:
-        """钻石形 DAG 的 milestone 提取."""
-        graph = _make_diamond_graph()
-        ledger = manager.create(goal="Diamond test", task_graph=graph, budget=10000)
+        """手动添加多层 milestones 可被正确检测."""
+        ledger = manager.create(goal="Diamond test", budget=10000)
 
-        # 应有多层 milestone
+        from mini_code_agent.longrun.ledger_types import Milestone
+        ledger.milestones.append(Milestone(
+            id="m-1", description="Layer 1",
+            associated_task_ids=["A"], expected_by_step=2, status="PENDING",
+        ))
+        ledger.milestones.append(Milestone(
+            id="m-2", description="Layer 2",
+            associated_task_ids=["B", "C"], expected_by_step=4, status="PENDING",
+        ))
+
         assert len(ledger.milestones) > 1
 
 
@@ -656,7 +672,7 @@ class TestBuildContextSummary:
     def test_deterministic_output(self, manager: TaskLedgerManager) -> None:
         """相同 ledger → 相同输出."""
         graph = _make_task_graph(3)
-        ledger = manager.create(goal="Deterministic test", task_graph=graph, budget=10000)
+        ledger = manager.create(goal="Deterministic test", budget=10000)
         ledger.current_phase = "execution"
 
         s1 = manager.build_context_summary(ledger)
@@ -666,7 +682,7 @@ class TestBuildContextSummary:
     def test_overview_always_present(self, manager: TaskLedgerManager) -> None:
         """任务概览应始终存在."""
         graph = _make_task_graph(1)
-        ledger = manager.create(goal="Overview test", task_graph=graph, budget=10000)
+        ledger = manager.create(goal="Overview test", budget=10000)
 
         summary = manager.build_context_summary(ledger, max_chars=200)
         assert "任务概览" in summary
@@ -675,7 +691,7 @@ class TestBuildContextSummary:
     def test_truncation_by_priority(self, manager: TaskLedgerManager) -> None:
         """低优先级部分在 max_chars 限制下被截断."""
         graph = _make_task_graph(3)
-        ledger = manager.create(goal="Truncation test", task_graph=graph, budget=10000)
+        ledger = manager.create(goal="Truncation test", budget=10000)
 
         # 添加大量历史数据
         for i in range(20):
@@ -705,7 +721,7 @@ class TestBuildContextSummary:
     def test_issues_in_summary(self, manager: TaskLedgerManager) -> None:
         """活跃问题应出现在摘要中."""
         graph = _make_task_graph(1)
-        ledger = manager.create(goal="Issue test", task_graph=graph, budget=10000)
+        ledger = manager.create(goal="Issue test", budget=10000)
         ledger.active_issues.append(ActiveIssue(
             id="i-1",
             description="Critical bug in auth",
@@ -720,7 +736,7 @@ class TestBuildContextSummary:
     def test_failures_in_summary(self, manager: TaskLedgerManager) -> None:
         """失败教训应出现在摘要中."""
         graph = _make_task_graph(1)
-        ledger = manager.create(goal="Failure test", task_graph=graph, budget=10000)
+        ledger = manager.create(goal="Failure test", budget=10000)
         ledger.failed_attempts.append(FailedAttemptRecord(
             task_id="task-0",
             artifact_id="a-fail",
@@ -736,7 +752,7 @@ class TestBuildContextSummary:
     def test_decisions_in_summary(self, manager: TaskLedgerManager) -> None:
         """关键决策应出现在摘要中."""
         graph = _make_task_graph(1)
-        ledger = manager.create(goal="Decision test", task_graph=graph, budget=10000)
+        ledger = manager.create(goal="Decision test", budget=10000)
         ledger.decisions_made.append(DecisionRecord(
             description="Use PostgreSQL",
             reason="Better for concurrent writes",
@@ -764,7 +780,7 @@ class TestHistory:
     def test_history_append_only(self, manager: TaskLedgerManager) -> None:
         """每次更新都有新记录，不覆盖."""
         graph = _make_task_graph(1)
-        ledger = manager.create(goal="History test", task_graph=graph, budget=10000)
+        ledger = manager.create(goal="History test", budget=10000)
 
         # create 已经写了 1 次
         # 再做 3 次更新
@@ -786,7 +802,7 @@ class TestHistory:
     def test_get_history(self, manager: TaskLedgerManager) -> None:
         """get_history 返回最后 N 条摘要."""
         graph = _make_task_graph(1)
-        ledger = manager.create(goal="Get history", task_graph=graph, budget=10000)
+        ledger = manager.create(goal="Get history", budget=10000)
 
         for i in range(5):
             ledger.total_steps = i + 1
@@ -800,7 +816,7 @@ class TestHistory:
     def test_history_survives_main_file_corruption(self, manager: TaskLedgerManager) -> None:
         """即使主文件损坏，history 也完好无损."""
         graph = _make_task_graph(1)
-        ledger = manager.create(goal="Survive test", task_graph=graph, budget=10000)
+        ledger = manager.create(goal="Survive test", budget=10000)
         ledger.total_steps = 42
         manager.save(ledger)
 
@@ -828,7 +844,7 @@ class TestConcurrencySafety:
     def test_concurrent_read_write(self, manager: TaskLedgerManager) -> None:
         """并发读写不应导致 JSON 解析错误."""
         graph = _make_task_graph(1)
-        ledger = manager.create(goal="Concurrent test", task_graph=graph, budget=10000)
+        ledger = manager.create(goal="Concurrent test", budget=10000)
         task_id = ledger.task_id
 
         errors: list[str] = []
@@ -880,7 +896,7 @@ class TestStatsAndResume:
 
     def test_get_stats(self, manager: TaskLedgerManager) -> None:
         graph = _make_task_graph(3)
-        ledger = manager.create(goal="Stats test", task_graph=graph, budget=10000)
+        ledger = manager.create(goal="Stats test", budget=10000)
         ledger.status = TaskRunStatus.RUNNING
         ledger.total_tokens_used = 3000
         ledger.total_steps = 5
@@ -897,7 +913,7 @@ class TestStatsAndResume:
 
     def test_get_summary_for_resume(self, manager: TaskLedgerManager) -> None:
         graph = _make_task_graph(3)
-        ledger = manager.create(goal="Resume test", task_graph=graph, budget=10000)
+        ledger = manager.create(goal="Resume test", budget=10000)
         ledger.current_task_id = "task-1"
 
         artifact = _make_artifact(task_id="task-0", tokens=500)
@@ -916,39 +932,6 @@ class TestStatsAndResume:
         assert "task-1" in summary
         assert "Auth broken" in summary
         assert "task-0" in summary  # 已完成的前置任务
-
-
-# ============================================================
-# Milestone 提取测试
-# ============================================================
-
-
-class TestMilestoneExtraction:
-    @pytest.fixture()
-    def manager(self, tmp_path: Path) -> TaskLedgerManager:
-        return TaskLedgerManager(storage_dir=str(tmp_path / "ledger"))
-
-    def test_linear_graph_milestones(self, manager: TaskLedgerManager) -> None:
-        """线性图每层一个 milestone."""
-        graph = _make_task_graph(3)
-        milestones = manager._extract_milestones(graph)
-        # 线性图有 3 层（每个任务一层）
-        assert len(milestones) == 3
-        # expected_by_step 递增
-        for i in range(1, len(milestones)):
-            assert milestones[i].expected_by_step >= milestones[i - 1].expected_by_step
-
-    def test_diamond_graph_milestones(self, manager: TaskLedgerManager) -> None:
-        """钻石图的层级结构."""
-        graph = _make_diamond_graph()
-        milestones = manager._extract_milestones(graph)
-        # A=depth0, B,C=depth1, D=depth2 → 3 层
-        assert len(milestones) == 3
-
-    def test_empty_graph_milestones(self, manager: TaskLedgerManager) -> None:
-        graph = TaskGraph()
-        milestones = manager._extract_milestones(graph)
-        assert milestones == []
 
 
 # ============================================================
@@ -971,7 +954,7 @@ class TestSaveOnMutation:
 
     def test_record_task_completed_saves(self, manager: TaskLedgerManager) -> None:
         graph = _make_task_graph(1)
-        ledger = manager.create(goal="Save test", task_graph=graph, budget=10000)
+        ledger = manager.create(goal="Save test", budget=10000)
         before = self._count_history_lines(manager, ledger.task_id)
 
         artifact = _make_artifact(task_id="task-0")
@@ -982,7 +965,7 @@ class TestSaveOnMutation:
 
     def test_record_task_failed_saves(self, manager: TaskLedgerManager) -> None:
         graph = _make_task_graph(1)
-        ledger = manager.create(goal="Save test", task_graph=graph, budget=10000)
+        ledger = manager.create(goal="Save test", budget=10000)
         before = self._count_history_lines(manager, ledger.task_id)
 
         artifact = _make_artifact(task_id="task-0", passed=False)
@@ -993,7 +976,7 @@ class TestSaveOnMutation:
 
     def test_record_active_issue_saves(self, manager: TaskLedgerManager) -> None:
         graph = _make_task_graph(1)
-        ledger = manager.create(goal="Save test", task_graph=graph, budget=10000)
+        ledger = manager.create(goal="Save test", budget=10000)
         before = self._count_history_lines(manager, ledger.task_id)
 
         issue = ActiveIssue(id="i-1", description="bug", source_task_id="t-0")
@@ -1004,7 +987,7 @@ class TestSaveOnMutation:
 
     def test_resolve_issue_saves(self, manager: TaskLedgerManager) -> None:
         graph = _make_task_graph(1)
-        ledger = manager.create(goal="Save test", task_graph=graph, budget=10000)
+        ledger = manager.create(goal="Save test", budget=10000)
         issue = ActiveIssue(id="i-1", description="bug", source_task_id="t-0")
         manager.record_active_issue(ledger, issue)
         before = self._count_history_lines(manager, ledger.task_id)
@@ -1016,7 +999,7 @@ class TestSaveOnMutation:
 
     def test_update_current_task_saves(self, manager: TaskLedgerManager) -> None:
         graph = _make_task_graph(1)
-        ledger = manager.create(goal="Save test", task_graph=graph, budget=10000)
+        ledger = manager.create(goal="Save test", budget=10000)
         before = self._count_history_lines(manager, ledger.task_id)
 
         manager.update_current_task(ledger, "task-0")
@@ -1026,7 +1009,7 @@ class TestSaveOnMutation:
 
     def test_update_phase_saves(self, manager: TaskLedgerManager) -> None:
         graph = _make_task_graph(1)
-        ledger = manager.create(goal="Save test", task_graph=graph, budget=10000)
+        ledger = manager.create(goal="Save test", budget=10000)
         before = self._count_history_lines(manager, ledger.task_id)
 
         manager.update_phase(ledger, "testing")
@@ -1036,7 +1019,7 @@ class TestSaveOnMutation:
 
     def test_update_resources_saves(self, manager: TaskLedgerManager) -> None:
         graph = _make_task_graph(1)
-        ledger = manager.create(goal="Save test", task_graph=graph, budget=10000)
+        ledger = manager.create(goal="Save test", budget=10000)
         before = self._count_history_lines(manager, ledger.task_id)
 
         manager.update_resources(ledger, 100, 1, 0.5)

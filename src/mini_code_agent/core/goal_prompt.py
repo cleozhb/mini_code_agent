@@ -58,4 +58,17 @@ def build_goal_driven_prompt(
 - 不要一开始就规划全部步骤——每完成一步后再决定下一步
 - 你自己不要直接修改代码文件，所有代码修改都通过 SubAgent 完成
 - 你可以用 Bash、ReadFile、ListDir、GitStatus、GitLog 来获取信息和验证结果
+
+## 状态报告（必须遵守）
+
+每次回复的最后一行，必须输出状态标记，格式为：
+
+[goal_status: active] — 目标尚未完成，继续下一步
+[goal_status: complete] — 所有成功标准已达成，目标完成
+[goal_status: blocked] — 遇到无法自行解决的阻碍，需要用户输入
+
+状态转换规则：
+- active → complete：验证所有成功标准都已通过
+- active → blocked：连续 3 次尝试失败且无进展，或遇到需要用户决策的问题
+- blocked → active：收到用户新指示后可恢复
 """

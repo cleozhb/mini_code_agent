@@ -2,19 +2,52 @@
 
 from __future__ import annotations
 
+import asyncio
 from dataclasses import dataclass, field
 from inspect import isawaitable
-from typing import Any, ClassVar
+from typing import Any, ClassVar, Literal
 
 from pydantic import BaseModel, Field
 
 from .base import PermissionLevel, Tool, ToolResult
 
+SubAgentType = Literal["coder", "explore", "plan"]
+
 
 class SubAgentInput(BaseModel):
     goal: str = Field(description="子 Agent 需要完成的具体任务描述")
     context: str = Field(default="", description="当前项目状态摘要，帮助子 Agent 理解上下文")
+    type: SubAgentType = Field(
+        default="coder",
+        description=(
+            "子 Agent 类型：coder（默认，通用编码，拥有全工具集）| "
+            "explore（代码库探索，只读）| plan（规划与架构设计，只读+可写计划文件）"
+        ),
+    )
     max_rounds: int = Field(default=25, description="子 Agent 最大工具调用轮数")
+
+
+EXPLORE_SUBAGENT_PROMPT = """\
+你是一个代码库探索助手。你的任务是分析、搜索和理解代码，然后给出清晰的总结。
+你只有只读工具（ReadFile, Grep, ListDir, 只读 Bash, Git 查询）。
+不要尝试修改任何文件或执行写操作。
+专注于：理解代码结构、追踪调用链、分析依赖关系、总结发现。
+"""
+
+PLAN_SUBAGENT_PROMPT = """\
+你是一个编程规划助手。严格按照用户的具体需求输出对应结果。
+
+## 核心原则（必须遵守）
+
+1. **严格范围控制**：只做用户明确要求的事。用户说"分析代码结构"就只输出结构分析，不要自作主张输出重构方案、目标架构、实施计划。
+2. **迭代而非重写**：如果提供了已有计划文件，在其基础上做增量修改，保留未变更的部分原文不动。
+3. **输出格式匹配请求**：
+   - 分析类请求 → 输出分析结果（函数清单、调用关系、依赖图等）
+   - 规划类请求（"怎么做"/"设计方案"/"实施计划"）→ 输出结构化方案
+   - 修改计划请求 → 只修改/新增相关章节
+
+将结果写入指定的计划文件。
+"""
 
 
 @dataclass
@@ -25,56 +58,62 @@ class SubAgentTool(Tool):
 
     name: str = "SubAgent"
     description: str = (
-        "派发一个子 Agent 去完成一个具体的编码任务。"
-        "子 Agent 拥有完整的文件读写、Shell、Git 等工具。"
-        "适合 1-2 个文件级别的改动粒度。"
-        "返回子 Agent 的执行结果摘要和停止原因。"
+        "派发一个子 Agent 执行任务。type 参数决定子 Agent 能力："
+        "coder（默认）拥有全工具集，适合编码修改；"
+        "explore 只读，适合代码库探索和分析；"
+        "plan 只读+可写计划文件，适合架构规划。"
     )
     permission_level: PermissionLevel = PermissionLevel.AUTO
 
-    # 构造时注入
     llm_client: Any = None
     project_path: str = "."
     system_prompt: str = ""
     confirm_callback: Any = None
     event_callback: Any = None
+    _plan_file_override: str | None = None
 
     async def execute(self, **kwargs: Any) -> ToolResult:
         goal: str = kwargs["goal"]
         context: str = kwargs.get("context", "")
+        agent_type: SubAgentType = kwargs.get("type", "coder")
         max_rounds: int = kwargs.get("max_rounds", 25)
 
         from ..core.agent import Agent, AgentEvent, AgentEventType, AgentResult
         from ..llm.base import TokenUsage
-        from ..safety.command_filter import CommandFilter
+        from ..safety.command_filter import CommandFilter, create_readonly_filter
         from ..safety.file_guard import FileGuard
         from ..safety.loop_guard import LoopGuard
         from .base import ToolRegistry
-        from .edit import EditFileTool
-        from .file_ops import ReadFileTool, WriteFileTool
-        from .git import GitDiffTool, GitLogTool, GitStatusTool
-        from .search import GrepTool, ListDirTool
-        from .shell import BashTool
 
         registry = ToolRegistry()
-        registry.register(ReadFileTool())
-        registry.register(WriteFileTool())
-        registry.register(EditFileTool())
-        registry.register(BashTool(cwd=self.project_path))
-        registry.register(GrepTool())
-        registry.register(ListDirTool())
-        registry.register(GitStatusTool())
-        registry.register(GitDiffTool())
-        registry.register(GitLogTool())
+        plan_file_path: str | None = None
 
-        command_filter = CommandFilter()
-        file_guard = FileGuard(work_dir=self.project_path)
+        if agent_type == "coder":
+            self._register_coder_tools(registry)
+            command_filter = CommandFilter()
+            file_guard = FileGuard(work_dir=self.project_path)
+            prompt_prefix = self.system_prompt or "你是一个编程助手，按指令完成任务。"
+        elif agent_type == "explore":
+            self._register_readonly_tools(registry)
+            command_filter = create_readonly_filter()
+            file_guard = FileGuard(work_dir=self.project_path)
+            prompt_prefix = EXPLORE_SUBAGENT_PROMPT
+        else:  # plan
+            plan_file_path = self._plan_file_override or self._generate_plan_file_path()
+            self._register_plan_tools(registry, plan_file_path)
+            command_filter = create_readonly_filter()
+            file_guard = FileGuard(work_dir=self.project_path)
+            if context and "已有的计划文件" in context:
+                prompt_prefix = PLAN_SUBAGENT_PROMPT + f"\n\n将修改后的完整方案写入（覆盖原文件）: {plan_file_path}"
+            else:
+                prompt_prefix = PLAN_SUBAGENT_PROMPT + f"\n\n将方案写入: {plan_file_path}"
+
         loop_guard = LoopGuard(max_rounds=max_rounds)
 
         sub_agent = Agent(
             llm_client=self.llm_client,
             tool_registry=registry,
-            system_prompt=self.system_prompt or "你是一个编程助手，按指令完成任务。",
+            system_prompt=prompt_prefix,
             confirm_callback=self.confirm_callback,
             command_filter=command_filter,
             file_guard=file_guard,
@@ -85,7 +124,6 @@ class SubAgentTool(Tool):
         path_context = (
             f"当前项目根目录：{self.project_path}\n"
             "路径规则：优先使用相对路径；如果必须使用绝对路径，只能使用上面的项目根目录。"
-            "不要编造 /home/user/repo、/workspace、/Users/boxiao 等未验证路径。"
         )
         prompt_parts = [path_context]
         if context:
@@ -98,6 +136,8 @@ class SubAgentTool(Tool):
                 result = await self._run_streaming_subagent(sub_agent, prompt)
             else:
                 result = await sub_agent.run(prompt)
+        except (KeyboardInterrupt, asyncio.CancelledError):
+            raise
         except Exception as e:
             return ToolResult(
                 output=f"[SubAgent 异常] {type(e).__name__}: {e}",
@@ -105,15 +145,71 @@ class SubAgentTool(Tool):
             )
 
         total_tokens = result.usage.input_tokens + result.usage.output_tokens
-        return ToolResult(
-            output=(
-                f"[stop_reason: {result.stop_reason}]\n"
-                f"[usage: input_tokens={result.usage.input_tokens} "
-                f"output_tokens={result.usage.output_tokens} "
-                f"total_tokens={total_tokens}]\n"
-                f"{result.content}"
-            ),
+        output = (
+            f"[type: {agent_type}] [stop_reason: {result.stop_reason}]\n"
+            f"[usage: input={result.usage.input_tokens} output={result.usage.output_tokens} total={total_tokens}]\n"
+            f"{result.content}"
         )
+        if plan_file_path:
+            output += f"\n[plan_file: {plan_file_path}]"
+        return ToolResult(output=output)
+
+    def _register_coder_tools(self, registry: Any) -> None:
+        from .edit import EditFileTool
+        from .file_ops import ReadFileTool, WriteFileTool
+        from .git import GitDiffTool, GitLogTool, GitStatusTool
+        from .search import GrepTool, ListDirTool
+        from .shell import BashTool
+
+        registry.register(ReadFileTool())
+        registry.register(WriteFileTool())
+        registry.register(EditFileTool())
+        registry.register(BashTool(cwd=self.project_path))
+        registry.register(GrepTool())
+        registry.register(ListDirTool())
+        registry.register(GitStatusTool())
+        registry.register(GitDiffTool())
+        registry.register(GitLogTool())
+
+    def _register_readonly_tools(self, registry: Any) -> None:
+        from .file_ops import ReadFileTool
+        from .git import GitDiffTool, GitLogTool, GitStatusTool
+        from .search import GrepTool, ListDirTool
+        from .shell import BashTool
+
+        registry.register(ReadFileTool())
+        registry.register(BashTool(cwd=self.project_path))
+        registry.register(GrepTool())
+        registry.register(ListDirTool())
+        registry.register(GitStatusTool())
+        registry.register(GitDiffTool())
+        registry.register(GitLogTool())
+
+    def _register_plan_tools(self, registry: Any, plan_file_path: str) -> None:
+        from .edit import EditFileTool
+        from .file_ops import ReadFileTool, WriteFileTool
+        from .git import GitDiffTool, GitLogTool, GitStatusTool
+        from .search import GrepTool, ListDirTool
+        from .shell import BashTool
+
+        registry.register(ReadFileTool())
+        registry.register(WriteFileTool())
+        registry.register(EditFileTool())
+        registry.register(BashTool(cwd=self.project_path))
+        registry.register(GrepTool())
+        registry.register(ListDirTool())
+        registry.register(GitStatusTool())
+        registry.register(GitDiffTool())
+        registry.register(GitLogTool())
+
+    def _generate_plan_file_path(self) -> str:
+        import time
+        from pathlib import Path
+
+        plans_dir = Path(self.project_path) / ".agent" / "plans"
+        plans_dir.mkdir(parents=True, exist_ok=True)
+        plan_id = f"plan-{int(time.time())}"
+        return str(plans_dir / f"{plan_id}.md")
 
     async def _run_streaming_subagent(
         self,

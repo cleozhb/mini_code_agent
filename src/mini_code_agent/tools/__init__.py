@@ -15,6 +15,7 @@ from .memory import AddMemoryTool, RecallMemoryTool
 from .search import GrepTool, ListDirTool
 from .shell import BashTool
 from .subagent import SubAgentTool
+from .web import WebFetchTool, WebSearchTool
 
 __all__ = [
     "PermissionLevel",
@@ -35,6 +36,8 @@ __all__ = [
     "ReadFileTool",
     "RecallMemoryTool",
     "SubAgentTool",
+    "WebFetchTool",
+    "WebSearchTool",
     "WriteFileTool",
     "BashTool",
     "GrepTool",

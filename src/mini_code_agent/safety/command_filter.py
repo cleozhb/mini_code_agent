@@ -68,6 +68,37 @@ SENSITIVE_PATHS: list[str] = [
     ".env",
 ]
 
+# ---------------------------------------------------------------------------
+# 只读模式：explore/plan 子 Agent 用，拦截所有写操作
+# ---------------------------------------------------------------------------
+
+READONLY_BLOCKED_PATTERNS: list[str] = [
+    r"(?:^|\|)\s*tee\b",
+    r"(?:^|\|)\s*dd\b",
+    r"\brm\b",
+    r"\bmv\b",
+    r"\bcp\b",
+    r"\bchmod\b",
+    r"\bchown\b",
+    r"\bmkdir\b",
+    r"\btouch\b",
+    r"\bsed\s+-i\b",
+    r"\bpip\s+install\b",
+    r"\buv\s+add\b",
+    r"\bnpm\s+install\b",
+    r"\byarn\s+add\b",
+    r"\bgit\s+(commit|push|checkout|reset|merge|rebase|cherry-pick|stash|tag|branch\s+-[dD])\b",
+    r">\s*\S",                   # redirect >
+    r">>\s*\S",                  # append >>
+]
+
+
+def create_readonly_filter() -> "CommandFilter":
+    """创建只读 CommandFilter，拦截所有写操作."""
+    return CommandFilter(
+        blacklist_patterns=BLACKLIST_PATTERNS + READONLY_BLOCKED_PATTERNS,
+    )
+
 
 class CommandFilter:
     """Shell 命令安全过滤器.

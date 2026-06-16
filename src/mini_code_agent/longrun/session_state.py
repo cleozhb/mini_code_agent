@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import datetime
 from enum import Enum
 
 
@@ -38,7 +38,6 @@ class SessionState:
     ledger_hash: str                # Ledger 文件的 SHA256（用于验证一致性）
 
     # === 任务图状态 ===
-    task_graph_json: str            # TaskGraph 的完整序列化
     current_task_id: str | None     # 正在执行的子任务
 
     # === 代码状态 ===
@@ -64,7 +63,6 @@ class SessionState:
             "trigger": self.trigger.value,
             "ledger_path": self.ledger_path,
             "ledger_hash": self.ledger_hash,
-            "task_graph_json": self.task_graph_json,
             "current_task_id": self.current_task_id,
             "git_checkpoint_hash": self.git_checkpoint_hash,
             "git_branch": self.git_branch,
@@ -89,7 +87,6 @@ class SessionState:
             trigger=CheckpointTrigger(d["trigger"]),
             ledger_path=d["ledger_path"],
             ledger_hash=d["ledger_hash"],
-            task_graph_json=d["task_graph_json"],
             current_task_id=d.get("current_task_id"),
             git_checkpoint_hash=d["git_checkpoint_hash"],
             git_branch=d["git_branch"],

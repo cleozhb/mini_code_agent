@@ -42,37 +42,6 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="显示详细信息（上下文统计等）",
     )
-    parser.add_argument(
-        "--plan",
-        action="store_true",
-        help="启动时默认开启 Plan 模式（先规划再执行）",
-    )
-    parser.add_argument(
-        "--graph",
-        action="store_true",
-        help="启动时默认开启 Graph 模式（DAG 任务图规划与执行）",
-    )
-    parser.add_argument(
-        "--long-run",
-        nargs="?",
-        const=True,
-        default=None,
-        metavar="GOAL",
-        help="启动长程任务模式。可直接传入目标，也可不带参数在 REPL 中交互输入",
-    )
-    parser.add_argument(
-        "--token-budget",
-        type=int,
-        default=DEFAULT_TOKEN_BUDGET,
-        help=f"长程任务的 token 预算 (默认: {DEFAULT_TOKEN_BUDGET:,})",
-    )
-    parser.add_argument(
-        "--resume",
-        type=str,
-        default=None,
-        metavar="TASK_ID",
-        help="恢复之前的长程任务（传入 task_id 或 'list' 列出所有）",
-    )
 
     # 子命令：不带 → REPL（保持原行为）；带 → 分派
     subparsers = parser.add_subparsers(dest="command", metavar="COMMAND")
@@ -151,7 +120,10 @@ async def async_main() -> None:
         LSPManager,
         ReadFileTool,
         RecallMemoryTool,
+        SubAgentTool,
         ToolRegistry,
+        WebFetchTool,
+        WebSearchTool,
         WriteFileTool,
     )
     from mini_code_agent.memory import ProjectMemory
@@ -193,6 +165,12 @@ async def async_main() -> None:
     registry.register(find_refs_tool)
     registry.register(hover_tool)
     registry.register(diagnostics_tool)
+    registry.register(WebSearchTool())
+    registry.register(WebFetchTool())
+    registry.register(SubAgentTool(
+        llm_client=llm_client,
+        project_path=str(project_dir),
+    ))
 
     # 3. 构建 system prompt（使用项目上下文感知）
     from mini_code_agent.core import build_system_prompt_with_context
@@ -244,149 +222,29 @@ async def async_main() -> None:
             tool_name, tool_call, console, prompt_session, safety_level,
         )
 
-    # 6. 创建 Planner + Plan mode 回调
-    from mini_code_agent.core import Planner
-    from mini_code_agent.cli.plan_display import (
-        ask_replan,
-        confirm_plan,
-        render_step_done,
-        render_step_start,
-    )
-
-    planner = Planner(llm_client=llm_client)
-
-    async def _plan_confirm_cb(plan):
-        result = await confirm_plan(plan, console, prompt_session)
-        return (result.decision == "confirm", result.plan)
-
-    async def _plan_progress_cb(idx, total, step, phase, success):
-        if phase == "start":
-            render_step_start(idx, total, step, console)
-        else:
-            render_step_done(idx, total, step, success, console)
-
-    async def _plan_replan_cb(plan, failed_step, last_content):
-        return await ask_replan(console, prompt_session)
-
-    # 6b. 创建 GraphPlanner + GraphExecutor + Graph mode 回调
-    from mini_code_agent.core import GraphPlanner, GraphExecutor
-    from mini_code_agent.cli.graph_display import (
-        ask_graph_blocked,
-        render_task_progress,
-    )
-
-    graph_planner = GraphPlanner(llm_client=llm_client)
-
-    async def _graph_blocked_cb(graph, failed, blocked):
-        return await ask_graph_blocked(graph, failed, blocked, console, prompt_session)
-
-    async def _graph_progress_cb(task_index, total, task, phase):
-        render_task_progress(task_index, total, task, phase, console)
-
-    # GraphExecutor 在下面拿到 SubtaskRunner / Ledger / Checkpoint 之后再实例化
-
-    # 7. 创建 Agent
+    # 6. 创建 Agent
     from mini_code_agent.core import Agent
 
-    # 7b. 长程任务 Ledger + Checkpoint + Resume
+    # Ledger + Checkpoint
     from mini_code_agent.longrun import (
         CheckpointManager,
         LongRunConfig,
         ResumeManager,
         TaskLedgerManager,
     )
+    from mini_code_agent.artifacts import ArtifactStore
+    from mini_code_agent.verify.verifier import IncrementalVerifier
 
-    ledger = None
     ledger_manager = TaskLedgerManager(
         storage_dir=str(project_dir / ".agent" / "ledger")
     )
-    longrun_config = LongRunConfig(token_budget=args.token_budget)
+    longrun_config = LongRunConfig()
     checkpoint_manager = CheckpointManager(
         checkpoint_dir=str(project_dir / ".agent" / "checkpoints"),
         ledger_manager=ledger_manager,
         git_checkpoint=git_checkpoint,
         cwd=str(project_dir),
     )
-    resume_manager = ResumeManager(
-        checkpoint_manager=checkpoint_manager,
-        ledger_manager=ledger_manager,
-        cwd=str(project_dir),
-    )
-    long_run_graph = None  # --long-run / --resume 生成的 TaskGraph
-
-    if args.resume == "list":
-        metas = ledger_manager.list_all()
-        if not metas:
-            console.print("[dim]没有可恢复的长程任务[/dim]")
-            sys.exit(0)
-        for m in metas:
-            console.print(
-                f"  {m.task_id[:8]}  [{m.status.value}]  "
-                f"{m.goal[:60]}  "
-                f"({m.completed_tasks} tasks, {m.total_tokens_used:,} tokens)"
-            )
-        sys.exit(0)
-    elif args.resume:
-        try:
-            ledger = ledger_manager.load(args.resume)
-            console.print(
-                f"[green]已恢复长程任务: {ledger.task_id[:8]}[/green]\n"
-                f"[dim]{ledger_manager.get_summary_for_resume(ledger)[:200]}...[/dim]"
-            )
-            # 从 ledger snapshot 重建 TaskGraph
-            snapshot = ledger.task_graph_snapshot
-            if snapshot and snapshot.get("nodes"):
-                from mini_code_agent.core.task_graph import TaskGraph, TaskNode, TaskStatus
-                long_run_graph = TaskGraph()
-                long_run_graph.original_goal = snapshot.get("original_goal", ledger.goal)
-                for _nid, ndata in snapshot["nodes"].items():
-                    long_run_graph.add_task(TaskNode(
-                        id=ndata["id"],
-                        description=ndata["description"],
-                        dependencies=ndata.get("dependencies", []),
-                        status=TaskStatus(ndata.get("status", "pending")),
-                        files_involved=ndata.get("files_involved", []),
-                        verification=ndata.get("verification", ""),
-                    ))
-                # 把已完成的任务标记上
-                for ct in ledger.completed_tasks:
-                    if ct.task_id in long_run_graph.nodes:
-                        node = long_run_graph.nodes[ct.task_id]
-                        if node.status not in (TaskStatus.COMPLETED,):
-                            long_run_graph.mark_completed(ct.task_id, ct.self_summary)
-        except Exception as e:
-            console.print(f"[red]恢复失败: {e}[/red]")
-            sys.exit(1)
-    elif args.long_run is True:
-        # --long-run 不带目标：延迟到 REPL 交互式输入
-        pass
-    elif isinstance(args.long_run, str):
-        # --long-run "目标"：立即生成 TaskGraph + 创建 Ledger
-        console.print(f"[dim]正在为长程任务生成 TaskGraph...[/dim]")
-        try:
-            long_run_graph = await graph_planner.plan_as_graph(args.long_run)
-        except Exception as e:
-            console.print(f"[red]生成 TaskGraph 失败: {e}[/red]")
-            sys.exit(1)
-
-        from mini_code_agent.cli.graph_display import render_graph_table
-        render_graph_table(long_run_graph, console)
-
-        ledger = ledger_manager.create(
-            goal=args.long_run,
-            task_graph=long_run_graph,
-            budget=args.token_budget,
-        )
-        console.print(
-            f"[green]Ledger 已创建: {ledger.task_id[:8]}[/green]\n"
-            f"[dim]Token 预算: {args.token_budget:,}  "
-            f"里程碑: {len(ledger.milestones)} 个[/dim]"
-        )
-
-    # 7c. Artifact + Incremental Verifier — L1 集成所需
-    from mini_code_agent.artifacts import ArtifactStore
-    from mini_code_agent.verify.verifier import IncrementalVerifier
-    from mini_code_agent.core import SubtaskRunner
 
     artifact_store = ArtifactStore(
         storage_dir=str(project_dir / ".agent" / "artifacts"),
@@ -403,53 +261,20 @@ async def async_main() -> None:
         loop_guard=loop_guard,
         project_memory=project_memory,
         git_checkpoint=git_checkpoint,
-        plan_mode=args.plan,
-        planner=planner,
-        plan_confirm_callback=_plan_confirm_cb,
-        plan_progress_callback=_plan_progress_cb,
-        plan_replan_callback=_plan_replan_cb,
-        ledger=ledger,
         ledger_manager=ledger_manager,
         checkpoint_manager=checkpoint_manager,
         longrun_config=longrun_config,
-        task_graph=long_run_graph,
         incremental_verifier=incremental_verifier,
         trace_recorder=trace_recorder,
     )
 
-    subtask_runner = SubtaskRunner(
-        agent=agent,
-        artifact_store=artifact_store,
-        verifier=incremental_verifier,
-        git_checkpoint=git_checkpoint,
-    )
-
-    graph_executor = GraphExecutor(
-        project_path=str(project_dir),
-        blocked_callback=_graph_blocked_cb,
-        progress_callback=_graph_progress_cb,
-        subtask_runner=subtask_runner,
-        ledger_manager=ledger_manager,
-        checkpoint_manager=checkpoint_manager,
-        longrun_config=longrun_config,
-    )
-
-    # 8. 启动 REPL
+    # 7. 启动 REPL
     from mini_code_agent.cli import REPL
 
     repl = REPL(
         agent=agent,
         console=console,
-        graph_planner=graph_planner,
-        graph_executor=graph_executor,
-        graph_mode=args.graph,
-        pending_graph=long_run_graph,
-        long_run_deferred=args.long_run is True,
-        token_budget=args.token_budget,
-        checkpoint_manager=checkpoint_manager,
-        resume_manager=resume_manager,
         artifact_store=artifact_store,
-        longrun_config=longrun_config,
     )
     try:
         await repl.run()

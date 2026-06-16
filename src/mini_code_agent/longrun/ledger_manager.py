@@ -23,7 +23,6 @@ from .task_ledger import LedgerMeta, TaskLedger
 
 if TYPE_CHECKING:
     from ..artifacts.artifact import SubtaskArtifact
-    from ..core.task_graph import TaskGraph
 
 logger = logging.getLogger(__name__)
 
@@ -52,21 +51,11 @@ class TaskLedgerManager:
     def create(
         self,
         goal: str,
-        task_graph: TaskGraph,
         budget: int,
     ) -> TaskLedger:
-        """初始化一个新 Ledger.
-
-        从 task_graph 提取 milestones（每个 phase 对应一个里程碑）。
-        """
+        """初始化一个新 Ledger."""
         task_id = str(uuid.uuid4())
         now = datetime.now(UTC)
-
-        # 从 task_graph 提取 milestones：为每个独立的 task 分组创建
-        milestones = self._extract_milestones(task_graph)
-
-        # 序列化 task_graph
-        graph_snapshot = self._serialize_task_graph(task_graph)
 
         ledger = TaskLedger(
             task_id=task_id,
@@ -74,10 +63,10 @@ class TaskLedgerManager:
             created_at=now,
             updated_at=now,
             status=TaskRunStatus.NOT_STARTED,
-            plan_summary=task_graph.original_goal or goal,
-            task_graph_snapshot=graph_snapshot,
+            plan_summary=goal,
+            task_graph_snapshot={"original_goal": goal},
             current_phase="planning",
-            milestones=milestones,
+            milestones=[],
             token_budget=budget,
             token_budget_remaining=budget,
         )
@@ -464,84 +453,6 @@ class TaskLedgerManager:
     # ─────────────────────────────────────────────────────────────────
     # 内部辅助
     # ─────────────────────────────────────────────────────────────────
-
-    def _extract_milestones(self, task_graph: TaskGraph) -> list[Milestone]:
-        """从 TaskGraph 提取 milestones.
-
-        策略：按拓扑层级分组，每组对应一个里程碑。
-        """
-        if not task_graph.nodes:
-            return []
-
-        # 按拓扑深度分层
-        depths: dict[str, int] = {}
-        for node_id in task_graph.nodes:
-            self._compute_depth(node_id, task_graph, depths)
-
-        # 按深度分组
-        layers: dict[int, list[str]] = {}
-        for node_id, depth in sorted(depths.items(), key=lambda x: x[1]):
-            layers.setdefault(depth, []).append(node_id)
-
-        milestones: list[Milestone] = []
-        cumulative_tasks = 0
-        for depth in sorted(layers.keys()):
-            task_ids = layers[depth]
-            cumulative_tasks += len(task_ids)
-            # 用第一个任务的描述作为里程碑简述
-            first_node = task_graph.nodes[task_ids[0]]
-            desc = (
-                f"完成第 {depth + 1} 层任务"
-                if len(task_ids) > 1
-                else first_node.description
-            )
-            milestones.append(Milestone(
-                id=f"milestone-{depth + 1}",
-                description=desc,
-                associated_task_ids=task_ids,
-                expected_by_step=cumulative_tasks,
-                status="PENDING",
-            ))
-
-        return milestones
-
-    def _compute_depth(
-        self,
-        node_id: str,
-        task_graph: TaskGraph,
-        depths: dict[str, int],
-    ) -> int:
-        """计算节点在 DAG 中的拓扑深度（最长路径到根）."""
-        if node_id in depths:
-            return depths[node_id]
-        node = task_graph.nodes[node_id]
-        if not node.dependencies:
-            depths[node_id] = 0
-            return 0
-        max_dep_depth = max(
-            self._compute_depth(dep_id, task_graph, depths)
-            for dep_id in node.dependencies
-            if dep_id in task_graph.nodes
-        )
-        depths[node_id] = max_dep_depth + 1
-        return depths[node_id]
-
-    def _serialize_task_graph(self, task_graph: TaskGraph) -> dict:
-        """将 TaskGraph 序列化为 dict."""
-        nodes: dict[str, dict] = {}
-        for node_id, node in task_graph.nodes.items():
-            nodes[node_id] = {
-                "id": node.id,
-                "description": node.description,
-                "dependencies": node.dependencies,
-                "status": node.status.value,
-                "files_involved": node.files_involved,
-                "verification": node.verification,
-            }
-        return {
-            "original_goal": task_graph.original_goal,
-            "nodes": nodes,
-        }
 
     def _check_milestones(self, ledger: TaskLedger) -> None:
         """检查是否有 milestone 因子任务完成而达成."""

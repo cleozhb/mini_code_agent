@@ -66,8 +66,10 @@ async def confirm_tool_call(
             answer = await prompt_session.prompt_async(
                 HTML("<b>[y]确认 / [n]拒绝 / [e]编辑: </b>"),
             )
-        except (EOFError, KeyboardInterrupt):
+        except EOFError:
             return False, None
+        except KeyboardInterrupt:
+            raise
 
         answer = answer.strip().lower()
         if answer in ("y", "yes", ""):
@@ -178,8 +180,10 @@ async def _edit_args(
         console.print("[dim]输入新命令（留空取消）：[/dim]")
         try:
             new_cmd = await prompt_session.prompt_async("$ ")
-        except (EOFError, KeyboardInterrupt):
+        except EOFError:
             return None
+        except KeyboardInterrupt:
+            raise
         if new_cmd.strip():
             return {**args, "command": new_cmd.strip()}
         return None
@@ -192,8 +196,10 @@ async def _edit_args(
     console.print("[dim]输入修改后的 JSON（留空取消）：[/dim]")
     try:
         new_json = await prompt_session.prompt_async("> ")
-    except (EOFError, KeyboardInterrupt):
+    except EOFError:
         return None
+    except KeyboardInterrupt:
+        raise
     if new_json.strip():
         try:
             return json.loads(new_json)

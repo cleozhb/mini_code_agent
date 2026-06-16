@@ -179,7 +179,6 @@ class TestSessionState:
             trigger=CheckpointTrigger.USER_PAUSE,
             ledger_path="/tmp/ledger.json",
             ledger_hash="abc123",
-            task_graph_json='{"original_goal": "test", "nodes": {}}',
             current_task_id="sub-1",
             git_checkpoint_hash="deadbeef",
             git_branch="main",
@@ -211,7 +210,6 @@ class TestSessionState:
                 trigger=trigger,
                 ledger_path="",
                 ledger_hash="",
-                task_graph_json="{}",
                 current_task_id=None,
                 git_checkpoint_hash="",
                 git_branch="main",
@@ -316,7 +314,6 @@ class TestCheckpointManagerSave:
 
         state = await checkpoint_manager.save_checkpoint(
             ledger=ledger,
-            task_graph=graph,
             trigger=CheckpointTrigger.SUBTASK_COMPLETE,
             config=config,
             current_task_id="task-1",
@@ -369,7 +366,6 @@ class TestCheckpointManagerSave:
 
         state = await checkpoint_manager.save_checkpoint(
             ledger=ledger,
-            task_graph=graph,
             trigger=CheckpointTrigger.TOKEN_THRESHOLD,
             config=config,
             current_task_id=None,
@@ -406,7 +402,6 @@ class TestCheckpointManagerSave:
 
         state = await checkpoint_manager.save_checkpoint(
             ledger=ledger,
-            task_graph=graph,
             trigger=CheckpointTrigger.USER_PAUSE,
             config=config,
             current_task_id=None,
@@ -445,7 +440,6 @@ class TestCheckpointManagerSave:
 
             state = await checkpoint_manager.save_checkpoint(
                 ledger=ledger,
-                task_graph=graph,
                 trigger=CheckpointTrigger.SUBTASK_COMPLETE,
                 config=config,
                 current_task_id=f"task-{i}",
@@ -475,7 +469,6 @@ class TestCheckpointManagerLoad:
 
         saved = await checkpoint_manager.save_checkpoint(
             ledger=ledger,
-            task_graph=graph,
             trigger=CheckpointTrigger.USER_PAUSE,
             config=config,
             current_task_id="task-1",
@@ -516,7 +509,6 @@ class TestCheckpointManagerLoad:
 
         state = await checkpoint_manager.save_checkpoint(
             ledger=ledger,
-            task_graph=graph,
             trigger=CheckpointTrigger.USER_PAUSE,
             config=config,
             current_task_id=None,
@@ -545,7 +537,6 @@ class TestCheckpointManagerLoad:
 
         state = await checkpoint_manager.save_checkpoint(
             ledger=ledger,
-            task_graph=graph,
             trigger=CheckpointTrigger.USER_PAUSE,
             config=config,
             current_task_id=None,
@@ -576,7 +567,6 @@ class TestCheckpointManagerFindLatest:
         # 创建两个 checkpoint
         await checkpoint_manager.save_checkpoint(
             ledger=ledger,
-            task_graph=graph,
             trigger=CheckpointTrigger.SUBTASK_COMPLETE,
             config=config,
             current_task_id="task-0",
@@ -586,7 +576,6 @@ class TestCheckpointManagerFindLatest:
         ledger_manager.save(ledger)
         second = await checkpoint_manager.save_checkpoint(
             ledger=ledger,
-            task_graph=graph,
             trigger=CheckpointTrigger.TOKEN_THRESHOLD,
             config=config,
             current_task_id="task-1",
@@ -632,7 +621,6 @@ class TestCleanup:
             ledger_manager.save(ledger)
             state = await checkpoint_manager.save_checkpoint(
                 ledger=ledger,
-                task_graph=graph,
                 trigger=CheckpointTrigger.SUBTASK_COMPLETE,
                 config=config,
                 current_task_id=f"task-{i}",
@@ -669,7 +657,6 @@ class TestCleanup:
 
         await checkpoint_manager.save_checkpoint(
             ledger=ledger,
-            task_graph=graph,
             trigger=CheckpointTrigger.SUBTASK_COMPLETE,
             config=config,
             current_task_id=None,
@@ -722,7 +709,6 @@ class TestAutoCheckpointPolicy:
             trigger=CheckpointTrigger.SUBTASK_COMPLETE,
             ledger_path="",
             ledger_hash="",
-            task_graph_json="{}",
             current_task_id=None,
             git_checkpoint_hash="abc",
             git_branch="main",
@@ -751,7 +737,6 @@ class TestAutoCheckpointPolicy:
             trigger=CheckpointTrigger.SUBTASK_COMPLETE,
             ledger_path="",
             ledger_hash="",
-            task_graph_json="{}",
             current_task_id=None,
             git_checkpoint_hash="abc",
             git_branch="main",
@@ -791,7 +776,6 @@ class TestResumeManager:
 
         state = await checkpoint_manager.save_checkpoint(
             ledger=ledger,
-            task_graph=graph,
             trigger=CheckpointTrigger.USER_PAUSE,
             config=config,
             current_task_id="task-1",
@@ -804,7 +788,6 @@ class TestResumeManager:
 
         assert context.session_state.checkpoint_id == state.checkpoint_id
         assert context.ledger.task_id == ledger.task_id
-        assert len(context.task_graph.nodes) == 3
         assert "恢复" in context.initial_prompt
         assert "task-1" in context.initial_prompt
 
@@ -824,7 +807,6 @@ class TestResumeManager:
 
         state = await checkpoint_manager.save_checkpoint(
             ledger=ledger,
-            task_graph=graph,
             trigger=CheckpointTrigger.USER_PAUSE,
             config=config,
             current_task_id=None,
@@ -856,7 +838,6 @@ class TestResumeManager:
 
         state = await checkpoint_manager.save_checkpoint(
             ledger=ledger,
-            task_graph=graph,
             trigger=CheckpointTrigger.USER_PAUSE,
             config=config,
             current_task_id=None,
@@ -889,7 +870,6 @@ class TestResumeManager:
 
         state = await checkpoint_manager.save_checkpoint(
             ledger=ledger,
-            task_graph=graph,
             trigger=CheckpointTrigger.USER_PAUSE,
             config=config,
             current_task_id=None,
@@ -957,7 +937,6 @@ class TestCrashRecovery:
 
             last_state = await checkpoint_manager.save_checkpoint(
                 ledger=ledger,
-                task_graph=graph,
                 trigger=CheckpointTrigger.SUBTASK_COMPLETE,
                 config=config,
                 current_task_id=f"task-{i + 1}" if i < 4 else None,
@@ -1003,17 +982,7 @@ class TestCrashRecovery:
         # HEAD 应该在 third_cp_git_hash 或其之后（因为 resume 做了 reset --hard）
         assert head.strip() == third_cp_git_hash or len(head.strip()) >= 7
 
-        # f. 验证 TaskGraph 还有未完成的任务
-        assert len(context.task_graph.nodes) == 5
-        completed_ids = {
-            nid for nid, n in context.task_graph.nodes.items()
-            if n.status == TaskStatus.COMPLETED
-        }
-        assert len(completed_ids) == 3
-        assert "task-3" not in completed_ids  # 还没完成
-        assert "task-4" not in completed_ids
-
-        # 验证 initial_prompt 包含恢复信息
+        # f. 验证恢复上下文
         assert "恢复" in context.initial_prompt
         assert context.ledger.goal in context.initial_prompt
 
@@ -1046,7 +1015,6 @@ class TestConcurrency:
             tasks.append(
                 checkpoint_manager.save_checkpoint(
                     ledger=ledger,
-                    task_graph=graph,
                     trigger=CheckpointTrigger.SUBTASK_COMPLETE,
                     config=config,
                     current_task_id=f"task-{i}",
@@ -1120,7 +1088,6 @@ class TestBuildResumePrompt:
             trigger=CheckpointTrigger.USER_PAUSE,
             ledger_path="",
             ledger_hash="",
-            task_graph_json="{}",
             current_task_id="task-2",
             git_checkpoint_hash="abc123",
             git_branch="main",

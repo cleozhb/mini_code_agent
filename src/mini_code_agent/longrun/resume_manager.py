@@ -6,8 +6,6 @@ import logging
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import Any, Callable
-
-from ..core.task_graph import TaskGraph
 from ..safety.path_filters import is_agent_internal_path, path_from_git_status_entry
 from ..tools.git import _run_git
 from .checkpoint_manager import CheckpointManager, CorruptedCheckpointError, _compute_sha256
@@ -32,7 +30,6 @@ class ResumeContext:
 
     session_state: SessionState
     ledger: TaskLedger
-    task_graph: TaskGraph
     initial_prompt: str         # 重建 Agent 后给它的第一条消息
     warnings: list[str] = field(default_factory=list)
 
@@ -67,8 +64,7 @@ class ResumeManager:
         1. 加载 SessionState
         2. 加载 Ledger（+ 一致性检查）
         3. Git 回滚
-        4. 重建 TaskGraph
-        5. 构造恢复 prompt
+        4. 构造恢复 prompt
         """
         warnings: list[str] = []
 
@@ -135,16 +131,12 @@ class ResumeManager:
                 raise ResumeError(f"Git reset 失败: {out}")
             logger.info("已回滚到 %s", state.git_checkpoint_hash[:8])
 
-        # 步骤 4 — 重建 TaskGraph
-        task_graph = TaskGraph.from_json(state.task_graph_json)
-
-        # 步骤 5 — 构造恢复 prompt
+        # 步骤 4 — 构造恢复 prompt
         initial_prompt = self._build_resume_prompt(ledger, state)
 
         return ResumeContext(
             session_state=state,
             ledger=ledger,
-            task_graph=task_graph,
             initial_prompt=initial_prompt,
             warnings=warnings,
         )
@@ -233,7 +225,6 @@ class ResumeManager:
         """
         agent = agent_factory(
             ledger=context.ledger,
-            task_graph=context.task_graph,
         )
 
         # 把 initial_prompt 作为第一条 user message 注入

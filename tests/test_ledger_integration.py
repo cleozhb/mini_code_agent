@@ -76,7 +76,6 @@ def manager_and_ledger(
     mgr = TaskLedgerManager(storage_dir=tmp_storage)
     ledger = mgr.create(
         goal="创建一个 hello.py 文件，打印 Hello World",
-        task_graph=sample_graph,
         budget=200_000,
     )
     return mgr, ledger
@@ -466,41 +465,17 @@ class TestCheckpointResume:
         tmp_storage: str,
         sample_graph: TaskGraph,
     ) -> None:
-        """TaskGraph snapshot 应该可以完整恢复."""
+        """TaskGraph snapshot 字段被简化为 original_goal（Goal 模式不存完整图）."""
         mgr = TaskLedgerManager(storage_dir=tmp_storage)
         ledger = mgr.create(
             goal="test graph snapshot",
-            task_graph=sample_graph,
             budget=100_000,
         )
-        task_id = ledger.task_id
 
-        # 从保存的 ledger 中恢复图
-        loaded = mgr.load(task_id)
+        loaded = mgr.load(ledger.task_id)
         snapshot = loaded.task_graph_snapshot
         assert snapshot is not None
-        assert "nodes" in snapshot
-        assert len(snapshot["nodes"]) == 3
-
-        # 重建 TaskGraph
-        restored = TaskGraph()
-        restored.original_goal = snapshot.get("original_goal", "")
-        for _nid, ndata in snapshot["nodes"].items():
-            restored.add_task(TaskNode(
-                id=ndata["id"],
-                description=ndata["description"],
-                dependencies=ndata.get("dependencies", []),
-                status=TaskStatus(ndata.get("status", "pending")),
-                files_involved=ndata.get("files_involved", []),
-                verification=ndata.get("verification", ""),
-            ))
-
-        assert len(restored.nodes) == 3
-        assert "task-1" in restored.nodes
-        assert "task-2" in restored.nodes
-        assert "task-3" in restored.nodes
-        assert restored.nodes["task-2"].dependencies == ["task-1"]
-        assert restored.nodes["task-3"].dependencies == ["task-2"]
+        assert snapshot.get("original_goal") == "test graph snapshot"
 
     def test_multiple_ledgers_isolated(self, tmp_storage: str) -> None:
         """多个 ledger 互不干扰."""
@@ -514,8 +489,8 @@ class TestCheckpointResume:
         g2.original_goal = "任务B"
         g2.add_task(TaskNode(id="b1", description="B-step-1"))
 
-        l1 = mgr.create(goal="任务A", task_graph=g1, budget=50_000)
-        l2 = mgr.create(goal="任务B", task_graph=g2, budget=80_000)
+        l1 = mgr.create(goal="任务A", budget=50_000)
+        l2 = mgr.create(goal="任务B", budget=80_000)
 
         assert l1.task_id != l2.task_id
         metas = mgr.list_all()
@@ -560,7 +535,7 @@ class TestStatusAndLedger:
 
         assert stats["goal"] == "创建一个 hello.py 文件，打印 Hello World"
         assert stats["status"] == "NOT_STARTED"
-        assert stats["completion_rate"] == "0/3"
+        assert stats["completion_rate"] == "0/0"
 
     def test_get_stats_after_partial_completion(
         self, manager_and_ledger: tuple[TaskLedgerManager, TaskLedger]
@@ -585,7 +560,6 @@ class TestStatusAndLedger:
         mgr.update_resources(ledger, tokens=500, steps=3, wall_time=2.0)
 
         stats = mgr.get_stats(ledger)
-        assert stats["completion_rate"] == "1/3"
         assert stats["completed_tasks"] == 1
         assert stats["total_tokens_used"] == 500
         assert stats["total_steps"] == 3

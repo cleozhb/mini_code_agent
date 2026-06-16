@@ -10,7 +10,6 @@ from datetime import UTC, datetime
 from pathlib import Path
 from uuid import uuid4
 
-from ..core.task_graph import TaskGraph
 from ..safety.git_checkpoint import GitCheckpoint
 from ..safety.path_filters import is_agent_internal_path, path_from_git_status_entry
 from ..tools.git import _run_git
@@ -96,7 +95,6 @@ class CheckpointManager:
     async def save_checkpoint(
         self,
         ledger: TaskLedger,
-        task_graph: TaskGraph,
         trigger: CheckpointTrigger,
         config: LongRunConfig,
         current_task_id: str | None,
@@ -208,7 +206,6 @@ class CheckpointManager:
             trigger=trigger,
             ledger_path=ledger_path,
             ledger_hash=ledger_hash,
-            task_graph_json=task_graph.to_json(),
             current_task_id=current_task_id,
             git_checkpoint_hash=git_hash,
             git_branch=git_branch,

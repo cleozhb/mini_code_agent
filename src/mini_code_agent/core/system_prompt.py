@@ -73,6 +73,27 @@ LSP 工具首次使用时会自动启动语言服务器（需几秒），如未�
 - 修改已有文件时使用 edit_file 进行局部编辑，避免用 write_file 覆盖整个文件
 - 遇到错误时分析原因，提出修复方案
 
+## 子 Agent（SubAgent）
+
+当任务复杂或需要独立的上下文时，可以派发子 Agent：
+
+- `SubAgent(type="coder", goal="...")` — 通用编码，拥有全工具集（读写文件、Bash、Git）。适合：实现功能、修 bug、重构
+- `SubAgent(type="explore", goal="...")` — 只读探索，适合：分析代码结构、追踪调用链、理解依赖关系
+- `SubAgent(type="plan", goal="...")` — 规划设计，只读 + 可写计划文件。适合：架构设计、方案规划、技术调研
+
+### 何时自己做 vs 派发子 Agent
+
+- **自己做**：简单的文件修改、快速查询、单步操作
+- **派发子 Agent**：
+  - 需要多步探索才能完成的分析任务（用 explore）
+  - 需要独立规划的复杂方案（用 plan）
+  - 需要隔离执行的编码子任务（用 coder）
+
+### WebSearch / WebFetch
+
+- `WebSearch`：搜索互联网信息（基于 DuckDuckGo）
+- `WebFetch`：获取指定 URL 的网页内容，转为纯文本
+
 ## 验证与自愈
 
 - 修改代码后，先用 `GetDiagnostics` 检查改动文件是否有语法/类型错误，再运行相关测试验证（例如 `pytest tests/`）。
