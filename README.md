@@ -1,14 +1,14 @@
 # Mini Code Agent
 
-从零构建的编程 Agent，完整实现了从 ReAct 循环到 DAG 任务编排、长程任务管理、增量验证、安全控制等 Coding Agent 核心能力。
+从零构建的编程 Agent，实现了 ReAct 循环 + Goal-Driven 子 Agent 编排、长程任务管理、增量验证、安全控制等 Coding Agent 核心能力。
 
 ## 核心特性
 
-- **多模型支持** — 统一抽象层对接兼容 Anthropic Claude / OpenAI 协议的模型，支持 Prompt Cache、Streaming、Structured Outputs
-- **Tool 体系** — 工具定义与执行（文件/Shell/搜索/Git/LSP/记忆）
+- **多模型支持** — 统一抽象层对接 Anthropic Claude / OpenAI 协议的模型，支持 Prompt Cache、Streaming、Structured Outputs
+- **Tool 体系** — 工具定义与执行（文件/Shell/搜索/Git/LSP/Web Search/记忆/SubAgent）
 - **上下文工程** — Token 预算管理、KV Cache 友好排序、超长对话自动摘要压缩
-- **三种执行模式** — 直接对话（ReAct Loop）/ 计划模式（Plan-then-Execute）/ 图模式（DAG 任务编排）
-- **DAG 任务图** — LLM 生成有向无环图，拓扑排序执行，支持依赖阻塞传播、关键路径分析、Mermaid 导出
+- **两种执行模式** — 普通模式（ReAct Loop）/ Goal 模式（目标驱动，Master Agent 实时决策 + SubAgent 执行）
+- **Goal-Driven 编排** — 只定义终态（goal + criteria），Master Agent 每步实时决策派发 SubAgent，支持中断恢复
 - **长程任务管理** — Task Ledger 外部记忆 + Checkpoint 断点续跑 + 崩溃恢复，支持跨会话的复杂任务
 - **增量验证** — Level 1 编辑后即时检查（AST/Import/LSP）+ Level 2 子任务完成后单元测试，失败自动重试
 - **四层安全体系** — 命令过滤 / 文件守卫 / Git Checkpoint / 循环防护
@@ -16,16 +16,15 @@
 - **Eval 基准测试** — 内置评测框架，支持任务定义、快照对比、验证脚本、结果分析
 
 ## 架构总览
-<img width="1122" height="1402" alt="image" src="https://github.com/user-attachments/assets/f7c50a60-fc99-4c62-b819-d1bded65f6ea" />
-
+<img width="1536" height="1024" alt="image" src="https://github.com/user-attachments/assets/5a72b777-14ae-4e83-b1f8-578654b408c1" />
 
 ## 项目结构
 
 ```
 src/mini_code_agent/
-├── core/           Agent 核心循环、Planner、DAG 图执行器、验证器、重试控制
-├── llm/            多模型客户端抽象（Anthropic/OpenAI/Responses）、Token 计费
-├── tools/          工具定义与执行（文件/Shell/搜索/Git/LSP/记忆），Pydantic 校验
+├── core/           Agent 核心循环（ReAct）、Goal-Driven Prompt、验证器、重试控制
+├── llm/            多模型客户端抽象（Anthropic/OpenAI）、Token 统计
+├── tools/          工具定义与执行（文件/Shell/搜索/Git/LSP/Web/记忆/SubAgent），Pydantic 校验
 ├── context/        上下文工程：Token 预算、项目分析、Repo Map、对话压缩
 ├── memory/         对话管理（摘要压缩）+ 项目记忆（持久化 JSON）
 ├── safety/         命令过滤、文件守卫、Git Checkpoint、循环防护
@@ -34,7 +33,7 @@ src/mini_code_agent/
 ├── artifacts/      子任务产物协议：Patch / Verification / Scope / Decision
 ├── trace/          全链路 JSONL 日志记录
 ├── eval/           评测框架：Runner / Tracker / Snapshot / Analyze
-└── cli/            REPL 交互、确认 UI、图可视化、计划展示
+└── cli/            REPL 交互、确认 UI、Eval 命令
 ```
 
 ## 技术栈
@@ -65,19 +64,20 @@ cp .env.example .env
 # 启动 Agent
 uv run python main.py
 
-# 指定模型/模式
-uv run python main.py --project-dir ~/.mini_code_agent  # 指定工作目录
-uv run python main.py --plan                            # 计划模式
-uv run python main.py --graph                           # DAG 图模式
-uv run python main.py --long-run "重构认证模块"           # 长程任务模式
-uv run python main.py --resume <task_id>                # 断点续跑
+# 指定模型/工作目录
+uv run python main.py --project-dir ~/my-project       # 指定工作目录
+uv run python main.py --provider anthropic              # 使用 Claude
 ```
 
 ## 设计亮点
 
-### ReAct + Plan + Graph 三级执行策略
+### 普通模式 + Goal 模式两级执行策略
 
-简单任务直接 ReAct 循环完成；中等复杂度任务先规划后执行，失败可重规划；复杂任务分解为 DAG，拓扑序并行执行，子任务独立上下文互不污染。
+简单任务直接 ReAct 循环完成（最大 25 轮工具调用）；复杂任务通过 `/goal` 进入目标驱动模式——只定义终态（goal + criteria），Master Agent 每步实时决策派发 SubAgent 执行具体编码，不预先固化任务分解，天然适应执行中的意外。
+
+### Goal-Driven 中断恢复
+
+Goal 模式通过 Ledger 记录目标进度和已完成步骤，配合 Checkpoint Manager 自动存档。崩溃或中断后通过 Resume Manager 从最近检查点恢复，Master Agent 读取 Ledger 上下文继续决策，无需重新开始。
 
 ### 上下文工程
 
@@ -102,18 +102,16 @@ Task Ledger 作为 Agent 的"外部记忆"，持久化目标、里程碑、已�
 
 | 命令 | 功能 |
 |------|------|
-| `/plan` | 进入计划模式 |
-| `/graph` | 进入 DAG 图模式 |
-| `/graph-export` | 导出 Mermaid 图 |
-| `/undo` | 回滚上一次文件修改 |
+| `/goal <描述>` | 进入 Goal-Driven 模式 |
+| `/plan <描述>` | 让 SubAgent(type=plan) 生成计划 |
+| `/exec` | 以 Goal 模式执行当前计划 |
+| `/undo` | 回滚最近一次 Agent 修改；依赖 Git checkpoint，非 Git 仓库不可用 |
 | `/checkpoints` | 查看 Git Checkpoint 列表 |
-| `/diff` | 查看当前变更 |
-| `/cost` | 查看 Token 用量和费用 |
+| `/diff` | 查看 Agent 自 checkpoint 以来的变更 |
+| `/cost` | 查看当前会话 Token 用量和估算费用 |
 | `/model` | 切换模型 |
 | `/memory` | 查看项目记忆 |
-| `/ledger` | 查看长程任务 Ledger |
-| `/status` | 查看当前任务状态 |
-| `/save` | 保存对话 |
+| `/save` | 保存信息到项目记忆 |
 | `/clear` | 清空上下文 |
 
 
@@ -121,7 +119,7 @@ Task Ledger 作为 Agent 的"外部记忆"，持久化目标、里程碑、已�
 
 ### Core — Agent 核心循环 [`src/mini_code_agent/core/`](src/mini_code_agent/core/)
 
-ReAct 循环（最大 25 轮）+ Plan-then-Execute + DAG 图执行三种模式。
+ReAct 循环（最大 25 轮）+ Goal-Driven 编排（Master 决策 + SubAgent 执行）两种模式。
 
 <details>
 <summary>展开文件列表</summary>
@@ -129,14 +127,10 @@ ReAct 循环（最大 25 轮）+ Plan-then-Execute + DAG 图执行三种模式�
 | 文件 | 职责 |
 |------|------|
 | [`agent.py`](src/mini_code_agent/core/agent.py) | Agent 主类，ReAct 循环：LLM → 工具执行 → 安全检查 → 验证 → 重试 |
-| [`planner.py`](src/mini_code_agent/core/planner.py) | LLM 生成结构化 Plan，Pydantic + `response_format` 约束输出 |
-| [`task_graph.py`](src/mini_code_agent/core/task_graph.py) | DAG 实现：环检测、拓扑排序、依赖阻塞传播、关键路径、Mermaid 导出 |
-| [`graph_planner.py`](src/mini_code_agent/core/graph_planner.py) | LLM 从自然语言生成 TaskGraph |
-| [`graph_executor.py`](src/mini_code_agent/core/graph_executor.py) | 拓扑序执行 DAG，子任务独立上下文，失败重试/阻塞回调 |
-| [`subtask_runner.py`](src/mini_code_agent/core/subtask_runner.py) | 桥接 Executor↔Agent，产出 SubtaskArtifact |
+| [`goal_prompt.py`](src/mini_code_agent/core/goal_prompt.py) | Goal-Driven 模式的 Master Agent system prompt 模板 |
+| [`system_prompt.py`](src/mini_code_agent/core/system_prompt.py) | 普通模式系统 Prompt 构建，注入项目上下文 |
 | [`verifier.py`](src/mini_code_agent/core/verifier.py) | 任务后验证：语法/Lint/相关测试 |
 | [`retry.py`](src/mini_code_agent/core/retry.py) | 验证失败时携带错误上下文自动重试（最多 3 次） |
-| [`system_prompt.py`](src/mini_code_agent/core/system_prompt.py) | 系统 Prompt 构建，注入项目上下文 |
 
 </details>
 
@@ -160,7 +154,7 @@ ReAct 循环（最大 25 轮）+ Plan-then-Execute + DAG 图执行三种模式�
 
 ### Tools — 工具系统 [`src/mini_code_agent/tools/`](src/mini_code_agent/tools/)
 
-Pydantic Schema 自动生成 + 三级权限（AUTO/CONFIRM/DENY），16 个内置工具。
+Pydantic Schema 自动生成 + 三级权限（AUTO/CONFIRM/DENY），内置工具覆盖文件/Shell/搜索/Git/LSP/Web/记忆/SubAgent。
 
 <details>
 <summary>展开文件列表</summary>
@@ -168,12 +162,15 @@ Pydantic Schema 自动生成 + 三级权限（AUTO/CONFIRM/DENY），16 个内�
 | 文件 | 职责 |
 |------|------|
 | [`base.py`](src/mini_code_agent/tools/base.py) | Tool 抽象基类 + ToolRegistry，Pydantic InputModel 自动生成 JSON Schema |
-| [`file_tools.py`](src/mini_code_agent/tools/file_tools.py) | ReadFile / WriteFile / EditFile（模糊匹配 + 回滚） |
-| [`shell_tools.py`](src/mini_code_agent/tools/shell_tools.py) | Bash 执行，30s 超时，输出截断，经 CommandFilter 过滤 |
-| [`search_tools.py`](src/mini_code_agent/tools/search_tools.py) | Grep（递归正则）/ ListDir（树形列表） |
-| [`git_tools.py`](src/mini_code_agent/tools/git_tools.py) | GitStatus / GitDiff / GitCommit / GitLog |
-| [`lsp.py`](src/mini_code_agent/tools/lsp.py) | LSP 集成：Python/TS/Go/Rust 的定义跳转、引用、类型、诊断 |
-| [`memory_tools.py`](src/mini_code_agent/tools/memory_tools.py) | 项目记忆的添加与关键词检索 |
+| [`file_ops.py`](src/mini_code_agent/tools/file_ops.py) | ReadFile / WriteFile |
+| [`edit.py`](src/mini_code_agent/tools/edit.py) | EditFile（模糊匹配 + 回滚） |
+| [`shell.py`](src/mini_code_agent/tools/shell.py) | Bash 执行，超时控制，输出截断，经 CommandFilter 过滤 |
+| [`search.py`](src/mini_code_agent/tools/search.py) | Grep（递归正则）/ ListDir（树形列表） |
+| [`git.py`](src/mini_code_agent/tools/git.py) | GitStatus / GitDiff / GitCommit / GitLog |
+| [`lsp.py`](src/mini_code_agent/tools/lsp.py) | LSP 集成：定义跳转、引用、类型、诊断 |
+| [`web.py`](src/mini_code_agent/tools/web.py) | WebSearch / WebFetch 网络搜索与内容获取 |
+| [`memory.py`](src/mini_code_agent/tools/memory.py) | 项目记忆的添加与关键词检索 |
+| [`subagent.py`](src/mini_code_agent/tools/subagent.py) | SubAgent 工具：派发子 Agent（coder/explore/plan）执行具体任务 |
 
 </details>
 
@@ -305,16 +302,15 @@ Append-only JSONL，记录完整 LLM 调用和工具执行过程。
 
 ### CLI — 命令行界面 [`src/mini_code_agent/cli/`](src/mini_code_agent/cli/)
 
-Rich 流式渲染 + prompt_toolkit 交互，14 个 Slash 命令。
+Rich 流式渲染 + prompt_toolkit 交互，支持 Goal/Plan/Exec 等 Slash 命令。
 
 <details>
 <summary>展开文件列表</summary>
 
 | 文件 | 职责 |
 |------|------|
-| [`repl.py`](src/mini_code_agent/cli/repl.py) | 交互式 REPL，历史/补全/流式输出 |
+| [`repl.py`](src/mini_code_agent/cli/repl.py) | 交互式 REPL，历史/补全/流式输出，Goal 模式循环 |
 | [`confirm.py`](src/mini_code_agent/cli/confirm.py) | 工具调用确认 UI |
-| [`graph_display.py`](src/mini_code_agent/cli/graph_display.py) | DAG 终端可视化 |
-| [`plan_display.py`](src/mini_code_agent/cli/plan_display.py) | 计划展示 |
+| [`eval_cmd.py`](src/mini_code_agent/cli/eval_cmd.py) | Eval 子命令入口 |
 
 </details>
