@@ -178,6 +178,42 @@ async def test_goal_blocked_stops_loop(tmp_path: Path) -> None:
 
 
 @pytest.mark.asyncio
+async def test_goal_complete_accepts_missing_closing_bracket(tmp_path: Path) -> None:
+    """容错识别缺少右中括号的 complete 状态标记."""
+    client = MockStreamingLLMClient([
+        _make_text_turn("所有标准已达成。\n[goal_status: complete"),
+    ])
+    repl, manager = _build_repl(client, tmp_path)
+
+    with patch.object(repl._prompt_session, "prompt_async", return_value="测试通过"):
+        await repl._handle_goal_command("缺少右括号的目标")
+
+    ledgers = manager.list_all()
+    ledger = manager.load(ledgers[0].task_id)
+    assert ledger.status == TaskRunStatus.COMPLETED
+    assert ledger.current_phase == "done"
+    assert client._call_index == 1
+
+
+@pytest.mark.asyncio
+async def test_goal_status_parser_uses_last_status(tmp_path: Path) -> None:
+    """同一轮出现多个状态标记时，以最后一个为准."""
+    client = MockStreamingLLMClient([
+        _make_text_turn("继续处理中。\n[goal_status: active]\n所有标准已达成。\n[goal_status: complete"),
+    ])
+    repl, manager = _build_repl(client, tmp_path)
+
+    with patch.object(repl._prompt_session, "prompt_async", return_value="测试通过"):
+        await repl._handle_goal_command("多个状态标记的目标")
+
+    ledgers = manager.list_all()
+    ledger = manager.load(ledgers[0].task_id)
+    assert ledger.status == TaskRunStatus.COMPLETED
+    assert ledger.current_phase == "done"
+    assert client._call_index == 1
+
+
+@pytest.mark.asyncio
 async def test_goal_interrupt_saves_paused(tmp_path: Path) -> None:
     """第二轮抛 KeyboardInterrupt，验证 ledger 保存为 PAUSED."""
     client = InterruptOnTurnClient(

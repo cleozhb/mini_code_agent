@@ -903,8 +903,14 @@ class REPL:
             return text_accumulator
 
         def _parse_goal_status(text: str) -> str:
-            m = re.search(r"\[goal_status:\s*(active|complete|blocked)\]", text)
-            return m.group(1) if m else "active"
+            matches = list(
+                re.finditer(
+                    r"^\s*\[?\s*goal_status\s*:\s*(active|complete|blocked)\b\s*\]?\s*$",
+                    text,
+                    flags=re.IGNORECASE | re.MULTILINE,
+                )
+            )
+            return matches[-1].group(1).lower() if matches else "active"
 
         # 首轮
         output = await _run_one_turn(initial_prompt)
