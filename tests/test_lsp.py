@@ -225,6 +225,56 @@ class TestLSPManager:
             mock_start.assert_not_called()
 
 
+class TestSharedLSPHelpers:
+    def test_agent_discovers_lsp_manager_from_registered_tools(self) -> None:
+        from mini_code_agent.core.agent import Agent
+        from mini_code_agent.llm.base import LLMClient
+        from mini_code_agent.tools.base import ToolRegistry
+
+        class DummyLLMClient(LLMClient):
+            async def chat(self, messages, tools=None, **kwargs):
+                raise NotImplementedError
+
+            def chat_stream(self, messages, tools=None, **kwargs):
+                raise NotImplementedError
+
+        manager = object()
+        tool = GetDiagnosticsTool()
+        tool._lsp_manager = manager
+        registry = ToolRegistry()
+        registry.register(tool)
+
+        agent = Agent(DummyLLMClient(model="dummy"), registry, "test")
+
+        assert agent.lsp_manager is manager
+
+    def test_subagent_coder_tools_share_lsp_manager(self) -> None:
+        from mini_code_agent.tools.base import ToolRegistry
+        from mini_code_agent.tools.subagent import SubAgentTool
+
+        manager = object()
+        registry = ToolRegistry()
+        tool = SubAgentTool(lsp_manager=manager)
+
+        tool._register_coder_tools(registry)
+
+        for name in ["GotoDefinition", "FindReferences", "GetHoverInfo", "GetDiagnostics"]:
+            registered = registry.get(name)
+            assert registered is not None
+            assert getattr(registered, "_lsp_manager") is manager
+
+    def test_subagent_coder_tools_skip_lsp_without_manager(self) -> None:
+        from mini_code_agent.tools.base import ToolRegistry
+        from mini_code_agent.tools.subagent import SubAgentTool
+
+        registry = ToolRegistry()
+        tool = SubAgentTool()
+
+        tool._register_coder_tools(registry)
+
+        assert registry.get("GetDiagnostics") is None
+
+
 # ===========================================================================
 # GotoDefinitionTool 测试
 # ===========================================================================

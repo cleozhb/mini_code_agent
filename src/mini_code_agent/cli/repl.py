@@ -448,6 +448,7 @@ class REPL:
             project_path=project_path,
             confirm_callback=self.agent.confirm_callback,
             event_callback=self._render_subagent_event,
+            lsp_manager=getattr(self.agent, "lsp_manager", None),
             _plan_file_override=str(base_file) if base_file else None,
         )
 
@@ -565,6 +566,7 @@ class REPL:
             system_prompt="你是一个编程助手，按指令完成任务。完成后简要说明做了什么。",
             confirm_callback=self.agent.confirm_callback,
             event_callback=_relay_subagent_event,
+            lsp_manager=getattr(self.agent, "lsp_manager", None),
         )
 
         registry = ToolRegistry()
@@ -777,6 +779,7 @@ class REPL:
                 system_prompt="你是一个编程助手，按指令完成任务。完成后简要说明做了什么。",
                 confirm_callback=self.agent.confirm_callback,
                 event_callback=_relay,
+                lsp_manager=getattr(self.agent, "lsp_manager", None),
             )
             registry = ToolRegistry()
             registry.register(sub_agent_tool)

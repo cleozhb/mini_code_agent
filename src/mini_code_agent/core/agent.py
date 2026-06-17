@@ -49,6 +49,14 @@ MAX_TOOL_ROUNDS = 25
 WRITE_TOOL_NAMES = {"WriteFile", "EditFile", "write_file", "edit_file"}
 
 
+def _find_shared_lsp_manager(tool_registry: ToolRegistry) -> Any | None:
+    for tool in tool_registry.list_tools():
+        manager = getattr(tool, "_lsp_manager", None)
+        if manager is not None:
+            return manager
+    return None
+
+
 class AgentError(Exception):
     """Agent 运行时错误."""
 
@@ -199,6 +207,7 @@ class Agent:
 
         # Incremental Verifier（可选）—— 每次 Edit 后做层级 1 快速验证
         self.incremental_verifier = incremental_verifier
+        self.lsp_manager = _find_shared_lsp_manager(tool_registry)
         self.trace_recorder = trace_recorder or getattr(
             llm_client, "trace_recorder", None
         )

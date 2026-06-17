@@ -42,6 +42,19 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="显示详细信息（上下文统计等）",
     )
+    parser.add_argument(
+        "--prewarm-lsp",
+        dest="prewarm_lsp",
+        action="store_true",
+        default=True,
+        help="启动 REPL 前预热 Python LSP（默认开启）",
+    )
+    parser.add_argument(
+        "--no-prewarm-lsp",
+        dest="prewarm_lsp",
+        action="store_false",
+        help="不在启动 REPL 前预热 Python LSP，改为首次使用时按需启动",
+    )
 
     # 子命令：不带 → REPL（保持原行为）；带 → 分派
     subparsers = parser.add_subparsers(dest="command", metavar="COMMAND")
@@ -170,6 +183,7 @@ async def async_main() -> None:
     registry.register(SubAgentTool(
         llm_client=llm_client,
         project_path=str(project_dir),
+        lsp_manager=lsp_manager,
     ))
 
     # 3. 构建 system prompt（使用项目上下文感知）
@@ -249,7 +263,22 @@ async def async_main() -> None:
     artifact_store = ArtifactStore(
         storage_dir=str(project_dir / ".agent" / "artifacts"),
     )
-    incremental_verifier = IncrementalVerifier()
+    from mini_code_agent.verify.level1 import QuickVerifier
+
+    incremental_verifier = IncrementalVerifier(
+        level1=QuickVerifier(lsp_manager=lsp_manager),
+    )
+
+    if args.prewarm_lsp:
+        try:
+            await lsp_manager.start_server("python", str(project_dir))
+            console.print("[dim]LSP: Python language server 已预热[/dim]")
+        except FileNotFoundError as e:
+            console.print(f"[yellow]LSP 预热跳过: {e}[/yellow]")
+        except Exception as e:
+            console.print(
+                f"[yellow]LSP 预热失败，后续仍可按需启动: {type(e).__name__}: {e}[/yellow]"
+            )
 
     agent = Agent(
         llm_client=llm_client,

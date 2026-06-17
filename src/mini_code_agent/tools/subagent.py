@@ -70,6 +70,7 @@ class SubAgentTool(Tool):
     system_prompt: str = ""
     confirm_callback: Any = None
     event_callback: Any = None
+    lsp_manager: Any = None
     _plan_file_override: str | None = None
 
     async def execute(self, **kwargs: Any) -> ToolResult:
@@ -158,6 +159,12 @@ class SubAgentTool(Tool):
         from .edit import EditFileTool
         from .file_ops import ReadFileTool, WriteFileTool
         from .git import GitDiffTool, GitLogTool, GitStatusTool
+        from .lsp import (
+            FindReferencesTool,
+            GetDiagnosticsTool,
+            GetHoverInfoTool,
+            GotoDefinitionTool,
+        )
         from .search import GrepTool, ListDirTool
         from .shell import BashTool
 
@@ -170,6 +177,19 @@ class SubAgentTool(Tool):
         registry.register(GitStatusTool())
         registry.register(GitDiffTool())
         registry.register(GitLogTool())
+        if self.lsp_manager is not None:
+            goto_def_tool = GotoDefinitionTool()
+            goto_def_tool._lsp_manager = self.lsp_manager
+            find_refs_tool = FindReferencesTool()
+            find_refs_tool._lsp_manager = self.lsp_manager
+            hover_tool = GetHoverInfoTool()
+            hover_tool._lsp_manager = self.lsp_manager
+            diagnostics_tool = GetDiagnosticsTool()
+            diagnostics_tool._lsp_manager = self.lsp_manager
+            registry.register(goto_def_tool)
+            registry.register(find_refs_tool)
+            registry.register(hover_tool)
+            registry.register(diagnostics_tool)
 
     def _register_readonly_tools(self, registry: Any) -> None:
         from .file_ops import ReadFileTool
