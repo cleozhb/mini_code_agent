@@ -16,11 +16,14 @@ from pathlib import Path
 
 import pytest
 
-from mini_code_agent.core import Agent, AgentResult, build_system_prompt
+from mini_code_agent.core import Agent, AgentEventType, AgentResult, build_system_prompt
+from mini_code_agent.core.runtime_input import InputKind, RuntimeInput
 from mini_code_agent.llm import (
     LLMClient,
     LLMResponse,
     Message,
+    StreamDelta,
+    StreamDeltaType,
     TokenUsage,
     ToolCall,
     ToolParam,
@@ -63,6 +66,44 @@ class MockLLMClient(LLMClient):
 
     def chat_stream(self, messages, tools=None):
         raise NotImplementedError("Mock 不支持 stream")
+
+
+class MockStreamLLMClient(LLMClient):
+    """可预设流式响应序列的 Mock LLM 客户端."""
+
+    def __init__(self, turns: list[list[StreamDelta]]) -> None:
+        super().__init__(model="mock-stream")
+        self._turns = list(turns)
+        self._call_index = 0
+        self.seen_messages: list[list[Message]] = []
+
+    async def chat(
+        self,
+        messages: list[Message],
+        tools: list[ToolParam] | None = None,
+    ) -> LLMResponse:
+        raise NotImplementedError("Mock stream client 不支持 chat")
+
+    async def chat_stream(self, messages, tools=None):
+        self.seen_messages.append(list(messages))
+        if self._call_index >= len(self._turns):
+            raise RuntimeError("Mock stream 响应已用尽")
+        turn = self._turns[self._call_index]
+        self._call_index += 1
+        for delta in turn:
+            yield delta
+
+
+class StaticRuntimeInputChannel:
+    """按 drain 次数返回预设 runtime input 的测试通道."""
+
+    def __init__(self, batches: list[list[RuntimeInput]]) -> None:
+        self._batches = list(batches)
+
+    def drain(self) -> list[RuntimeInput]:
+        if not self._batches:
+            return []
+        return self._batches.pop(0)
 
 
 # ==================================================================
@@ -169,6 +210,74 @@ async def test_agent_multiple_tool_calls(tmp_path: Path):
     assert result.tool_calls_count == 2
     assert "AAA" in result.content
     assert "BBB" in result.content
+
+
+@pytest.mark.asyncio
+async def test_run_stream_pause_before_tool_adds_synthetic_result(tmp_path: Path):
+    """工具执行前收到 pause 时，未执行工具要补 tool result 并正常中断."""
+    client = MockStreamLLMClient([
+        [
+            StreamDelta(
+                type=StreamDeltaType.TOOL_CALL_START,
+                tool_call_id="call_1",
+                tool_name="read_file",
+            ),
+            StreamDelta(
+                type=StreamDeltaType.TOOL_CALL_END,
+                tool_call_id="call_1",
+                tool_name="read_file",
+                content='{"path": "missing.txt"}',
+            ),
+            StreamDelta(type=StreamDeltaType.FINISH, usage=TokenUsage(10, 3)),
+        ],
+    ])
+    channel = StaticRuntimeInputChannel([
+        [RuntimeInput(kind=InputKind.PAUSE_REQUEST)],
+    ])
+    registry = ToolRegistry()
+    registry.register(ReadFileTool())
+    agent = Agent(client, registry, "你是助手")
+
+    events = [event async for event in agent.run_stream("读取文件", input_channel=channel)]
+
+    assert events[-1].type == AgentEventType.INTERRUPTED
+    tool_messages = [m for m in agent.messages if m.tool_result is not None]
+    assert len(tool_messages) == 1
+    assert tool_messages[0].tool_result is not None
+    assert tool_messages[0].tool_result.tool_call_id == "call_1"
+    assert tool_messages[0].tool_result.is_error is True
+    assert "工具未执行" in tool_messages[0].tool_result.content
+
+
+@pytest.mark.asyncio
+async def test_run_stream_user_input_before_finish_continues_and_reports_total_usage():
+    """纯文本结束前收到插话时继续一轮，FINISH usage 应包含两轮."""
+    client = MockStreamLLMClient([
+        [
+            StreamDelta(type=StreamDeltaType.TEXT, content="第一轮"),
+            StreamDelta(type=StreamDeltaType.FINISH, usage=TokenUsage(10, 2)),
+        ],
+        [
+            StreamDelta(type=StreamDeltaType.TEXT, content="第二轮"),
+            StreamDelta(type=StreamDeltaType.FINISH, usage=TokenUsage(20, 3)),
+        ],
+    ])
+    channel = StaticRuntimeInputChannel([
+        [RuntimeInput(kind=InputKind.USER_INSTRUCTION, content="补充要求")],
+        [],
+    ])
+    agent = Agent(client, ToolRegistry(), "你是助手")
+
+    events = [event async for event in agent.run_stream("开始", input_channel=channel)]
+    finish = events[-1]
+
+    assert finish.type == AgentEventType.FINISH
+    assert finish.usage is not None
+    assert finish.usage.input_tokens == 30
+    assert finish.usage.output_tokens == 5
+    assert agent.total_usage.input_tokens == 30
+    assert agent.total_usage.output_tokens == 5
+    assert any(m.content == "补充要求" for m in agent.messages)
 
 
 # ==================================================================

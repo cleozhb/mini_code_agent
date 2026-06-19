@@ -55,6 +55,11 @@ def parse_args() -> argparse.Namespace:
         action="store_false",
         help="不在启动 REPL 前预热 Python LSP，改为首次使用时按需启动",
     )
+    parser.add_argument(
+        "--tui",
+        action="store_true",
+        help="使用 Textual full-screen TUI 界面",
+    )
 
     # 子命令：不带 → REPL（保持原行为）；带 → 分派
     subparsers = parser.add_subparsers(dest="command", metavar="COMMAND")
@@ -232,9 +237,16 @@ async def async_main() -> None:
     prompt_session = PromptSession()
 
     async def _confirm_cb(tool_name, tool_call, safety_level=SafetyLevel.NEEDS_CONFIRM):
-        return await confirm_tool_call(
-            tool_name, tool_call, console, prompt_session, safety_level,
-        )
+        controller = getattr(repl, "_active_controller", None)
+        if controller:
+            await controller.suspend()
+        try:
+            return await confirm_tool_call(
+                tool_name, tool_call, console, prompt_session, safety_level,
+            )
+        finally:
+            if controller:
+                controller.resume()
 
     # 6. 创建 Agent
     from mini_code_agent.core import Agent
@@ -297,7 +309,20 @@ async def async_main() -> None:
         trace_recorder=trace_recorder,
     )
 
-    # 7. 启动 REPL
+    # 7. 启动 REPL 或 TUI
+    if args.tui:
+        from mini_code_agent.cli.tui import TUIApp
+
+        app = TUIApp(agent=agent)
+        agent.confirm_callback = app._tui_confirm_cb
+        try:
+            await app.run_async()
+        finally:
+            if trace_recorder is not None:
+                trace_recorder.finish_session()
+            await lsp_manager.stop_server()
+        return
+
     from mini_code_agent.cli import REPL
 
     repl = REPL(

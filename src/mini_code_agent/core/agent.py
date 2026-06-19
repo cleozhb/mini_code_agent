@@ -39,6 +39,7 @@ if TYPE_CHECKING:
     from ..longrun.task_ledger import TaskLedger
     from ..trace import TraceRecorder
     from ..verify.verifier import IncrementalVerifier
+    from .runtime_input import RuntimeInputChannel
     from .task_graph import TaskGraph
 
 logger = logging.getLogger(__name__)
@@ -84,7 +85,9 @@ class AgentObserver:
         ...
 
 
-StopReason = Literal["ok", "max_rounds", "max_tokens", "timeout", "error"]
+StopReason = Literal[
+    "ok", "max_rounds", "max_tokens", "timeout", "error", "interrupted"
+]
 
 
 @dataclass
@@ -127,6 +130,7 @@ class AgentEventType(str, Enum):
     TOOL_CALL_END = "tool_call_end"    # 工具调用参数接收完毕
     TOOL_RESULT = "tool_result"        # 工具执行结果
     FINISH = "finish"                  # 本轮结束
+    INTERRUPTED = "interrupted"        # 用户请求暂停/中断
 
 
 @dataclass
@@ -494,11 +498,16 @@ class Agent:
         await self._maybe_compress()
         return result
 
-    async def run_stream(self, user_message: str) -> AsyncIterator[AgentEvent]:
+    async def run_stream(
+        self,
+        user_message: str,
+        *,
+        input_channel: "RuntimeInputChannel | None" = None,
+    ) -> AsyncIterator[AgentEvent]:
         """流式核心循环：与 run() 逻辑一致，但以事件流形式产出中间过程.
 
         yields:
-            AgentEvent 事件流：TEXT_DELTA / TOOL_CALL_* / TOOL_RESULT / FINISH
+            AgentEvent 事件流：TEXT_DELTA / TOOL_CALL_* / TOOL_RESULT / FINISH / INTERRUPTED
         """
         trace_run_id = self._trace_agent_run_start(user_message)
         # 自动 checkpoint：记录任务开始前的 HEAD（不创建 commit）
@@ -618,6 +627,24 @@ class Agent:
             # 没有工具调用 → 纯文本回复，结束
             if not tool_calls:
                 self.conversation.append(Message.assistant(full_content))
+                # 检查点 C：纯文本回复结束前
+                if input_channel:
+                    should_pause, user_msgs = self._drain_input_channel(input_channel)
+                    if should_pause:
+                        self._accumulate_usage(round_usage)
+                        self._trace_agent_run_finish(
+                            trace_run_id,
+                            result=AgentResult(
+                                content="[interrupted]",
+                                usage=round_usage,
+                                tool_calls_count=total_tool_calls,
+                            ),
+                        )
+                        yield AgentEvent(type=AgentEventType.INTERRUPTED)
+                        return
+                    if user_msgs:
+                        self.conversation.append(Message.user("\n".join(user_msgs)))
+                        continue
                 self._accumulate_usage(round_usage)
                 await self._maybe_compress()
                 # 自动 checkpoint：任务完成后
@@ -644,7 +671,34 @@ class Agent:
             )
 
             # 逐个执行工具
-            for tool_call in tool_calls:
+            pending_user_msgs: list[str] = []
+            for idx, tool_call in enumerate(tool_calls):
+                # 检查点 A：每个 tool call 执行前
+                if input_channel:
+                    should_pause, user_msgs = self._drain_input_channel(input_channel)
+                    if should_pause:
+                        for remaining_tc in tool_calls[idx:]:
+                            self.conversation.append(Message.tool(LLMToolResult(
+                                tool_call_id=remaining_tc.id,
+                                content="[用户暂停，工具未执行]",
+                                is_error=True,
+                            )))
+                        if user_msgs:
+                            self.conversation.append(Message.user("\n".join(user_msgs)))
+                        self._accumulate_usage(round_usage)
+                        self._trace_agent_run_finish(
+                            trace_run_id,
+                            result=AgentResult(
+                                content="[interrupted]",
+                                usage=round_usage,
+                                tool_calls_count=total_tool_calls,
+                            ),
+                        )
+                        yield AgentEvent(type=AgentEventType.INTERRUPTED)
+                        return
+                    if user_msgs:
+                        pending_user_msgs.extend(user_msgs)
+
                 tool_result_msg, exec_result = await self._execute_tool_call_with_result(tool_call)
                 self.conversation.append(tool_result_msg)
                 total_tool_calls += 1
@@ -653,6 +707,31 @@ class Agent:
                     tool_call=tool_call,
                     tool_result=exec_result,
                 )
+
+            # 检查点 B：所有工具执行完后、下一轮 LLM 前
+            if input_channel:
+                should_pause, user_msgs = self._drain_input_channel(input_channel)
+                all_user = pending_user_msgs + user_msgs
+                pending_user_msgs = []
+                if should_pause:
+                    if all_user:
+                        self.conversation.append(Message.user("\n".join(all_user)))
+                    self._accumulate_usage(round_usage)
+                    self._trace_agent_run_finish(
+                        trace_run_id,
+                        result=AgentResult(
+                            content="[interrupted]",
+                            usage=round_usage,
+                            tool_calls_count=total_tool_calls,
+                        ),
+                    )
+                    yield AgentEvent(type=AgentEventType.INTERRUPTED)
+                    return
+                if all_user:
+                    self.conversation.append(Message.user("\n".join(all_user)))
+            elif pending_user_msgs:
+                self.conversation.append(Message.user("\n".join(pending_user_msgs)))
+                pending_user_msgs = []
 
         # 超出最大轮数 → 收尾
         logger.warning("达到最大工具调用轮数，强制收尾")
@@ -697,6 +776,16 @@ class Agent:
             content="max_rounds",
             usage=round_usage,
         )
+
+    def _drain_input_channel(
+        self, channel: "RuntimeInputChannel"
+    ) -> tuple[bool, list[str]]:
+        """返回 (should_pause, user_messages_content_list)."""
+        from .runtime_input import InputKind
+        items = channel.drain()
+        should_pause = any(i.kind == InputKind.PAUSE_REQUEST for i in items)
+        user_msgs = [i.content for i in items if i.kind == InputKind.USER_INSTRUCTION and i.content]
+        return should_pause, user_msgs
 
     async def _maybe_compress(self) -> None:
         """检查是否需要压缩对话历史，需要则执行."""

@@ -71,6 +71,7 @@ class SubAgentTool(Tool):
     confirm_callback: Any = None
     event_callback: Any = None
     lsp_manager: Any = None
+    input_channel: Any = None
     _plan_file_override: str | None = None
 
     async def execute(self, **kwargs: Any) -> ToolResult:
@@ -245,7 +246,7 @@ class SubAgentTool(Tool):
         tool_calls_errors = 0
         stop_reason = "ok"
 
-        async for event in sub_agent.run_stream(prompt):
+        async for event in sub_agent.run_stream(prompt, input_channel=self.input_channel):
             await self._emit_event(event)
             if event.type == AgentEventType.TEXT_DELTA:
                 content += event.content
@@ -257,6 +258,14 @@ class SubAgentTool(Tool):
                 stop_reason = event.content or "ok"
                 if event.usage is not None:
                     usage = event.usage
+            elif event.type == AgentEventType.INTERRUPTED:
+                stop_reason = "interrupted"
+                if self.input_channel is not None:
+                    from ..core.runtime_input import InputKind, RuntimeInput
+                    self.input_channel._queue.put_nowait(
+                        RuntimeInput(kind=InputKind.PAUSE_REQUEST)
+                    )
+                break
 
         return AgentResult(
             content=content,

@@ -3,9 +3,7 @@
 from __future__ import annotations
 
 import asyncio
-import json
 import sys
-from functools import partial
 from typing import Any
 
 from prompt_toolkit import PromptSession
@@ -16,18 +14,17 @@ from prompt_toolkit.key_binding import KeyBindings
 from rich.console import Console
 from rich.markdown import Markdown
 from rich.panel import Panel
-from rich.text import Text
 
 from ..core.agent import Agent, AgentEvent, AgentEventType
-from ..llm.base import LLMClient, TokenUsage, ToolCall
-from ..llm.pricing import estimate_cost
-from ..tools.base import ToolRegistry
-from .confirm import confirm_tool_call
+from ..llm.base import ToolCall
+from .command_handler import CommandHandler, CommandResult, RunnerCommand
+from .console_renderer import ConsoleRenderer
 
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
     from ..artifacts import ArtifactStore
+    from .input_controller import RuntimeInputController
 
 
 _WRITE_TOOL_NAMES = {"WriteFile", "EditFile", "write_file", "edit_file"}
@@ -68,6 +65,9 @@ class REPL:
         self.agent = agent
         self.console = console or Console()
         self._artifact_store = artifact_store
+        self._active_controller: "RuntimeInputController | None" = None
+        self._renderer = ConsoleRenderer(self.console)
+        self._cmd_handler = CommandHandler(agent, self._renderer)
 
         # 斜杠命令补全
         self._completer = WordCompleter(
@@ -107,7 +107,7 @@ class REPL:
                     break
                 continue
 
-            await self._run_agent_stream(user_input)
+            await self._run_agent_with_input(user_input)
 
     async def _get_input(self) -> str:
         """获取用户输入，支持多行（Alt+Enter 提交，Enter 换行默认单行）."""
@@ -130,46 +130,7 @@ class REPL:
         parts = cmd.split(maxsplit=1)
         command = parts[0].lower()
 
-        if command in ("/quit", "/exit", "/q"):
-            self.console.print("[dim]再见！[/dim]")
-            return False
-
-        if command == "/clear":
-            self.agent.reset()
-            self.console.clear()
-            self.console.print("[green]对话历史已清空[/green]")
-            return True
-
-        if command == "/cost":
-            self._show_cost()
-            return True
-
-        if command == "/model":
-            model_arg = parts[1].strip() if len(parts) > 1 else ""
-            self._switch_model(model_arg)
-            return True
-
-        if command == "/memory":
-            self._show_memory()
-            return True
-
-        if command == "/save":
-            save_arg = parts[1].strip() if len(parts) > 1 else ""
-            self._save_memory(save_arg)
-            return True
-
-        if command == "/undo":
-            await self._undo()
-            return True
-
-        if command == "/checkpoints":
-            await self._show_checkpoints()
-            return True
-
-        if command == "/diff":
-            await self._show_agent_diff()
-            return True
-
+        # /goal, /plan, /exec 需要独立 runner，保留在 REPL
         if command == "/goal":
             goal_arg = parts[1].strip() if len(parts) > 1 else ""
             await self._handle_goal_command(goal_arg)
@@ -185,202 +146,22 @@ class REPL:
             await self._handle_exec_command(exec_arg)
             return True
 
-        self.console.print(f"[red]未知命令: {command}[/red]")
-        self.console.print(
-            "[dim]可用命令: /quit  /clear  /cost  /model  /memory  /save"
-            "  /undo  /checkpoints  /diff  /goal  /plan  /exec[/dim]"
-        )
+        # 其余命令委托给 CommandHandler
+        result = await self._cmd_handler.handle(cmd)
+        if result == CommandResult.QUIT:
+            return False
+        if isinstance(result, RunnerCommand):
+            self.console.print(f"[red]该命令需要独立 runner: /{result.kind}[/red]")
+            return True
+        if result == CommandResult.UNKNOWN:
+            self.console.print(f"[red]未知命令: {command}[/red]")
+            self.console.print(
+                "[dim]可用命令: /quit  /clear  /cost  /model  /memory  /save"
+                "  /undo  /checkpoints  /diff  /goal  /plan  /exec[/dim]"
+            )
         return True
 
-    async def _undo(self) -> None:
-        """回滚最近一次 Agent 的所有修改."""
-        cp = self.agent.git_checkpoint
-        if cp is None:
-            self.console.print("[red]Git checkpoint 未启用[/red]")
-            return
-
-        if not await cp.is_git_repo():
-            self.console.print("[red]当前目录不是 git 仓库，无法回滚[/red]")
-            return
-
-        checkpoints = await cp.list_checkpoints()
-        if not checkpoints:
-            self.console.print("[yellow]没有找到 checkpoint，无法回滚[/yellow]")
-            return
-
-        latest = checkpoints[0]
-        self.console.print(
-            f"[dim]将回滚到 checkpoint 之前的状态: "
-            f"{latest.message} ({latest.commit_hash[:8]})[/dim]"
-        )
-
-        success = await cp.rollback_last()
-        if success:
-            self.console.print("[green]回滚成功[/green]")
-        else:
-            self.console.print("[red]回滚失败[/red]")
-
-    async def _show_checkpoints(self) -> None:
-        """列出所有 agent checkpoint."""
-        cp = self.agent.git_checkpoint
-        if cp is None:
-            self.console.print("[red]Git checkpoint 未启用[/red]")
-            return
-
-        checkpoints = await cp.list_checkpoints()
-        if not checkpoints:
-            self.console.print("[dim]暂无 git checkpoint[/dim]")
-        else:
-            lines = []
-            for i, c in enumerate(checkpoints):
-                lines.append(
-                    f"  {i + 1}. [{c.commit_hash[:8]}] {c.message}  "
-                    f"[dim]({c.timestamp})[/dim]"
-                )
-
-            self.console.print(Panel(
-                "\n".join(lines),
-                title=f"[bold]Git Checkpoints ({len(checkpoints)})[/bold]",
-                border_style="cyan",
-            ))
-
-    async def _show_agent_diff(self) -> None:
-        """查看 Agent 自最近 checkpoint 以来的所有修改."""
-        cp = self.agent.git_checkpoint
-        if cp is None:
-            self.console.print("[red]Git checkpoint 未启用[/red]")
-            return
-
-        checkpoints = await cp.list_checkpoints()
-        if not checkpoints:
-            self.console.print("[dim]暂无 checkpoint，无法显示 diff[/dim]")
-            return
-
-        # 找最早的 "before:" checkpoint 作为基准
-        base_hash = checkpoints[-1].commit_hash
-        from ..tools.git import _run_git
-
-        code, diff_output = await _run_git(
-            "diff", f"{base_hash}~1", "HEAD", cwd=cp.cwd
-        )
-        if code != 0:
-            # 如果 ~1 不存在（首个 commit），直接 show
-            code, diff_output = await _run_git(
-                "diff", base_hash, "HEAD", cwd=cp.cwd
-            )
-
-        if not diff_output.strip():
-            self.console.print("[dim]无改动[/dim]")
-            return
-
-        lines = diff_output.splitlines()
-        if len(lines) > 200:
-            display = "\n".join(lines[:200])
-            display += f"\n\n... [截断：共 {len(lines)} 行，仅显示前 200 行]"
-        else:
-            display = diff_output
-
-        from rich.syntax import Syntax
-        self.console.print(Syntax(display, "diff", theme="monokai"))
-
-    def _show_cost(self) -> None:
-        """显示 token 消耗和费用估算."""
-        usage = self.agent.total_usage
-        model = self.agent.llm_client.model
-        cost = estimate_cost(model, usage)
-
-        lines = [
-            f"模型: {model}",
-            f"输入 tokens: {usage.input_tokens:,}",
-            f"输出 tokens: {usage.output_tokens:,}",
-            f"总计 tokens: {usage.total_tokens:,}",
-        ]
-        if usage.cached_input_tokens:
-            lines.append(f"OpenAI cached input tokens: {usage.cached_input_tokens:,}")
-        if usage.reasoning_tokens:
-            lines.append(f"OpenAI reasoning tokens: {usage.reasoning_tokens:,}")
-        if usage.cache_creation_input_tokens:
-            lines.append(
-                "Anthropic cache creation tokens: "
-                f"{usage.cache_creation_input_tokens:,}"
-            )
-        if usage.cache_read_input_tokens:
-            lines.append(
-                f"Anthropic cache read tokens: {usage.cache_read_input_tokens:,}"
-            )
-        if cost is not None:
-            suffix = "" if cost.is_complete else "（部分估算）"
-            lines.append(f"估算费用: ${cost.total_cost:.4f}{suffix}")
-            if cost.missing_price_items:
-                lines.append(
-                    "缺失价格项: " + ", ".join(cost.missing_price_items)
-                )
-        else:
-            lines.append("估算费用: (该模型暂无价格数据)")
-
-        self.console.print(Panel(
-            "\n".join(lines),
-            title="[bold]会话消耗[/bold]",
-            border_style="cyan",
-        ))
-
-    def _show_memory(self) -> None:
-        """显示项目长期记忆和对话 token 统计."""
-        lines: list[str] = []
-
-        # 对话 token 统计
-        conv = self.agent.conversation
-        lines.append(f"对话 token 数: {conv.token_count:,}")
-        lines.append(f"对话消息数: {len(conv.messages)}")
-        threshold = int(conv.max_tokens * conv.compress_ratio)
-        lines.append(f"压缩阈值: {threshold:,} tokens")
-
-        # 项目记忆
-        pm = self.agent.project_memory
-        if pm:
-            data = pm.data
-            lines.append("")
-            lines.append(f"项目约定: {len(data.conventions)} 条")
-            for c in data.conventions:
-                lines.append(f"  - {c}")
-            lines.append(f"技术决策: {len(data.decisions)} 条")
-            for d in data.decisions:
-                lines.append(f"  - [{d.date}] {d.decision}")
-            lines.append(f"已知问题: {len(data.known_issues)} 条")
-            for ki in data.known_issues:
-                lines.append(f"  - {ki.issue}")
-        else:
-            lines.append("\n(项目记忆未启用)")
-
-        self.console.print(Panel(
-            "\n".join(lines),
-            title="[bold]记忆状态[/bold]",
-            border_style="magenta",
-        ))
-
-    def _save_memory(self, text: str) -> None:
-        """手动保存一条信息到项目记忆（约定类型）."""
-        pm = self.agent.project_memory
-        if not pm:
-            self.console.print("[red]项目记忆未启用[/red]")
-            return
-        if not text:
-            self.console.print("[dim]用法: /save <要记住的信息>[/dim]")
-            return
-        pm.add_convention(text)
-        self.console.print(f"[green]已保存到项目记忆: {text}[/green]")
-
-    def _switch_model(self, model_name: str) -> None:
-        """切换模型."""
-        if not model_name:
-            self.console.print(f"[dim]当前模型: {self.agent.llm_client.model}[/dim]")
-            self.console.print("[dim]用法: /model <模型名称>[/dim]")
-            return
-        old = self.agent.llm_client.model
-        self.agent.llm_client.model = model_name
-        self.console.print(f"[green]模型已切换: {old} → {model_name}[/green]")
-
-    async def _handle_plan_command(self, arg: str) -> None:
+    async def _handle_exec_command(self, arg: str) -> None:
         """/plan [--base file] <需求描述> — 派发 plan 子 Agent 输出方案.
 
         同会话内自动基于上次 /plan 生成的文件迭代；
@@ -500,7 +281,7 @@ class REPL:
             self._show_goal_status()
             return
         if sub_cmd == "pause":
-            self.console.print("[yellow]如需暂停，请直接按 Ctrl+C[/yellow]")
+            self.console.print("[yellow]运行中输入 /pause 即可暂停当前执行[/yellow]")
             return
         if sub_cmd == "resume":
             await self._goal_resume()
@@ -567,6 +348,7 @@ class REPL:
             confirm_callback=self.agent.confirm_callback,
             event_callback=_relay_subagent_event,
             lsp_manager=getattr(self.agent, "lsp_manager", None),
+            input_channel=self._active_controller,
         )
 
         registry = ToolRegistry()
@@ -726,7 +508,7 @@ class REPL:
             f"开始执行。当前项目根目录是 {project_path}。"
             "先用相对路径检查当前项目状态，然后决定第一步。"
         )
-        await self._run_goal_loop(
+        await self._run_goal_with_input(
             goal=goal,
             criteria=criteria,
             ledger=ledger,
@@ -736,6 +518,29 @@ class REPL:
             longrun_config=longrun_config,
             initial_prompt=first_prompt,
         )
+
+    async def _run_goal_with_input(self, **kwargs) -> None:
+        """带运行时输入支持的 goal loop 入口."""
+        from .input_controller import RuntimeInputController
+
+        controller = RuntimeInputController()
+        self._active_controller = controller
+        master_agent = kwargs.get("master_agent")
+        if master_agent is not None:
+            self._bind_input_channel_to_tools(master_agent, controller)
+
+        controller.start()
+        try:
+            await self._run_goal_loop(**kwargs)
+        finally:
+            await controller.stop()
+            self._active_controller = None
+
+    def _bind_input_channel_to_tools(self, agent, controller) -> None:
+        """Attach the active runtime input channel to tools that opt into it."""
+        for tool in agent.tool_registry.list_tools():
+            if hasattr(tool, "input_channel"):
+                tool.input_channel = controller
 
     async def _run_goal_loop(
         self,
@@ -780,6 +585,7 @@ class REPL:
                 confirm_callback=self.agent.confirm_callback,
                 event_callback=_relay,
                 lsp_manager=getattr(self.agent, "lsp_manager", None),
+                input_channel=self._active_controller,
             )
             registry = ToolRegistry()
             registry.register(sub_agent_tool)
@@ -874,26 +680,26 @@ class REPL:
             nonlocal text_accumulator
             text_accumulator = ""
             try:
-                async for event in master_agent.run_stream(prompt):
+                async for event in master_agent.run_stream(prompt, input_channel=self._active_controller):
                     if event.type == AgentEventType.TEXT_DELTA:
-                        sys.stdout.write(event.content)
-                        sys.stdout.flush()
+                        self._renderer.render_text_delta(event.content)
                         text_accumulator += event.content
                     elif event.type == AgentEventType.TOOL_CALL_START:
-                        sys.stdout.write("\n")
-                        sys.stdout.flush()
-                        self._render_tool_call_start(event.tool_call)
+                        self._renderer.render_text_end()
+                        self._renderer.render_tool_call_start(event.tool_call)
                     elif event.type == AgentEventType.TOOL_CALL_END:
-                        self._render_tool_call_args(event.tool_call)
+                        self._renderer.render_tool_call_args(event.tool_call)
                     elif event.type == AgentEventType.TOOL_RESULT:
-                        self._render_tool_result(event.tool_call, event.tool_result)
+                        self._renderer.render_tool_result(event.tool_call, event.tool_result)
                     elif event.type == AgentEventType.FINISH:
                         run_finished = True
                         finish_stop_reason = event.content or "ok"
-                        sys.stdout.write("\n")
-                        sys.stdout.flush()
+                        self._renderer.render_text_end()
                         if event.usage:
-                            self._render_usage_brief(event.usage)
+                            self._renderer.render_finish(event.usage)
+                    elif event.type == AgentEventType.INTERRUPTED:
+                        run_interrupted = True
+                        self.console.print("\n[yellow]已中断（Goal 已暂停）[/yellow]")
             except (KeyboardInterrupt, asyncio.CancelledError):
                 run_interrupted = True
                 self.console.print("\n[yellow]已中断（Goal 已暂停）[/yellow]")
@@ -918,7 +724,18 @@ class REPL:
 
         # 状态机循环
         while goal_status == "active" and not run_interrupted and run_error is None:
-            output = await _run_one_turn("继续执行下一步。")
+            next_prompt = "继续执行下一步。"
+            if self._active_controller:
+                from ..core.runtime_input import InputKind
+                items = self._active_controller.drain()
+                if any(i.kind == InputKind.PAUSE_REQUEST for i in items):
+                    run_interrupted = True
+                    self.console.print("\n[yellow]已中断（Goal 已暂停）[/yellow]")
+                    break
+                user_items = [i.content for i in items if i.kind == InputKind.USER_INSTRUCTION and i.content]
+                if user_items:
+                    next_prompt = "\n".join(user_items)
+            output = await _run_one_turn(next_prompt)
             if run_interrupted or run_error is not None:
                 break
             goal_status = _parse_goal_status(output)
@@ -1082,7 +899,7 @@ class REPL:
             )
 
         self.console.print(f"[dim]恢复 Goal: {goal}[/dim]")
-        await self._run_goal_loop(
+        await self._run_goal_with_input(
             goal=goal,
             criteria=criteria,
             ledger=ledger,
@@ -1109,142 +926,80 @@ class REPL:
         manager.save(ledger)
         self.console.print(f"[green]Goal {ledger.task_id[:8]} 已取消[/green]")
 
-    async def _run_agent_stream(self, user_input: str) -> None:
+    async def _run_agent_with_input(self, user_input: str) -> None:
+        """带运行时输入支持的 agent 执行入口."""
+        from .input_controller import RuntimeInputController
+
+        controller = RuntimeInputController()
+        self._active_controller = controller
+
+        controller.start()
+        try:
+            await self._run_agent_stream(user_input, controller)
+        finally:
+            await controller.stop()
+            self._active_controller = None
+
+    async def _run_agent_stream(self, user_input: str, controller=None) -> None:
         """流式执行 Agent 并实时渲染输出."""
         self.console.print()  # 空行分隔
 
-        text_buffer = ""
-        in_text = False
-
         try:
-            async for event in self.agent.run_stream(user_input):
+            async for event in self.agent.run_stream(user_input, input_channel=controller):
                 if event.type == AgentEventType.TEXT_DELTA:
-                    # 逐 token 打印文本
-                    if not in_text:
-                        in_text = True
-                    sys.stdout.write(event.content)
-                    sys.stdout.flush()
-                    text_buffer += event.content
+                    self._renderer.render_text_delta(event.content)
 
                 elif event.type == AgentEventType.TOOL_CALL_START:
-                    # 结束之前的文本块
-                    if in_text:
-                        sys.stdout.write("\n")
-                        sys.stdout.flush()
-                        in_text = False
-                        text_buffer = ""
-
-                    self._render_tool_call_start(event.tool_call)
+                    self._renderer.render_tool_call_start(event.tool_call)
 
                 elif event.type == AgentEventType.TOOL_CALL_END:
-                    self._render_tool_call_args(event.tool_call)
+                    self._renderer.render_tool_call_args(event.tool_call)
 
                 elif event.type == AgentEventType.TOOL_RESULT:
-                    self._render_tool_result(event.tool_call, event.tool_result)
+                    self._renderer.render_tool_result(event.tool_call, event.tool_result)
 
                 elif event.type == AgentEventType.FINISH:
-                    if in_text:
-                        sys.stdout.write("\n")
-                        sys.stdout.flush()
-                        in_text = False
+                    self._renderer.render_text_end()
                     # 显示 checkpoint 信息
                     cp = self.agent.git_checkpoint
                     if cp is not None:
                         cps = await cp.list_checkpoints()
                         if cps:
                             latest = cps[0]
-                            self.console.print(
-                                f"  [dim]checkpoint: {latest.message} "
-                                f"({latest.commit_hash[:8]})[/dim]"
+                            self._renderer.render_system(
+                                f"  checkpoint: {latest.message} "
+                                f"({latest.commit_hash[:8]})"
                             )
-                    if event.usage:
-                        self._render_usage_brief(event.usage)
+                    self._renderer.render_finish(event.usage)
+
+                elif event.type == AgentEventType.INTERRUPTED:
+                    self._renderer.render_text_end()
+                    self.console.print("\n[yellow]已暂停[/yellow]")
+                    break
 
         except KeyboardInterrupt:
             self.console.print("\n[yellow]已中断[/yellow]")
         except Exception as e:
-            if in_text:
-                sys.stdout.write("\n")
-                sys.stdout.flush()
+            self._renderer.render_text_end()
             self.console.print(f"\n[red]错误: {type(e).__name__}: {e}[/red]")
 
     def _render_subagent_event(self, event: AgentEvent) -> None:
         """渲染 SubAgent 内部事件，让 Goal 模式下的执行过程可见."""
-        if event.type == AgentEventType.TOOL_CALL_START:
-            self._render_tool_call_start(event.tool_call, prefix="    ↳ ")
-        elif event.type == AgentEventType.TOOL_CALL_END:
-            self._render_tool_call_args(event.tool_call, prefix="      ")
-        elif event.type == AgentEventType.TOOL_RESULT:
-            self._render_tool_result(event.tool_call, event.tool_result, prefix="      ")
-        elif event.type == AgentEventType.FINISH and event.usage:
-            self.console.print(
-                f"      [dim]SubAgent tokens: "
-                f"{event.usage.input_tokens:,} in / "
-                f"{event.usage.output_tokens:,} out[/dim]"
-            )
+        self._renderer.render_subagent_event(event)
 
     def _render_tool_call_start(
         self,
         tool_call: ToolCall | None,
         prefix: str = "  ",
     ) -> None:
-        """渲染工具调用开始."""
-        if not tool_call:
-            return
-        self.console.print(
-            f"{prefix}[bold yellow]⚡ {tool_call.name}[/bold yellow]",
-            highlight=False,
-        )
+        self._renderer.render_tool_call_start(tool_call, prefix)
 
     def _render_tool_call_args(
         self,
         tool_call: ToolCall | None,
         prefix: str = "    ",
     ) -> None:
-        """渲染工具调用的参数."""
-        if not tool_call:
-            return
-        args = tool_call.arguments
-        # 为常见工具做特殊展示
-        if tool_call.name == "Bash" and "command" in args:
-            self.console.print(f"{prefix}[dim]$ {args['command']}[/dim]")
-        elif tool_call.name == "ReadFile" and "path" in args:
-            extra = ""
-            if "start_line" in args:
-                extra = f" (行 {args['start_line']}-{args.get('end_line', '末尾')})"
-            self.console.print(f"{prefix}[dim]📄 {args['path']}{extra}[/dim]")
-        elif tool_call.name == "WriteFile" and "path" in args:
-            content = args.get("content", "")
-            lines_count = len(content.splitlines())
-            self.console.print(f"{prefix}[dim]✏️  {args['path']} ({lines_count} 行)[/dim]")
-        elif tool_call.name == "Grep" and "pattern" in args:
-            path = args.get("path", ".")
-            self.console.print(f"{prefix}[dim]🔍 '{args['pattern']}' in {path}[/dim]")
-        elif tool_call.name == "ListDir":
-            path = args.get("path", ".")
-            self.console.print(f"{prefix}[dim]📁 {path}[/dim]")
-        elif tool_call.name == "GitStatus":
-            path = args.get("path", ".")
-            self.console.print(f"{prefix}[dim]📋 git status ({path})[/dim]")
-        elif tool_call.name == "GitDiff":
-            staged = args.get("staged", False)
-            label = "staged" if staged else "unstaged"
-            self.console.print(f"{prefix}[dim]📋 git diff ({label})[/dim]")
-        elif tool_call.name == "GitCommit":
-            msg = args.get("message", "")
-            self.console.print(f"{prefix}[dim]📝 git commit -m \"{msg}\"[/dim]")
-        elif tool_call.name == "GitLog":
-            count = args.get("count", 10)
-            self.console.print(f"{prefix}[dim]📋 git log -{count}[/dim]")
-        elif tool_call.name == "SubAgent":
-            agent_type = args.get("type", "coder")
-            goal_text = args.get("goal", "")
-            self.console.print(f"{prefix}[dim]🤖 SubAgent({agent_type}): {goal_text}[/dim]")
-        else:
-            compact = json.dumps(args, ensure_ascii=False)
-            if len(compact) > 120:
-                compact = compact[:117] + "..."
-            self.console.print(f"{prefix}[dim]{compact}[/dim]")
+        self._renderer.render_tool_call_args(tool_call, prefix)
 
     def _render_tool_result(
         self,
@@ -1252,39 +1007,15 @@ class REPL:
         result: Any,
         prefix: str = "    ",
     ) -> None:
-        """渲染工具执行结果（简要）."""
+        from ..tools.base import ToolResult as ExecToolResult
         if result is None:
             return
-
-        from ..tools.base import ToolResult as ExecToolResult
-
         if not isinstance(result, ExecToolResult):
             return
+        self._renderer.render_tool_result(tool_call, result, prefix)
 
-        if result.is_error:
-            error_text = result.error or "未知错误"
-            if len(error_text) > 200:
-                error_text = error_text[:197] + "..."
-            self.console.print(f"{prefix}[red]✗ {error_text}[/red]")
-        else:
-            output = result.output
-            lines = output.splitlines()
-            if len(lines) > 5:
-                preview = "\n".join(lines[:3])
-                self.console.print(f"{prefix}[green]✓[/green] [dim]({len(lines)} 行输出)[/dim]")
-            elif output:
-                # 短输出直接显示
-                if len(output) > 200:
-                    output = output[:197] + "..."
-                self.console.print(f"{prefix}[green]✓[/green] [dim]{output}[/dim]")
-            else:
-                self.console.print(f"{prefix}[green]✓[/green] [dim](空输出)[/dim]")
-
-    def _render_usage_brief(self, usage: TokenUsage) -> None:
-        """在回复末尾简要显示 token 用量."""
-        self.console.print(
-            f"\n[dim]tokens: {usage.input_tokens:,} in / {usage.output_tokens:,} out[/dim]"
-        )
+    def _render_usage_brief(self, usage) -> None:
+        self._renderer.render_finish(usage)
 
     def _print_welcome(self) -> None:
         """打印欢迎信息."""
@@ -1305,6 +1036,7 @@ class REPL:
             f"  /undo         — 回滚最近一次 Agent 修改\n"
             f"  /checkpoints  — 列出所有 checkpoint\n"
             f"  /diff         — 查看 Agent 的所有修改\n"
+            f"  运行中输入    — 插话；/pause 暂停当前执行\n"
             f"  Ctrl+C  — 中断当前操作\n"
             f"  多行输入：Alt+Enter 换行，Enter 提交",
             border_style="blue",
