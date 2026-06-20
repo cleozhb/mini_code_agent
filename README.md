@@ -1,6 +1,9 @@
 # Mini Code Agent
 
 从零构建的编程 Agent，实现了 ReAct 循环 + Goal-Driven 子 Agent 编排、长程任务管理、增量验证、安全控制等 Coding Agent 核心能力。
+<div align="center">
+  <img src="https://github.com/user-attachments/assets/1bb0d564-252e-4b24-b7fc-347f69a7e78e" width="60%" alt="output" />
+</div>
 
 ## 核心特性
 
