@@ -16,6 +16,7 @@ from textual.widgets import Header, Input, RichLog, TextArea
 
 from ..core.agent import Agent, AgentEvent, AgentEventType
 from .command_handler import CommandHandler, CommandResult, RunnerCommand
+from .repl import _changed_path_from_subagent_event
 from .tui_confirm import ConfirmScreen
 from .tui_input import PromptTextArea, TUIInputController
 from .tui_renderer import TUIRenderer
@@ -145,8 +146,9 @@ class TUIApp(App[None]):
         if not goal:
             self._renderer.render_error("用法: /goal <目标描述>")
             return
-        if goal == "resume":
-            self._do_goal_resume()
+        if goal == "resume" or goal.startswith("resume "):
+            parts = goal.split(maxsplit=1)
+            self._do_goal_resume(parts[1].strip() if len(parts) > 1 else None)
             return
         self._pending_goal = goal
         self.push_screen(
@@ -200,19 +202,26 @@ class TUIApp(App[None]):
         from ..tools.git import GitLogTool, GitStatusTool
         from ..tools.search import GrepTool, ListDirTool
         from ..tools.shell import BashTool
-        from ..tools.subagent import SubAgentTool
+        from ..tools.subagent import CODER_SUBAGENT_PROMPT, SubAgentTool
         project_path = str(Path(".").resolve())
         llm_client = self._agent.llm_client
         self._agent_busy = True
         self._input_ctrl = TUIInputController()
+        subagent_files_changed: list[str] = []
+
+        async def _relay_subagent_event(event: AgentEvent) -> None:
+            changed_path = _changed_path_from_subagent_event(event)
+            if changed_path and changed_path not in subagent_files_changed:
+                subagent_files_changed.append(changed_path)
+            await self._relay_subagent_event(event)
 
         try:
             sub_agent_tool = SubAgentTool(
                 llm_client=llm_client,
                 project_path=project_path,
-                system_prompt="你是一个编程助手，按指令完成任务。完成后简要说明做了什么。",
+                system_prompt=CODER_SUBAGENT_PROMPT,
                 confirm_callback=self._agent.confirm_callback,
-                event_callback=self._relay_subagent_event,
+                event_callback=_relay_subagent_event,
                 lsp_manager=getattr(self._agent, "lsp_manager", None),
                 input_channel=self._input_ctrl,
             )
@@ -253,8 +262,11 @@ class TUIApp(App[None]):
 
             ledger = None
             if manager is not None:
+                from ..longrun.current_goal import apply_trace_context, save_current_goal
+                from ..longrun.goal_observer import attach_goal_ledger_observer
                 from ..longrun.ledger_types import TaskRunStatus
                 ledger = manager.create(goal=goal, budget=500_000)
+                apply_trace_context(ledger, self._agent.trace_recorder)
                 ledger.status = TaskRunStatus.RUNNING
                 ledger.current_phase = "execution"
                 ledger.current_task_id = "goal"
@@ -264,8 +276,10 @@ class TUIApp(App[None]):
                 ledger.task_graph_snapshot["criteria"] = criteria
                 ledger.token_budget_remaining = max(0, ledger.token_budget - ledger.total_tokens_used)
                 manager.save(ledger)
+                save_current_goal(project_path, ledger)
                 master_agent.ledger = ledger
                 master_agent.ledger_manager = manager
+                attach_goal_ledger_observer(master_agent, ledger, manager, subagent_files_changed)
                 self._renderer.render_system(f"Ledger 已创建: {ledger.task_id[:8]}")
 
             self._renderer.render_system(f"Goal-Driven 模式启动 | 目标: {goal}")
@@ -346,16 +360,26 @@ class TUIApp(App[None]):
                 ledger.current_phase = "failed"
             ledger.token_budget_remaining = max(0, ledger.token_budget - ledger.total_tokens_used)
             manager.save(ledger)
+            from ..longrun.current_goal import clear_current_goal, save_current_goal
+            if ledger.status in (TaskRunStatus.PAUSED, TaskRunStatus.RUNNING):
+                save_current_goal(master_agent.project_path or str(Path(".").resolve()), ledger)
+            else:
+                clear_current_goal(master_agent.project_path or str(Path(".").resolve()), ledger.task_id)
 
         if run_interrupted and checkpoint_manager is not None and ledger is not None:
             from ..longrun.session_state import CheckpointTrigger
             try:
-                msg_dicts = [{"role": getattr(m.role, "value", str(m.role)), "content": str(m.content)[:500]} for m in master_agent.messages]
-                await checkpoint_manager.save_checkpoint(
+                from ..longrun.message_checkpoint import serialize_checkpoint_messages
+                msg_dicts = serialize_checkpoint_messages(master_agent.messages)
+                state = await checkpoint_manager.save_checkpoint(
                     ledger=ledger, trigger=CheckpointTrigger.USER_PAUSE,
                     config=longrun_config, current_task_id="goal",
                     recent_messages=msg_dicts,
                 )
+                ledger.last_checkpoint_id = state.checkpoint_id
+                manager.save(ledger)
+                from ..longrun.current_goal import save_current_goal
+                save_current_goal(master_agent.project_path or str(Path(".").resolve()), ledger)
                 self._renderer.render_system("Checkpoint 已保存")
             except Exception:
                 pass
@@ -367,7 +391,7 @@ class TUIApp(App[None]):
     # ------------------------------------------------------------------
 
     @work(exclusive=True, exit_on_error=False)
-    async def _do_goal_resume(self) -> None:
+    async def _do_goal_resume(self, task_id_prefix: str | None = None) -> None:
         from ..longrun.checkpoint_manager import CheckpointManager
         from ..longrun.config import LongRunConfig
         from ..longrun.ledger_types import TaskRunStatus
@@ -377,20 +401,34 @@ class TUIApp(App[None]):
         from ..tools.git import GitLogTool, GitStatusTool
         from ..tools.search import GrepTool, ListDirTool
         from ..tools.shell import BashTool
-        from ..tools.subagent import SubAgentTool
+        from ..tools.subagent import CODER_SUBAGENT_PROMPT, SubAgentTool
 
         manager = self._agent.ledger_manager
         if manager is None:
             self._renderer.render_error("Ledger 未启用")
             return
 
-        ledgers = manager.list_all()
-        paused = [l for l in ledgers if l.status == TaskRunStatus.PAUSED]
-        if not paused:
-            self._renderer.render_system("没有暂停中的 Goal")
+        project_path = str(Path(".").resolve())
+        try:
+            from ..longrun.current_goal import (
+                format_goal_candidates,
+                list_resumable_goals,
+                resolve_goal_to_resume,
+            )
+            from ..longrun.ledger_manager import LedgerError
+            ledger = resolve_goal_to_resume(manager, project_path, task_id_prefix)
+        except LedgerError as e:
+            from ..longrun.current_goal import format_goal_candidates, list_resumable_goals
+            candidates = list_resumable_goals(manager)
+            if candidates:
+                self._renderer.render_error(
+                    f"无法确定要恢复的 Goal: {e}\n"
+                    "请使用 /goal resume <task_id> 指定：\n"
+                    f"{format_goal_candidates(candidates)}"
+                )
+            else:
+                self._renderer.render_system("没有可恢复的 Goal")
             return
-
-        ledger = manager.load(paused[0].task_id)
         goal = ledger.task_graph_snapshot.get("original_goal", "") or ledger.goal
         criteria = ledger.task_graph_snapshot.get("criteria", "")
         if not goal:
@@ -401,11 +439,18 @@ class TUIApp(App[None]):
         llm_client = self._agent.llm_client
         self._agent_busy = True
         self._input_ctrl = TUIInputController()
+        subagent_files_changed: list[str] = []
+
+        async def _relay_subagent_event(event: AgentEvent) -> None:
+            changed_path = _changed_path_from_subagent_event(event)
+            if changed_path and changed_path not in subagent_files_changed:
+                subagent_files_changed.append(changed_path)
+            await self._relay_subagent_event(event)
 
         try:
             # 加载 checkpoint
             checkpoint_manager = None
-            restore_messages: list[dict] | None = None
+            restore_messages = None
             if self._agent.git_checkpoint is not None:
                 checkpoint_manager = CheckpointManager(
                     checkpoint_dir=str(Path(project_path) / ".agent" / "checkpoints"),
@@ -413,13 +458,16 @@ class TUIApp(App[None]):
                     git_checkpoint=self._agent.git_checkpoint,
                     cwd=project_path,
                 )
-                checkpoints = checkpoint_manager.list_checkpoints(ledger.task_id)
-                if checkpoints:
-                    latest = checkpoints[0]
+                checkpoint_id = ledger.last_checkpoint_id
+                if checkpoint_id is None:
+                    checkpoints = checkpoint_manager.list_checkpoints(ledger.task_id)
+                    checkpoint_id = checkpoints[0].id if checkpoints else None
+                if checkpoint_id:
                     try:
-                        state = checkpoint_manager.load_checkpoint(ledger.task_id, latest.id)
-                        restore_messages = state.recent_messages_full
-                        self._renderer.render_system(f"已加载 checkpoint {latest.id[:8]}")
+                        from ..longrun.message_checkpoint import restore_checkpoint_messages
+                        state = checkpoint_manager.load_checkpoint(ledger.task_id, checkpoint_id)
+                        restore_messages = restore_checkpoint_messages(state.recent_messages_full or [])
+                        self._renderer.render_system(f"已加载 checkpoint {checkpoint_id[:8]}")
                     except Exception:
                         pass
 
@@ -444,9 +492,9 @@ class TUIApp(App[None]):
             sub_agent_tool = SubAgentTool(
                 llm_client=llm_client,
                 project_path=project_path,
-                system_prompt="你是一个编程助手，按指令完成任务。完成后简要说明做了什么。",
+                system_prompt=CODER_SUBAGENT_PROMPT,
                 confirm_callback=self._agent.confirm_callback,
-                event_callback=self._relay_subagent_event,
+                event_callback=_relay_subagent_event,
                 lsp_manager=getattr(self._agent, "lsp_manager", None),
                 input_channel=self._input_ctrl,
             )
@@ -474,22 +522,21 @@ class TUIApp(App[None]):
                 longrun_config=longrun_config,
             )
 
+            from ..longrun.current_goal import apply_trace_context, save_current_goal
+            apply_trace_context(ledger, self._agent.trace_recorder)
             ledger.status = TaskRunStatus.RUNNING
             ledger.current_phase = "execution"
             master_agent.ledger = ledger
             master_agent.ledger_manager = manager
+            from ..longrun.goal_observer import attach_goal_ledger_observer
+            attach_goal_ledger_observer(master_agent, ledger, manager, subagent_files_changed)
             manager.save(ledger)
+            save_current_goal(project_path, ledger)
 
             # 注入恢复对话历史
             if restore_messages:
-                from ..llm.base import Message
                 for msg in restore_messages:
-                    role = msg.get("role", "")
-                    content = msg.get("content", "")
-                    if role == "user":
-                        master_agent.inject_initial_message(content)
-                    elif role == "assistant":
-                        master_agent.conversation.append(Message.assistant(content))
+                    master_agent.conversation.append(msg)
 
             self._renderer.render_system(f"恢复 Goal: {goal}")
             await self._goal_loop(master_agent, ledger, manager, checkpoint_manager, longrun_config, initial_prompt)

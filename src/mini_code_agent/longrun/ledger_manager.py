@@ -31,6 +31,21 @@ class LedgerError(Exception):
     """Ledger 操作错误."""
 
 
+class LedgerNotFoundError(LedgerError):
+    """未找到匹配的 Ledger."""
+
+
+class AmbiguousLedgerError(LedgerError):
+    """Ledger ID 前缀匹配到多个候选."""
+
+    def __init__(self, prefix: str, matches: list[str]) -> None:
+        self.prefix = prefix
+        self.matches = matches
+        super().__init__(
+            f"Ledger ID 前缀不唯一: {prefix}，匹配: {', '.join(matches)}"
+        )
+
+
 class TaskLedgerManager:
     """Ledger 的管理器：负责持久化、增量更新和上下文摘要.
 
@@ -148,7 +163,21 @@ class TaskLedgerManager:
                 metas.append(ledger.to_meta())
             except Exception as e:
                 logger.warning("无法读取 Ledger %s: %s", path.name, e)
+        metas.sort(key=lambda m: m.updated_at, reverse=True)
         return metas
+
+    def find_by_id_prefix(self, prefix: str) -> TaskLedger:
+        """按 task_id 前缀查找唯一 Ledger."""
+        normalized = prefix.strip()
+        if not normalized:
+            raise LedgerNotFoundError("Ledger ID 前缀为空")
+
+        matches = [m for m in self.list_all() if m.task_id.startswith(normalized)]
+        if not matches:
+            raise LedgerNotFoundError(f"未找到匹配的 Ledger: {normalized}")
+        if len(matches) > 1:
+            raise AmbiguousLedgerError(normalized, [m.task_id for m in matches])
+        return self.load(matches[0].task_id)
 
     # ─────────────────────────────────────────────────────────────────
     # 增量更新方法（被 Agent / GraphExecutor 调用的主接口）

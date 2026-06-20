@@ -166,6 +166,9 @@ class CheckpointManager:
                 git_hash = head.strip()
 
         # 步骤 3 — 确保 ledger 已保存
+        checkpoint_id = str(uuid4())
+        now = datetime.now(UTC)
+        ledger.last_checkpoint_id = checkpoint_id
         if self.ledger_manager is not None:
             self.ledger_manager.save(ledger)
         ledger_path = str(
@@ -180,24 +183,17 @@ class CheckpointManager:
         git_branch = branch.strip() if code == 0 else "unknown"
 
         # 步骤 4 — 构造 SessionState
-        checkpoint_id = str(uuid4())
-        now = datetime.now(UTC)
-
-        # 消息序列化：只保留最近 20 条的 role/content
+        # 消息序列化：保留最近 20 条完整 checkpoint message dict。
         recent_full = None
         if recent_messages:
             recent_full = []
             for msg in recent_messages[-20:]:
-                if isinstance(msg, dict):
-                    recent_full.append(msg)
-                elif hasattr(msg, "role") and hasattr(msg, "content"):
-                    # Message 对象
-                    entry: dict = {"role": msg.role.value if hasattr(msg.role, "value") else str(msg.role)}
-                    if isinstance(msg.content, str):
-                        entry["content"] = msg.content[:500]
-                    else:
-                        entry["content"] = str(msg.content)[:500]
-                    recent_full.append(entry)
+                if not isinstance(msg, dict):
+                    raise CheckpointError("recent_messages must be serialized message dicts")
+                required = {"role", "content", "tool_calls", "tool_result"}
+                if not required.issubset(msg):
+                    raise CheckpointError("recent_messages contains invalid checkpoint message")
+                recent_full.append(msg)
 
         state = SessionState(
             checkpoint_id=checkpoint_id,

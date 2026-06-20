@@ -1505,15 +1505,8 @@ class Agent:
                 snapshot_config_dict = snapshot_config.to_dict()
                 snapshot_config_dict["_tokens_at_checkpoint"] = self.ledger.total_tokens_used
 
-                # 需要传 messages 作为 list[dict]
-                msg_dicts: list[dict] = []
-                for m in self.messages:
-                    entry: dict = {"role": m.role.value if hasattr(m.role, "value") else str(m.role)}
-                    if isinstance(m.content, str):
-                        entry["content"] = m.content[:500]
-                    else:
-                        entry["content"] = str(m.content)[:500]
-                    msg_dicts.append(entry)
+                from ..longrun.message_checkpoint import serialize_checkpoint_messages
+                msg_dicts = serialize_checkpoint_messages(self.messages)
 
                 self.last_checkpoint = await self.checkpoint_manager.save_checkpoint(
                     ledger=self.ledger,
@@ -1522,6 +1515,9 @@ class Agent:
                     current_task_id=self.current_task_id,
                     recent_messages=msg_dicts,
                 )
+                if self.project_path is not None:
+                    from ..longrun.current_goal import save_current_goal
+                    save_current_goal(self.project_path, self.ledger)
                 logger.info("自动 checkpoint 已创建: trigger=%s", trigger.value)
             except Exception as e:
                 logger.warning("自动 checkpoint 失败: %s", e)

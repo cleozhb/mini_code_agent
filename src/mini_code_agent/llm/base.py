@@ -45,6 +45,31 @@ class ToolCall:
             return self.raw_arguments
         return json.dumps(self.arguments, ensure_ascii=False)
 
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "name": self.name,
+            "arguments": self.arguments,
+            "raw_arguments": self.raw_arguments,
+            "parse_error": self.parse_error,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> ToolCall:
+        required = {"id", "name", "arguments"}
+        if not isinstance(data, dict) or not required.issubset(data):
+            raise ValueError("invalid checkpoint tool_call")
+        arguments = data["arguments"]
+        if not isinstance(arguments, dict):
+            raise ValueError("invalid checkpoint tool_call.arguments")
+        return cls(
+            id=str(data["id"]),
+            name=str(data["name"]),
+            arguments=arguments,
+            raw_arguments=str(data.get("raw_arguments") or ""),
+            parse_error=data.get("parse_error"),
+        )
+
 
 @dataclass
 class ToolResult:
@@ -53,6 +78,25 @@ class ToolResult:
     tool_call_id: str
     content: str
     is_error: bool = False
+
+    def to_dict(self) -> dict:
+        content = self.content if isinstance(self.content, str) else str(self.content)
+        return {
+            "tool_call_id": self.tool_call_id,
+            "content": content[:1500],
+            "is_error": self.is_error,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> ToolResult:
+        required = {"tool_call_id", "content", "is_error"}
+        if not isinstance(data, dict) or not required.issubset(data):
+            raise ValueError("invalid checkpoint tool_result")
+        return cls(
+            tool_call_id=str(data["tool_call_id"]),
+            content=str(data["content"]),
+            is_error=bool(data["is_error"]),
+        )
 
 
 @dataclass
@@ -85,6 +129,39 @@ class Message:
     @staticmethod
     def tool(tool_result: ToolResult) -> Message:
         return Message(role=Role.TOOL, tool_result=tool_result)
+
+    def to_dict(self) -> dict:
+        content = self.content if isinstance(self.content, str) else str(self.content or "")
+        return {
+            "role": self.role.value,
+            "content": content[:1500],
+            "tool_calls": [tool_call.to_dict() for tool_call in self.tool_calls],
+            "tool_result": self.tool_result.to_dict() if self.tool_result else None,
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> Message:
+        required = {"role", "content", "tool_calls", "tool_result"}
+        if not isinstance(data, dict) or not required.issubset(data):
+            raise ValueError("invalid checkpoint message")
+        try:
+            role = Role(data["role"])
+        except ValueError as e:
+            raise ValueError("invalid checkpoint message role") from e
+        raw_tool_calls = data["tool_calls"]
+        if not isinstance(raw_tool_calls, list):
+            raise ValueError("invalid checkpoint message tool_calls")
+        raw_tool_result = data["tool_result"]
+        return cls(
+            role=role,
+            content=str(data["content"]),
+            tool_calls=[ToolCall.from_dict(item) for item in raw_tool_calls],
+            tool_result=(
+                ToolResult.from_dict(raw_tool_result)
+                if raw_tool_result is not None
+                else None
+            ),
+        )
 
 
 # ---------------------------------------------------------------------------

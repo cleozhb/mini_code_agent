@@ -26,6 +26,11 @@ from mini_code_agent.artifacts import (
     SubtaskArtifact,
 )
 from mini_code_agent.core.task_graph import TaskGraph, TaskNode
+from mini_code_agent.longrun.current_goal import (
+    load_current_goal,
+    resolve_goal_to_resume,
+    save_current_goal,
+)
 from mini_code_agent.longrun.ledger_types import (
     ActiveIssue,
     CompletedTaskRecord,
@@ -477,6 +482,116 @@ class TestLedgerManager:
         ids = {m.task_id for m in metas}
         assert l1.task_id in ids
         assert l2.task_id in ids
+
+    def test_list_all_orders_by_updated_at_desc(self, manager: TaskLedgerManager) -> None:
+        """最近更新的 Ledger 排在前面，仅用于展示排序."""
+        l1 = manager.create(goal="Older paused", budget=1000)
+        l1.status = TaskRunStatus.PAUSED
+        manager.save(l1)
+
+        l2 = manager.create(goal="Newer paused", budget=1000)
+        l2.status = TaskRunStatus.PAUSED
+        manager.save(l2)
+
+        metas = manager.list_all()
+
+        assert metas[0].task_id == l2.task_id
+        assert metas[1].task_id == l1.task_id
+
+    def test_find_by_id_prefix(self, manager: TaskLedgerManager) -> None:
+        ledger = manager.create(goal="Prefix lookup", budget=1000)
+
+        found = manager.find_by_id_prefix(ledger.task_id[:8])
+
+        assert found.task_id == ledger.task_id
+
+    def test_ledger_session_fields_round_trip(self, manager: TaskLedgerManager) -> None:
+        ledger = manager.create(goal="Session fields", budget=1000)
+        ledger.session_id = "abc123"
+        ledger.trace_dir = ".agent/traces/trace-abc123"
+        ledger.last_checkpoint_id = "cp-1"
+        manager.save(ledger)
+
+        loaded = manager.load(ledger.task_id)
+        meta = loaded.to_meta()
+
+        assert loaded.session_id == "abc123"
+        assert loaded.trace_dir == ".agent/traces/trace-abc123"
+        assert loaded.last_checkpoint_id == "cp-1"
+        assert meta.session_id == "abc123"
+        assert meta.last_checkpoint_id == "cp-1"
+
+    def test_current_goal_ref_round_trip(self, manager: TaskLedgerManager, tmp_path: Path) -> None:
+        project_path = tmp_path / "project"
+        ledger = manager.create(goal="Current goal", budget=1000)
+        ledger.status = TaskRunStatus.PAUSED
+        ledger.session_id = "sid"
+        ledger.trace_dir = ".agent/traces/t"
+        ledger.last_checkpoint_id = "cp-current"
+        manager.save(ledger)
+
+        save_current_goal(project_path, ledger)
+        ref = load_current_goal(project_path)
+
+        assert ref is not None
+        assert ref.task_id == ledger.task_id
+        assert ref.status == TaskRunStatus.PAUSED
+        assert ref.session_id == "sid"
+        assert ref.last_checkpoint_id == "cp-current"
+
+    def test_resume_uses_current_goal_not_latest_updated(
+        self,
+        manager: TaskLedgerManager,
+        tmp_path: Path,
+    ) -> None:
+        project_path = tmp_path / "project"
+        quicksort = manager.create(goal="实现快排", budget=1000)
+        quicksort.status = TaskRunStatus.PAUSED
+        manager.save(quicksort)
+        save_current_goal(project_path, quicksort)
+
+        shellsort = manager.create(goal="实现希尔排序", budget=1000)
+        shellsort.status = TaskRunStatus.PAUSED
+        manager.save(shellsort)
+
+        metas = manager.list_all()
+        assert metas[0].task_id == shellsort.task_id
+
+        resolved = resolve_goal_to_resume(manager, project_path)
+
+        assert resolved.task_id == quicksort.task_id
+
+    def test_resume_without_current_goal_does_not_guess_latest(
+        self,
+        manager: TaskLedgerManager,
+        tmp_path: Path,
+    ) -> None:
+        project_path = tmp_path / "project"
+        ledger = manager.create(goal="Paused", budget=1000)
+        ledger.status = TaskRunStatus.PAUSED
+        manager.save(ledger)
+
+        with pytest.raises(LedgerError, match="当前 Goal"):
+            resolve_goal_to_resume(manager, project_path)
+
+    def test_resume_with_explicit_prefix(
+        self,
+        manager: TaskLedgerManager,
+        tmp_path: Path,
+    ) -> None:
+        project_path = tmp_path / "project"
+        target = manager.create(goal="Explicit", budget=1000)
+        target.status = TaskRunStatus.PAUSED
+        manager.save(target)
+
+        other = manager.create(goal="Other", budget=1000)
+        other.status = TaskRunStatus.PAUSED
+        manager.save(other)
+        save_current_goal(project_path, other)
+
+        resolved = resolve_goal_to_resume(manager, project_path, target.task_id[:8])
+
+        assert resolved.task_id == target.task_id
 
     def test_record_task_completed(self, manager: TaskLedgerManager, graph: TaskGraph) -> None:
         """record_task_completed 正确提取 Artifact 所有字段."""

@@ -34,6 +34,15 @@ EXPLORE_SUBAGENT_PROMPT = """\
 专注于：理解代码结构、追踪调用链、分析依赖关系、总结发现。
 """
 
+CODER_SUBAGENT_PROMPT = (
+    "你是一个编程助手，按指令完成任务。完成后用以下格式总结（不超过3行）：\n"
+    "1. 做了什么\n"
+    "2. 修改/创建了哪些文件\n"
+    "3. 验证结果（如有）"
+)
+
+MAX_SUBAGENT_CONTENT_CHARS = 2000
+
 PLAN_SUBAGENT_PROMPT = """\
 你是一个编程规划助手。严格按照用户的具体需求输出对应结果。
 
@@ -94,7 +103,7 @@ class SubAgentTool(Tool):
             self._register_coder_tools(registry)
             command_filter = CommandFilter()
             file_guard = FileGuard(work_dir=self.project_path)
-            prompt_prefix = self.system_prompt or "你是一个编程助手，按指令完成任务。"
+            prompt_prefix = self.system_prompt or CODER_SUBAGENT_PROMPT
         elif agent_type == "explore":
             self._register_readonly_tools(registry)
             command_filter = create_readonly_filter()
@@ -147,10 +156,14 @@ class SubAgentTool(Tool):
             )
 
         total_tokens = result.usage.input_tokens + result.usage.output_tokens
+        content = result.content
+        if len(content) > MAX_SUBAGENT_CONTENT_CHARS:
+            suffix = "\n[SubAgent 输出过长，已截断]"
+            content = content[:MAX_SUBAGENT_CONTENT_CHARS - len(suffix)] + suffix
         output = (
             f"[type: {agent_type}] [stop_reason: {result.stop_reason}]\n"
             f"[usage: input={result.usage.input_tokens} output={result.usage.output_tokens} total={total_tokens}]\n"
-            f"{result.content}"
+            f"{content}"
         )
         if plan_file_path:
             output += f"\n[plan_file: {plan_file_path}]"

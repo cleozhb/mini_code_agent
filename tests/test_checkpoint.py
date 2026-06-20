@@ -31,6 +31,7 @@ from mini_code_agent.longrun.checkpoint_manager import (
     _compute_sha256,
     _write_atomic,
 )
+from mini_code_agent.llm.base import Message, ToolCall
 from mini_code_agent.longrun.config import LongRunConfig
 from mini_code_agent.longrun.ledger_manager import TaskLedgerManager
 from mini_code_agent.longrun.ledger_types import (
@@ -300,6 +301,53 @@ class TestLongRunConfig:
 
 class TestCheckpointManagerSave:
     @pytest.mark.asyncio
+    async def test_save_rejects_legacy_recent_messages(
+        self,
+        checkpoint_manager: CheckpointManager,
+        ledger_manager: TaskLedgerManager,
+        config: LongRunConfig,
+        git_repo: Path,
+    ):
+        """CheckpointManager 不静默接受旧 role/content 格式."""
+        ledger = _make_ledger(total_tokens=5000, total_steps=10)
+        ledger_manager.save(ledger)
+
+        with pytest.raises(CheckpointError):
+            await checkpoint_manager.save_checkpoint(
+                ledger=ledger,
+                trigger=CheckpointTrigger.SUBTASK_COMPLETE,
+                config=config,
+                current_task_id="task-1",
+                recent_messages=[{"role": "user", "content": "test"}],
+            )
+
+    @pytest.mark.asyncio
+    async def test_save_preserves_full_checkpoint_message(
+        self,
+        checkpoint_manager: CheckpointManager,
+        ledger_manager: TaskLedgerManager,
+        config: LongRunConfig,
+        git_repo: Path,
+    ):
+        """CheckpointManager 保留完整 tool_calls 字段."""
+        ledger = _make_ledger(total_tokens=5000, total_steps=10)
+        ledger_manager.save(ledger)
+        raw_message = Message.assistant(
+            "calling",
+            tool_calls=[ToolCall(id="call-1", name="ReadFile", arguments={"path": "a.py"})],
+        ).to_dict()
+
+        state = await checkpoint_manager.save_checkpoint(
+            ledger=ledger,
+            trigger=CheckpointTrigger.SUBTASK_COMPLETE,
+            config=config,
+            current_task_id="task-1",
+            recent_messages=[raw_message],
+        )
+
+        assert state.recent_messages_full == [raw_message]
+
+    @pytest.mark.asyncio
     async def test_save_clean_workspace(
         self,
         checkpoint_manager: CheckpointManager,
@@ -317,7 +365,7 @@ class TestCheckpointManagerSave:
             trigger=CheckpointTrigger.SUBTASK_COMPLETE,
             config=config,
             current_task_id="task-1",
-            recent_messages=[{"role": "user", "content": "test"}],
+            recent_messages=[Message.user("test").to_dict()],
         )
 
         assert state.checkpoint_id
@@ -472,7 +520,7 @@ class TestCheckpointManagerLoad:
             trigger=CheckpointTrigger.USER_PAUSE,
             config=config,
             current_task_id="task-1",
-            recent_messages=[{"role": "user", "content": "hello"}],
+            recent_messages=[Message.user("hello").to_dict()],
         )
 
         loaded = checkpoint_manager.load_checkpoint(
@@ -779,7 +827,7 @@ class TestResumeManager:
             trigger=CheckpointTrigger.USER_PAUSE,
             config=config,
             current_task_id="task-1",
-            recent_messages=[{"role": "user", "content": "test"}],
+            recent_messages=[Message.user("test").to_dict()],
         )
 
         context = await resume_manager.prepare_resume(

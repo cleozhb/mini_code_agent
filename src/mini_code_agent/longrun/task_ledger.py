@@ -26,6 +26,9 @@ class LedgerMeta:
     updated_at: datetime
     completed_tasks: int
     total_tokens_used: int
+    session_id: str | None = None
+    trace_dir: str | None = None
+    last_checkpoint_id: str | None = None
 
 
 @dataclass
@@ -65,6 +68,11 @@ class TaskLedger:
     token_budget: int = 0  # 从 config 读入
     token_budget_remaining: int = 0
 
+    # === 会话关联 ===
+    session_id: str | None = None
+    trace_dir: str | None = None
+    last_checkpoint_id: str | None = None
+
     # === 版本 ===
     ledger_schema_version: str = "1.0"
 
@@ -92,6 +100,9 @@ class TaskLedger:
             "total_wall_time_seconds": self.total_wall_time_seconds,
             "token_budget": self.token_budget,
             "token_budget_remaining": self.token_budget_remaining,
+            "session_id": self.session_id,
+            "trace_dir": self.trace_dir,
+            "last_checkpoint_id": self.last_checkpoint_id,
         }
 
     @classmethod
@@ -118,6 +129,9 @@ class TaskLedger:
             total_wall_time_seconds=d.get("total_wall_time_seconds", 0.0),
             token_budget=d.get("token_budget", 0),
             token_budget_remaining=d.get("token_budget_remaining", 0),
+            session_id=d.get("session_id"),
+            trace_dir=d.get("trace_dir"),
+            last_checkpoint_id=d.get("last_checkpoint_id"),
             ledger_schema_version=d.get("ledger_schema_version", "1.0"),
         )
 
@@ -131,4 +145,7 @@ class TaskLedger:
             updated_at=self.updated_at,
             completed_tasks=len(self.completed_tasks),
             total_tokens_used=self.total_tokens_used,
+            session_id=self.session_id,
+            trace_dir=self.trace_dir,
+            last_checkpoint_id=self.last_checkpoint_id,
         )

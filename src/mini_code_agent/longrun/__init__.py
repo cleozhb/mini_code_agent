@@ -6,7 +6,8 @@ from .checkpoint_manager import (
     CorruptedCheckpointError,
 )
 from .config import LongRunConfig
-from .ledger_manager import TaskLedgerManager
+from .current_goal import CurrentGoalRef
+from .ledger_manager import AmbiguousLedgerError, LedgerNotFoundError, TaskLedgerManager
 from .ledger_types import (
     ActiveIssue,
     CompletedTaskRecord,
@@ -21,15 +22,18 @@ from .task_ledger import LedgerMeta, TaskLedger
 
 __all__ = [
     "ActiveIssue",
+    "AmbiguousLedgerError",
     "CheckpointError",
     "CheckpointManager",
     "CheckpointMeta",
     "CheckpointTrigger",
     "CompletedTaskRecord",
     "CorruptedCheckpointError",
+    "CurrentGoalRef",
     "DecisionRecord",
     "FailedAttemptRecord",
     "LedgerMeta",
+    "LedgerNotFoundError",
     "LongRunConfig",
     "Milestone",
     "ResumeContext",

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import sys
+from pathlib import Path
 from typing import Any
 
 from prompt_toolkit import PromptSession
@@ -175,7 +176,6 @@ class REPL:
 
         from ..tools.subagent import SubAgentTool
         from ..core.agent import AgentEvent, AgentEventType
-        from pathlib import Path
 
         project_path = str(Path(".").resolve())
 
@@ -271,9 +271,8 @@ class REPL:
 
     async def _handle_goal_command(self, arg: str) -> None:
         """/goal [目标|status|pause|resume|cancel] — Goal-Driven 编排模式."""
-        from ..core.agent import AgentObserver
         from ..core.goal_prompt import build_goal_driven_prompt
-        from ..tools.subagent import SubAgentTool
+        from ..tools.subagent import CODER_SUBAGENT_PROMPT, SubAgentTool
 
         # 子命令分派
         sub_cmd = arg.strip().split(maxsplit=1)[0].lower() if arg.strip() else ""
@@ -284,7 +283,8 @@ class REPL:
             self.console.print("[yellow]运行中输入 /pause 即可暂停当前执行[/yellow]")
             return
         if sub_cmd == "resume":
-            await self._goal_resume()
+            parts = arg.strip().split(maxsplit=1)
+            await self._goal_resume(parts[1].strip() if len(parts) > 1 else None)
             return
         if sub_cmd == "cancel":
             self._goal_cancel()
@@ -321,8 +321,6 @@ class REPL:
             return
 
         # 构建 master Agent
-        from pathlib import Path
-
         from ..core.agent import Agent
         from ..safety.loop_guard import LoopGuard
         from ..tools.base import ToolRegistry
@@ -344,7 +342,7 @@ class REPL:
         sub_agent_tool = SubAgentTool(
             llm_client=llm_client,
             project_path=project_path,
-            system_prompt="你是一个编程助手，按指令完成任务。完成后简要说明做了什么。",
+            system_prompt=CODER_SUBAGENT_PROMPT,
             confirm_callback=self.agent.confirm_callback,
             event_callback=_relay_subagent_event,
             lsp_manager=getattr(self.agent, "lsp_manager", None),
@@ -395,7 +393,9 @@ class REPL:
         if manager is not None:
             from ..longrun.ledger_types import TaskRunStatus
 
+            from ..longrun.current_goal import apply_trace_context, save_current_goal
             ledger = manager.create(goal=goal, budget=500_000)
+            apply_trace_context(ledger, self.agent.trace_recorder)
             ledger.status = TaskRunStatus.RUNNING
             ledger.current_phase = "execution"
             ledger.current_task_id = "goal"
@@ -406,6 +406,7 @@ class REPL:
                 0, ledger.token_budget - ledger.total_tokens_used
             )
             manager.save(ledger)
+            save_current_goal(project_path, ledger)
             master_agent.ledger = ledger
             master_agent.ledger_manager = manager
             # B3: 持久化 criteria 到 Ledger
@@ -417,86 +418,8 @@ class REPL:
 
         # 挂 Observer：监听 SubAgent tool 调用结果，即时写入 Ledger
         if ledger is not None and manager is not None:
-            from datetime import datetime, UTC
-            from ..longrun.ledger_types import CompletedTaskRecord, FailedAttemptRecord
-
-            class GoalLedgerObserver(AgentObserver):
-                def __init__(self, ledger, manager, files_changed_buffer: list[str]):
-                    self._ledger = ledger
-                    self._manager = manager
-                    self._files_changed_buffer = files_changed_buffer
-                    self._sub_count = 0
-
-                def on_tool_call(self, name: str, args: dict, result) -> None:
-                    if name != "SubAgent":
-                        return
-                    from ..tools.base import ToolResult as TR
-                    if not isinstance(result, TR):
-                        return
-                    self._sub_count += 1
-                    task_id = f"sub-{self._sub_count}"
-                    goal_desc = args.get("goal", "")[:200]
-                    output = result.output or ""
-                    stop_reason = "unknown"
-                    first_line = output.splitlines()[0] if output else ""
-                    if first_line.startswith("[stop_reason:") and first_line.endswith("]"):
-                        stop_reason = first_line[len("[stop_reason:"):-1].strip()
-                    token_count = 0
-                    for line in output.splitlines()[:3]:
-                        if line.startswith("[usage:") and line.endswith("]"):
-                            for part in line[len("[usage:"):-1].strip().split():
-                                if part.startswith("total_tokens="):
-                                    try:
-                                        token_count = int(part.split("=", 1)[1])
-                                    except ValueError:
-                                        token_count = 0
-                                    break
-                    step_start = self._ledger.total_steps
-                    step_end = step_start + 1
-                    sub_failed = result.is_error or stop_reason not in {"ok", "unknown"}
-                    files_changed = list(self._files_changed_buffer)
-                    self._files_changed_buffer.clear()
-
-                    if sub_failed:
-                        reason = result.error or f"stop_reason={stop_reason}"
-                        self._ledger.failed_attempts.append(FailedAttemptRecord(
-                            task_id=task_id,
-                            artifact_id="",
-                            approach_description=goal_desc,
-                            failure_reason=reason,
-                            step_number=step_end,
-                        ))
-                    else:
-                        self._ledger.completed_tasks.append(CompletedTaskRecord(
-                            task_id=task_id,
-                            artifact_id="",
-                            description=goal_desc,
-                            self_summary=output[:300],
-                            files_changed=files_changed,
-                            verification_passed=False,
-                            confidence="DONE",
-                            step_number_start=step_start,
-                            step_number_end=step_end,
-                            token_count=token_count,
-                            timestamp=datetime.now(UTC),
-                        ))
-                    self._ledger.total_steps = step_end
-                    self._ledger.total_tokens_used += token_count
-                    self._ledger.token_budget_remaining = max(
-                        0, self._ledger.token_budget - self._ledger.total_tokens_used
-                    )
-                    self._manager.save(self._ledger)
-
-                def on_llm_call(self, tokens_in: int, tokens_out: int, model: str) -> None:
-                    self._ledger.total_tokens_used += tokens_in + tokens_out
-                    self._ledger.token_budget_remaining = max(
-                        0, self._ledger.token_budget - self._ledger.total_tokens_used
-                    )
-                    self._manager.save(self._ledger)
-
-            master_agent.observers.append(
-                GoalLedgerObserver(ledger, manager, subagent_files_changed)
-            )
+            from ..longrun.goal_observer import attach_goal_ledger_observer
+            attach_goal_ledger_observer(master_agent, ledger, manager, subagent_files_changed)
 
         self.console.print(
             f"\n[bold]Goal-Driven 模式启动[/bold]\n"
@@ -552,14 +475,13 @@ class REPL:
         checkpoint_manager=None,
         longrun_config=None,
         initial_prompt: str = "",
-        restore_messages: list[dict] | None = None,
+        restore_messages: list | None = None,
     ) -> None:
         """Goal 模式状态机循环 — /goal 和 /goal resume 共用."""
         from ..core.agent import AgentEventType
 
         # 如果是 resume 调用（没有传 master_agent），需要自己构建
         if master_agent is None:
-            from pathlib import Path
             from ..core.agent import Agent
             from ..core.goal_prompt import build_goal_driven_prompt
             from ..longrun.checkpoint_manager import CheckpointManager
@@ -570,18 +492,23 @@ class REPL:
             from ..tools.git import GitLogTool, GitStatusTool
             from ..tools.search import GrepTool, ListDirTool
             from ..tools.shell import BashTool
-            from ..tools.subagent import SubAgentTool
+            from ..tools.subagent import CODER_SUBAGENT_PROMPT, SubAgentTool
 
             project_path = str(Path(".").resolve())
             llm_client = self.agent.llm_client
 
+            subagent_files_changed: list[str] = []
+
             async def _relay(event) -> None:
+                changed_path = _changed_path_from_subagent_event(event)
+                if changed_path and changed_path not in subagent_files_changed:
+                    subagent_files_changed.append(changed_path)
                 self._render_subagent_event(event)
 
             sub_agent_tool = SubAgentTool(
                 llm_client=llm_client,
                 project_path=project_path,
-                system_prompt="你是一个编程助手，按指令完成任务。完成后简要说明做了什么。",
+                system_prompt=CODER_SUBAGENT_PROMPT,
                 confirm_callback=self.agent.confirm_callback,
                 event_callback=_relay,
                 lsp_manager=getattr(self.agent, "lsp_manager", None),
@@ -623,21 +550,20 @@ class REPL:
             if ledger is not None and manager is not None:
                 master_agent.ledger = ledger
                 master_agent.ledger_manager = manager
+                from ..longrun.current_goal import apply_trace_context, save_current_goal
+                from ..longrun.goal_observer import attach_goal_ledger_observer
                 from ..longrun.ledger_types import TaskRunStatus as _TRS
+                attach_goal_ledger_observer(master_agent, ledger, manager, subagent_files_changed)
+                apply_trace_context(ledger, self.agent.trace_recorder)
                 ledger.status = _TRS.RUNNING
                 ledger.current_phase = "execution"
                 manager.save(ledger)
+                save_current_goal(project_path, ledger)
 
         # 注入恢复对话历史
         if restore_messages:
             for msg in restore_messages:
-                role = msg.get("role", "")
-                content = msg.get("content", "")
-                if role == "user":
-                    master_agent.inject_initial_message(content)
-                elif role == "assistant":
-                    from ..llm.base import Message
-                    master_agent.conversation.append(Message.assistant(content))
+                master_agent.conversation.append(msg)
 
         def _set_goal_node_status(status: str) -> None:
             if ledger is None:
@@ -780,26 +706,30 @@ class REPL:
                 _set_goal_node_status("failed")
             _refresh_budget()
             manager.save(ledger)
+            from ..longrun.current_goal import clear_current_goal, save_current_goal
+            project_path = str(Path(".").resolve())
+            if ledger.status in (TaskRunStatus.PAUSED, TaskRunStatus.RUNNING):
+                save_current_goal(project_path, ledger)
+            else:
+                clear_current_goal(project_path, ledger.task_id)
 
         # B2: 中断时 best-effort 保存 checkpoint
         if run_interrupted and checkpoint_manager is not None and ledger is not None:
             from ..longrun.session_state import CheckpointTrigger
             try:
-                msg_dicts: list[dict] = []
-                for m in master_agent.messages:
-                    entry: dict = {"role": m.role.value if hasattr(m.role, "value") else str(m.role)}
-                    if isinstance(m.content, str):
-                        entry["content"] = m.content[:500]
-                    else:
-                        entry["content"] = str(m.content)[:500]
-                    msg_dicts.append(entry)
-                await checkpoint_manager.save_checkpoint(
+                from ..longrun.message_checkpoint import serialize_checkpoint_messages
+                msg_dicts = serialize_checkpoint_messages(master_agent.messages)
+                state = await checkpoint_manager.save_checkpoint(
                     ledger=ledger,
                     trigger=CheckpointTrigger.USER_PAUSE,
                     config=longrun_config,
                     current_task_id="goal",
                     recent_messages=msg_dicts,
                 )
+                ledger.last_checkpoint_id = state.checkpoint_id
+                manager.save(ledger)
+                from ..longrun.current_goal import save_current_goal
+                save_current_goal(str(Path(".").resolve()), ledger)
                 self.console.print("[green]Checkpoint 已保存[/green]")
             except Exception:
                 pass
@@ -833,19 +763,33 @@ class REPL:
             border_style="cyan",
         ))
 
-    async def _goal_resume(self) -> None:
+    async def _goal_resume(self, task_id_prefix: str | None = None) -> None:
         """/goal resume — 基于 checkpoint + Ledger 恢复暂停的 Goal."""
         manager = self.agent.ledger_manager
         if manager is None:
             self.console.print("[red]Ledger 未启用[/red]")
             return
-        from ..longrun.ledger_types import TaskRunStatus
-        ledgers = manager.list_all()
-        paused = [l for l in ledgers if l.status == TaskRunStatus.PAUSED]
-        if not paused:
-            self.console.print("[dim]没有暂停中的 Goal[/dim]")
+        project_path = str(Path(".").resolve())
+        try:
+            from ..longrun.current_goal import (
+                format_goal_candidates,
+                list_resumable_goals,
+                resolve_goal_to_resume,
+            )
+            from ..longrun.ledger_manager import LedgerError
+            ledger = resolve_goal_to_resume(manager, project_path, task_id_prefix)
+        except LedgerError as e:
+            from ..longrun.current_goal import format_goal_candidates, list_resumable_goals
+            candidates = list_resumable_goals(manager)
+            if candidates:
+                self.console.print(
+                    "[red]无法确定要恢复的 Goal: "
+                    f"{e}[/red]\n[dim]请使用 /goal resume <task_id> 指定：[/dim]\n"
+                    f"{format_goal_candidates(candidates)}"
+                )
+            else:
+                self.console.print("[dim]没有可恢复的 Goal[/dim]")
             return
-        ledger = manager.load(paused[0].task_id)
 
         # 取回 goal + criteria
         goal = ledger.task_graph_snapshot.get("original_goal", "")
@@ -857,13 +801,12 @@ class REPL:
             return
 
         # 查找最新 checkpoint
-        from pathlib import Path
         from ..longrun.checkpoint_manager import CheckpointManager
         from ..longrun.config import LongRunConfig
 
         project_path = str(Path(".").resolve())
         checkpoint_manager = None
-        restore_messages: list[dict] | None = None
+        restore_messages = None
 
         if self.agent.git_checkpoint is not None:
             checkpoint_manager = CheckpointManager(
@@ -872,14 +815,17 @@ class REPL:
                 git_checkpoint=self.agent.git_checkpoint,
                 cwd=project_path,
             )
-            checkpoints = checkpoint_manager.list_checkpoints(ledger.task_id)
-            if checkpoints:
-                latest = checkpoints[0]
+            checkpoint_id = ledger.last_checkpoint_id
+            if checkpoint_id is None:
+                checkpoints = checkpoint_manager.list_checkpoints(ledger.task_id)
+                checkpoint_id = checkpoints[0].id if checkpoints else None
+            if checkpoint_id:
                 try:
-                    state = checkpoint_manager.load_checkpoint(ledger.task_id, latest.id)
-                    restore_messages = state.recent_messages_full
+                    from ..longrun.message_checkpoint import restore_checkpoint_messages
+                    state = checkpoint_manager.load_checkpoint(ledger.task_id, checkpoint_id)
+                    restore_messages = restore_checkpoint_messages(state.recent_messages_full or [])
                     self.console.print(
-                        f"[green]已加载 checkpoint {latest.id[:8]}[/green]"
+                        f"[green]已加载 checkpoint {checkpoint_id[:8]}[/green]"
                     )
                 except Exception:
                     pass
@@ -924,6 +870,8 @@ class REPL:
         ledger.status = TaskRunStatus.FAILED
         ledger.current_phase = "cancelled"
         manager.save(ledger)
+        from ..longrun.current_goal import clear_current_goal
+        clear_current_goal(str(Path(".").resolve()), ledger.task_id)
         self.console.print(f"[green]Goal {ledger.task_id[:8]} 已取消[/green]")
 
     async def _run_agent_with_input(self, user_input: str) -> None:
